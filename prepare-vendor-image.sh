@@ -87,8 +87,7 @@ PY
 
 tar -C "$source_dir" -czf "$output_dir/zd1051-payload.tar.gz" \
     firmwares aidfs ap-models file_list.txt
-"$work_dir/make-boot-initrd.sh"
 
 echo "Prepared local vendor-derived artifacts in $output_dir"
 sha256sum "$output_dir/bzImage" "$output_dir/vmlinux" "$output_dir/rootfs.ext2" \
-    "$output_dir/bootinitramfs.gz" "$output_dir/zd1051-payload.tar.gz"
+    "$output_dir/restoreinitramfs.gz" "$output_dir/zd1051-payload.tar.gz"

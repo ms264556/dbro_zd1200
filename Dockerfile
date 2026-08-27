@@ -5,32 +5,28 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         binutils \
-        cpio \
         curl \
         e2fsprogs \
-        gdb \
         gzip \
         procps \
         python3 \
         qemu-system-x86 \
         qemu-utils \
+        reiserfsprogs \
         ripgrep \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/zd1200
-COPY boot-initrd-handoff \
-     limit-process-cpu.py \
-     make-runtime-initrd.sh \
+COPY limit-process-cpu.py \
      make-synthetic-cf.py \
+     patch-kernel.py \
      run-zd1200-qemu.sh \
      run-zd1200-web.sh \
      write-boarddata.py \
-     zd1200-patch.gdb \
      /opt/zd1200/
 
-RUN chmod +x /opt/zd1200/boot-initrd-handoff \
-        /opt/zd1200/*.sh /opt/zd1200/*.py \
+RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py \
     && mkdir -p /opt/zd1200/image /var/lib/zd1200
 
 ENV STATE_DIR=/var/lib/zd1200 \

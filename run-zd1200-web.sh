@@ -9,7 +9,6 @@ started_at=$SECONDS
 high_cpu_samples=0
 ready=0
 http_status=""
-gdb_port="${GDB_PORT:-$((21000 + $$ % 1000))}"
 http_port="${HTTP_PORT:-38080}"
 https_port="${HTTPS_PORT-38443}"
 network_mode="${NETWORK_MODE:-user}"
@@ -47,15 +46,20 @@ trap cleanup EXIT INT TERM
 cd "$work_dir" || exit 1
 mkdir -p "$state_dir"
 
-if [ ! -f image/bootinitramfs.gz ]; then
-    echo "Missing image/bootinitramfs.gz" >&2
+if [ ! -f image/bzImage ]; then
+    echo "Missing image/bzImage" >&2
     exit 1
 fi
-runtime_initrd="${RUNTIME_INITRD:-$state_dir/bootinitramfs.runtime.gz}"
-RUNTIME_INITRD="$runtime_initrd" "$work_dir/make-runtime-initrd.sh"
-if ! command -v gdb >/dev/null 2>&1; then
-    echo "gdb is required" >&2
-    exit 1
+# The lab boots the statically patched kernel (patch-kernel.py applies the
+# QEMU hardware accommodations; no gdb attach is needed).  image/ is mounted
+# read-only in the container, so the patched kernel lands in the writable
+# state dir and is passed via KERNEL=.
+patched_kernel="${PATCHED_KERNEL:-$state_dir/bzImage.patched}"
+if [ ! -f "$patched_kernel" ] || [ ! -s "$patched_kernel" ]; then
+    echo "Building patched kernel $patched_kernel ..."
+    python3 "$work_dir/patch-kernel.py" \
+        --in "$work_dir/image/bzImage" \
+        --out "$patched_kernel"
 fi
 if ! command -v qemu-img >/dev/null 2>&1; then
     echo "qemu-img is required" >&2
@@ -71,7 +75,7 @@ fi
 python3 "$work_dir/write-boarddata.py" \
     --disk "$synthetic_disk" \
     --serial "${ZD_SERIAL:-123456000789}" \
-    --mac "${ZD_MAC1:-01:01:01:01:01:02}" \
+    --mac "${ZD_MAC1:-00:0c:e6:12:00:01}" \
     --model "${ZD_MODEL:-ZD1200}" \
     --customer "${ZD_CUSTOMER:-ruckus}"
 if [ ! -f "$persistent_disk" ]; then
@@ -80,25 +84,19 @@ if [ ! -f "$persistent_disk" ]; then
 fi
 
 : > "$log_file"
-setsid env INITRD="$runtime_initrd" \
+setsid env KERNEL="$patched_kernel" \
+    INITRD="" \
     DISK_IMAGE="$persistent_disk" DISK_FORMAT=qcow2 DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
     ACCEL="$vm_accel" \
-    GDB_PORT="$gdb_port" \
     HTTP_PORT="$http_port" \
     HTTPS_PORT="$https_port" \
     NETWORK_MODE="$network_mode" \
     TAP_IF="${TAP_IF:-tap-zd}" \
-    DEBUG=1 nice -n 10 ./run-zd1200-qemu.sh \
+    nice -n 10 ./run-zd1200-qemu.sh \
     >>"$log_file" 2>&1 </dev/null &
 qemu_pid=$!
 
 sleep 3
-
-timeout "${GDB_TIMEOUT:-30}s" gdb -q -batch image/vmlinux \
-    -ex 'set architecture i386' \
-    -ex "target remote :$gdb_port" \
-    -x zd1200-patch.gdb \
-    >/tmp/zd1200-web-gdb.log 2>&1 || true
 
 # CPU_LIMIT is opt-in for KVM. TCG retains its historical 60% safety cap.
 if [ -z "$cpu_limit" ] && [ "$vm_accel" = tcg ]; then

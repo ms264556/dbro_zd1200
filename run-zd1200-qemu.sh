@@ -4,7 +4,11 @@ set -u
 work_dir="$(cd "$(dirname "$0")" && pwd)"
 kernel="${KERNEL:-$work_dir/image/bzImage}"
 rootfs="$work_dir/image/rootfs.ext2"
-initrd="${INITRD:-$work_dir/image/restoreinitramfs.gz}"
+# No initramfs by default: like the physical appliance, the kernel mounts
+# root=/dev/hda2 directly and runs the stock /sbin/init.  Set INITRD to a
+# path (or "none", which is ignored) to boot an initramfs instead.
+initrd="${INITRD-}"
+if [ "$initrd" = "none" ]; then initrd=""; fi
 synthetic_disk="$work_dir/synthetic-cf.img"
 disk_image="${DISK_IMAGE:-$synthetic_disk}"
 disk_format="${DISK_FORMAT:-raw}"
@@ -15,12 +19,16 @@ if ! command -v qemu-system-i386 >/dev/null 2>&1; then
     exit 1
 fi
 
-for required_file in "$kernel" "$rootfs" "$initrd"; do
+for required_file in "$kernel" "$rootfs"; do
     if [ ! -f "$required_file" ]; then
         echo "Missing required file: $required_file" >&2
         exit 1
     fi
 done
+if [ -n "$initrd" ] && [ ! -f "$initrd" ]; then
+    echo "Missing required file: $initrd" >&2
+    exit 1
+fi
 
 if [ "$disk_image" = "$synthetic_disk" ] && [ ! -f "$synthetic_disk" ]; then
     python3 "$work_dir/make-synthetic-cf.py"
@@ -73,7 +81,11 @@ case "${NETWORK_MODE:-user}" in
 esac
 
 if [ "${NETWORK_MODE:-user}" != none ]; then
-    nic_args=( -net nic,model=e1000e,macaddr=52:54:00:12:00:01 )
+    # The synthetic board reports COB7402, so the stock network script loads
+    # the igb2 driver.  QEMU's `igb` model emulates the Intel 82576 (PCI
+    # 0x10C9) which igb2.ko supports, so the stock driver binds and brings up
+    # eth0/br0 exactly like real hardware.
+    nic_args=( -net nic,model=igb,macaddr=52:54:00:12:00:01 )
 fi
 
 snapshot_args=()
@@ -110,6 +122,11 @@ case "${ACCEL:-auto}" in
 esac
 echo "QEMU accelerator: ${accel_args[1]}" >&2
 
+initrd_args=()
+if [ -n "$initrd" ]; then
+    initrd_args=( -initrd "$initrd" )
+fi
+
 exec qemu-system-i386 \
     -name zd1200-10.5.1-lab \
     "${accel_args[@]}" \
@@ -118,7 +135,7 @@ exec qemu-system-i386 \
     -m "${MEMORY_MB:-2048}" \
     -smp 1 \
     -kernel "$kernel" \
-    -initrd "$initrd" \
+    "${initrd_args[@]}" \
     -drive "file=$disk_image,format=$disk_format,if=ide,index=0,media=disk,cache=${DISK_CACHE:-writeback}" \
     -append "root=/dev/hda2 ro console=ttyS0,115200n8 ${KERNEL_EXTRA-}" \
     "${snapshot_args[@]}" \

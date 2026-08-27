@@ -57,6 +57,28 @@ REGION2_START = 3920881            # CONFIG_V54_ZD_PLATFORM == 1 (ZD1200)
 SECTOR = 512
 RKS_BD_OFFSET = 0x8000             # DATA_PART_SIZE(0x1000) * 8
 
+# The v54bsp driver's CF reader (nar5520_cf_read_write) first tries to open
+# the board-data device by path (e.g. /dev/hda).  When that fails at boot (no
+# device node yet in a no-initramfs boot), it falls back to the raw block
+# device and requires a valid partition-table magic -- 0x55AA in bytes
+# 510..511 of ZD_PART_SECTOR -- before it will read the board-data records.
+# A real ZD1200 CF carries that signature (plus a partition-table-like
+# structure) at this sector; replicate it so the stock kernel finds the
+# records without the handoff's mknod.
+ZD_PART_SECTOR_P1 = 3927001         # CONFIG_V54_ZD_PLATFORM == 1
+ZD_PART_SECTOR_P0 = 3982101         # CONFIG_V54_ZD_PLATFORM == 0
+
+# Synthetic CF geometry (must match make-synthetic-cf.py).  Boot flags are
+# limited to 0x00/0x80: the vendor msdos_partition() rejects any entry whose
+# boot indicator is neither, so a raw 0x01 (as on the real CF) would make the
+# kernel report "unknown partition table".
+CF_PARTITIONS = [
+    (0x00, 2048, 327680),      # boot flag, start sector, count (hda1)
+    (0x80, 329728, 327680),    # hda2 (root A)
+    (0x00, 657408, 327680),    # hda3 (root B)
+    (0x00, 985088, 3000000),   # hda4 (data / writable)
+]
+
 RKS_STRUCT_SIZE = 0xD0             # sizeof(struct rks_boarddata), rev 4
 AR531X_STRUCT_SIZE = 0x80          # sizeof(struct ar531x_boarddata), rev 5
 
@@ -131,6 +153,23 @@ def build_ar531x_boarddata(mac1: bytes, mac2: bytes, model: str) -> bytes:
     return bytes(b)
 
 
+def build_zd_part_sector(partitions) -> bytes:
+    """Replicate the partition-table-like sector the real ZD1200 CF carries at
+    ZD_PART_SECTOR.  The v54bsp CF reader only requires the 0x55AA magic in
+    bytes 510..511 here, but mirror the on-disk structure (MBR-style entries,
+    erased-flash 0xFF fill) so the synthetic CF matches a real card."""
+    b = bytearray([0xFF] * SECTOR)
+    for i, (boot, start, count) in enumerate(partitions):
+        e = 446 + i * 16
+        b[e] = boot
+        b[e + 1:e + 4] = b"\xfe\xff\xff"     # CHS, saturated
+        b[e + 4] = 0x83                        # Linux partition type
+        b[e + 5:e + 8] = b"\xfe\xff\xff"
+        struct.pack_into("<II", b, e + 8, start, count)
+    b[510:512] = b"\x55\xaa"
+    return bytes(b)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -138,9 +177,11 @@ def main():
                     help="CF disk image to patch (default synthetic-cf.img)")
     ap.add_argument("--serial", default="123456000789",
                     help="serial number (default 123456000789)")
-    ap.add_argument("--mac", dest="mac1", default="01:01:01:01:01:02",
+    ap.add_argument("--mac", dest="mac1", default="00:0c:e6:12:00:01",
                     help="base MAC (MAC1); MAC2 = MAC1 + 1 is derived "
-                         "(default 01:01:01:01:01:02)")
+                         "(default 00:0c:e6:12:00:01; must be a unicast "
+                         "address - the v54bsp driver forces it onto the "
+                         "NIC and e1000e rejects multicast MACs)")
     ap.add_argument("--model", default="ZD1200", help="model string")
     ap.add_argument("--customer", default="ruckus", help="customer string")
     ap.add_argument("--platform", type=int, default=1, choices=(0, 1),
@@ -154,8 +195,10 @@ def main():
     mac2 = mac_plus_one(mac1)
 
     region2 = 3981601 if args.platform == 0 else REGION2_START
+    zd_part = (ZD_PART_SECTOR_P0 if args.platform == 0 else ZD_PART_SECTOR_P1)
     rbd = build_rks_boarddata(args.serial, mac1, mac2, args.model, args.customer)
     abd = build_ar531x_boarddata(mac1, mac2, args.model)
+    zps = build_zd_part_sector(CF_PARTITIONS)
 
     rks_sector = region2 + RKS_BD_OFFSET // SECTOR
     ar531x_sector = region2
@@ -167,6 +210,12 @@ def main():
         f.write(abd)
         f.seek(rks_off)
         f.write(rbd)
+        # Partition-table magic the v54bsp CF reader requires at boot when it
+        # cannot open the device by path (no-initramfs boot).  Without it the
+        # board data is never loaded, so /proc/v54bsp/serial is empty and the
+        # stock setupRootCA cert generation is skipped.
+        f.seek(zd_part * SECTOR)
+        f.write(zps)
 
     ck = rks_cksum(rbd)
     mac1_s = mac1.hex(":")
@@ -177,6 +226,7 @@ def main():
     print(f"  rks_boarddata:    sector {rks_sector} (file 0x{rks_off:x}), "
           f"magic {rbd[:4]!r}, rev {struct.unpack_from('<H', rbd, 6)[0]}, "
           f"cksum {ck:#06x}")
+    print(f"  zd_part_sector:   sector {zd_part} (0x55AA magic at +510)")
     print(f"  serial: {args.serial!r}")
     print(f"  MAC1:   {mac1_s}   (wlan0/enet0/enetxMac[0]/MACbase)")
     print(f"  MAC2:   {mac2_s}   (= MAC1 + 1; wlan1/enet1/enetxMac[1])")
