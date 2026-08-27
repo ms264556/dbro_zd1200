@@ -44,13 +44,6 @@ to `127.0.0.1` — a loopback-only adapter.  No Docker is required.
 ## 3. One-time preparation
 
 ```sh
-# aarch64 hosts only: the repo calls bare `as --32` / `ld -m elf_i386`, which
-# the aarch64 binutils reject.  Point at the i686 binutils via PATH:
-mkdir -p /tmp/zd-i686-bin
-ln -sf /usr/bin/i686-linux-gnu-as /tmp/zd-i686-bin/as
-ln -sf /usr/bin/i686-linux-gnu-ld /tmp/zd-i686-bin/ld
-export PATH="/tmp/zd-i686-bin:$PATH"   # only needed for prepare-vendor-image.sh
-
 ./prepare-vendor-image.sh /abs/path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img.tgz
 ```
 
@@ -103,11 +96,11 @@ account.
 
 ## 7. Development hints (non-obvious traps)
 
-1. **aarch64 host: the repo's `as --32` / `ld -m elf_i386` fail.**  The
-   host `as`/`ld` are the aarch64 binutils and reject i386 flags.  Prepending
-   a dir with symlinks to `i686-linux-gnu-as`/`i686-linux-gnu-ld` to `PATH`
-   fixes `prepare-vendor-image.sh` (see §3).  `patch-kernel.py` and the
-   launch script do not need it.
+1. **aarch64 hosts work as-is.**  The old initramfs/handoff build needed
+   `as --32` / `ld -m elf_i386` (i686 binutils) to assemble `pivot-exec.S`;
+   that flow is gone, and `prepare-vendor-image.sh` / `patch-kernel.py` /
+   the launch scripts are pure bash + Python + tar, so no binutils shim is
+   required.
 
 2. **`image/rootfs.ext2` is gzip, not ext2.**  The vendor archive stores
    `rootfs.i386.ext2.director1200.img` compressed; `prepare-vendor-image.sh`
@@ -118,7 +111,7 @@ account.
    automatically.
 
 3. **TCG cannot run the old gdb patch, so the kernel is patched
-   statically.**  The historical `zd1200-patch.gdb` used `hbreak`, which
+   statically.**  The original gdb patch flow used `hbreak`, which
    QEMU's TCG backend rejects.  `patch-kernel.py` applies the same edits as
    static byte writes to the kernel ELF.  **Critical layout detail:** in this
    vendor bzImage the gzip member does *not* run to EOF — a second-stage boot
@@ -150,9 +143,9 @@ account.
    mount works unmodified and `mount` shows `reiserfs` like a real ZD1200.
 
 7. **No initramfs, no handoff.**  The physical appliance boots kernel →
-   rootfs directly; this repo now does the same.  The old
-   `boot-initrd-handoff` / `make-boot-initrd.sh` / `make-runtime-initrd.sh`
-   files are retained only as historical artifacts and are not used.
+   rootfs directly; this repo now does the same.  The old initramfs/handoff
+   flow (`boot-initrd-handoff` / `make-boot-initrd.sh` /
+   `make-runtime-initrd.sh`) has been removed from the tree.
 
 8. **Persistence and factory reset.**  All VM writes (controller state, host
    keys, wizard-created accounts) live in the qcow2 overlay `zd1200-vm.qcow2`

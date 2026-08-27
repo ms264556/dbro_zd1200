@@ -97,6 +97,7 @@ echo "== launching QEMU =="
 echo "  accelerator : ${ACCEL:-tcg}"
 echo "  console     : attached here (Ctrl-A X to quit QEMU)"
 echo "  web         : http://127.0.0.1:38080/  https://127.0.0.1:38443/admin10/login.jsp"
+echo "  ssh         : ssh -p 38022 admin@127.0.0.1"
 
 exec env \
     KERNEL=image/bzImage.patched \
@@ -106,6 +107,7 @@ exec env \
     NETWORK_MODE=user \
     ACCEL="${ACCEL:-tcg}" PACE_GUEST=0 \
     HTTP_PORT=38080 HTTPS_PORT=38443 \
+    EXTRA_HOSTFWD="tcp:127.0.0.1:38022-:22" \
     KERNEL_EXTRA="nohz=off" \
     ./run-zd1200-qemu.sh
 

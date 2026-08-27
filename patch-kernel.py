@@ -3,12 +3,12 @@
 
 Why this exists
 ---------------
-The repo boots the ZoneDirector 1200 under QEMU with a gdb stub patch
-(`zd1200-patch.gdb`) that fixes hardware-specific kernel paths (watchdog,
-board-data queries, halt/restart).  That flow relies on KVM hardware
-breakpoints (`hbreak`), which QEMU's TCG backend does not support.  The
-patches are plain static byte writes at fixed kernel virtual addresses, so
-the same edits can be applied directly to the kernel image before boot.
+The repo boots the ZoneDirector 1200 under QEMU with a gdb stub patch that
+fixes hardware-specific kernel paths (watchdog, board-data queries,
+halt/restart).  That flow relies on KVM hardware breakpoints (`hbreak`),
+which QEMU's TCG backend does not support.  The patches are plain static
+byte writes at fixed kernel virtual addresses, so the same edits can be
+applied directly to the kernel image before boot.
 
 How patches are located (multi-release support)
 -----------------------------------------------
@@ -63,7 +63,7 @@ import sys
 import zlib
 from pathlib import Path
 
-# Signature-based patches, derived from zd1200-patch.gdb.  Each entry is:
+# Signature-based patches, derived from the original gdb patch flow.  Each entry is:
 #   (function, signature_hex, patch_offset, patch_hex, description,
 #    rel32_exit=0)
 #   - signature_hex: byte pattern found in the ORIGINAL (unpatched) kernel

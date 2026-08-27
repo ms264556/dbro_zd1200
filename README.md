@@ -44,8 +44,8 @@ by Git and must never be committed.
   optional.
 - A dedicated Layer-2 path for the guest if it will manage real APs. The host
   must not have an IP address on that adapter, bridge, or TAP interface.
-- Host tools for preparation: Bash, Python 3, `tar`, `gzip`, `cpio`,
-  `openssl`, GNU binutils (`as`, `ld`), `md5sum`, and `sha256sum`.
+- Host tools for preparation: Bash, Python 3, `tar`, `gzip`, `md5sum`, and
+  `sha256sum`.
 
 ## Build the local image
 
@@ -115,12 +115,7 @@ README.md                     LICENSE                         .gitignore        
 ZD1200-LAB-GUIDE.md
 ```
 
-Historical artifacts no longer used by the boot (kept for reference):
-`boot-initrd-handoff`, `boot-initrd-init`, `boot-initrd-inittab`,
-`make-boot-initrd.sh`, `make-runtime-initrd.sh`, `pivot-exec.S`,
-`zd-controller-wrapper.sh`, `zd-memory-snapshot.sh`, `zd1200-patch.gdb`,
-`zd-dropbear2222/`.  `limit-process-cpu.py` is retained for the automatic TCG
-fallback only.
+`limit-process-cpu.py` is retained for the automatic TCG fallback only.
 
 ## Known limitation
 
