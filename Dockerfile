@@ -8,17 +8,20 @@ RUN apt-get update \
         curl \
         e2fsprogs \
         gzip \
+        iproute2 \
         procps \
         python3 \
         qemu-system-x86 \
         qemu-utils \
         reiserfsprogs \
         ripgrep \
+        udhcpc \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/zd1200
-COPY limit-process-cpu.py \
+COPY boarddata-from-mac.sh \
+     limit-process-cpu.py \
      make-synthetic-cf.py \
      patch-kernel.py \
      run-zd1200-qemu.sh \

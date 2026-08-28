@@ -70,12 +70,37 @@ case "${NETWORK_MODE:-user}" in
         fi
         net_args=( -net "tap,ifname=$tap_if,script=no,downscript=no" )
         ;;
+    macvtap)
+        # Inside the macvlan-networked container: create a macvtap in bridge
+        # mode on eth0 so the guest shares the LAN L2 with the container
+        # (DHCP and mDNS from the LAN reach the guest).  The kernel publishes
+        # the tap char device at /sys/class/macvtap/tap<ifindex>/dev; the node
+        # itself lands in the host's devtmpfs, so mknod it here.  Requires
+        # NET_ADMIN and a device-cgroup rule for the tap major.
+        macvtap_if="mvt0"
+        if ! ip link show "$macvtap_if" >/dev/null 2>&1; then
+            ip link add link eth0 name "$macvtap_if" type macvtap mode bridge
+        fi
+        ip link set "$macvtap_if" up
+        tap_idx="$(cat "/sys/class/net/$macvtap_if/ifindex")"
+        dev_t="$(cat "/sys/class/macvtap/tap$tap_idx/dev" 2>/dev/null)"
+        if [ -z "$dev_t" ]; then
+            echo "Cannot find /sys/class/macvtap/tap$tap_idx/dev (macvtap driver not loaded?)" >&2
+            exit 1
+        fi
+        tap_node="/dev/tap$tap_idx"
+        if [ ! -e "$tap_node" ]; then
+            mknod "$tap_node" c "${dev_t%%:*}" "${dev_t##*:}"
+        fi
+        exec 3<>"$tap_node"
+        net_args=( -net "tap,fd=3" )
+        ;;
     none)
         net_args=( -net none )
         nic_args=()
         ;;
     *)
-        echo "NETWORK_MODE must be user or tap" >&2
+        echo "NETWORK_MODE must be user, tap, macvtap or none" >&2
         exit 2
         ;;
 esac
@@ -85,7 +110,13 @@ if [ "${NETWORK_MODE:-user}" != none ]; then
     # the igb2 driver.  QEMU's `igb` model emulates the Intel 82576 (PCI
     # 0x10C9) which igb2.ko supports, so the stock driver binds and brings up
     # eth0/br0 exactly like real hardware.
-    nic_args=( -net nic,model=igb,macaddr=52:54:00:12:00:01 )
+    if [ "${NETWORK_MODE:-user}" = macvtap ] && [ -n "${ZD_MAC2:-}" ]; then
+        # MAC2 = MAC1 + 1 (board data): unique per container and distinct from
+        # the container's own eth0 (MAC1) on the same LAN segment.
+        nic_args=( -net "nic,model=igb,macaddr=$ZD_MAC2" )
+    else
+        nic_args=( -net nic,model=igb,macaddr=52:54:00:12:00:01 )
+    fi
 fi
 
 snapshot_args=()

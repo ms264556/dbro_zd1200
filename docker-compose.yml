@@ -12,16 +12,30 @@ services:
       - /dev/kvm:/dev/kvm
       - /dev/net/tun:/dev/net/tun
 
-    # The optional host/zd1200-bridge service creates the TAP device.
-    network_mode: host
+    # macvlan: the container gets its own MAC on the LAN (so mDNS works) and
+    # the entrypoint's udhcpc obtains an IP from the LAN DHCP server.  The
+    # parent interface is configurable via ZD_MACVLAN_PARENT.
+    networks:
+      - zd1200-macvlan
+
+    # The QEMU guest attaches through a macvtap created on eth0 (needs
+    # NET_ADMIN) and opens the kernel's tap char device, whose major number
+    # is host-dependent (hence the wildcard device-cgroup rule).
+    cap_add:
+      - NET_ADMIN
+    device_cgroup_rules:
+      - "c *:* rwm"
 
     environment:
       CPU_MODEL: pentium3
       MEMORY_MB: "2048"
-      NETWORK_MODE: tap
+      NETWORK_MODE: macvtap
       TAP_IF: ${ZD_TAP_IF:-tap-zd}
       GUEST_IP: ${ZD_GUEST_IP:-192.168.50.10}
       # Board data written into the CF image: serial + base MAC (MAC2=MAC1+1).
+      # In macvlan mode the serial and MACs are derived from the container's
+      # eth0 MAC; set ZD_BOARDDATA_FROM_MAC=0 to force the fixed values below.
+      ZD_BOARDDATA_FROM_MAC: "1"
       ZD_SERIAL: ${ZD_SERIAL:-123456000789}
       ZD_MAC1: ${ZD_MAC1:-00:0c:e6:12:00:01}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
@@ -45,6 +59,17 @@ services:
       timeout: 8s
       start_period: 10m
       retries: 3
+
+networks:
+  # L2 network for the container: its own MAC on the LAN, IP from the LAN's
+  # DHCP server (obtained by udhcpc in the entrypoint).  The parent must be
+  # the host interface that carries the LAN: a real NIC, or a vSwitch/bridge
+  # port with MAC spoofing enabled (macvlan uses MACs other than the host's).
+  zd1200-macvlan:
+    driver: macvlan
+    driver_opts:
+      parent: ${ZD_MACVLAN_PARENT:-eth0}
+      mode: bridge
 
 volumes:
   zd1200-state:

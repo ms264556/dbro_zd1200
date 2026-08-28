@@ -18,6 +18,10 @@ synthetic_disk="${SYNTHETIC_DISK:-$state_dir/synthetic-cf.img}"
 persistent_disk="${PERSISTENT_DISK:-$state_dir/zd1200-vm.qcow2}"
 vm_snapshot="${VM_SNAPSHOT:-0}"
 cpu_limit="${CPU_LIMIT:-}"
+# Consecutive >95% CPU samples (5s each) before the supervisor stops QEMU.
+# The 2.6.32 guest can legitimately spin during TCG boot/keygen phases, which
+# false-triggers this watchdog; set 0/off/none to disable it.
+cpu_guard="${ZD_CPU_GUARD:-4}"
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     vm_accel=kvm
 else
@@ -72,10 +76,23 @@ fi
 # The serial number and MACs live in the board-data records on the CF image
 # (read by the kernel's v54bsp driver; NOT patched into the kernel).  Rewrite
 # them on every launch so env changes take effect.  MAC2 = MAC1 + 1.
+# In macvlan mode the identity is derived from the container's eth0 MAC (the
+# MAC Docker allocated on the macvlan network), so every instance is unique on
+# the LAN; set ZD_BOARDDATA_FROM_MAC=0 to force fixed ZD_SERIAL/ZD_MAC1.
+if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_BOARDDATA_FROM_MAC:-1}" != "0" ]; then
+    eval "$("$work_dir/boarddata-from-mac.sh")"
+    zd_serial="$SERIAL"
+    zd_mac1="$MAC"
+    zd_mac2="$MAC2"
+else
+    zd_serial="${ZD_SERIAL:-123456000789}"
+    zd_mac1="${ZD_MAC1:-00:0c:e6:12:00:01}"
+    zd_mac2="${ZD_MAC2:-}"
+fi
 python3 "$work_dir/write-boarddata.py" \
     --disk "$synthetic_disk" \
-    --serial "${ZD_SERIAL:-123456000789}" \
-    --mac "${ZD_MAC1:-00:0c:e6:12:00:01}" \
+    --serial "$zd_serial" \
+    --mac "$zd_mac1" \
     --model "${ZD_MODEL:-ZD1200}" \
     --customer "${ZD_CUSTOMER:-ruckus}"
 if [ ! -f "$persistent_disk" ]; then
@@ -84,6 +101,15 @@ if [ ! -f "$persistent_disk" ]; then
 fi
 
 : > "$log_file"
+
+# macvlan: obtain the container's LAN IP from the DHCP server.  The macvlan
+# network carries no useful Docker-assigned address (Docker only pools a
+# vestigial subnet; udhcpc's deconfig flushes it), so udhcpc keeps retrying
+# in the background until the LAN grants a lease - which also gives mDNS
+# multicast a real L2 path.
+if [ "${NETWORK_MODE:-user}" = macvtap ]; then
+    udhcpc -i eth0 -b -q -p /var/run/udhcpc.pid >>"$log_file" 2>&1 || true
+fi
 setsid env KERNEL="$patched_kernel" \
     INITRD="" \
     DISK_IMAGE="$persistent_disk" DISK_FORMAT=qcow2 DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
@@ -92,6 +118,7 @@ setsid env KERNEL="$patched_kernel" \
     HTTPS_PORT="$https_port" \
     NETWORK_MODE="$network_mode" \
     TAP_IF="${TAP_IF:-tap-zd}" \
+    ZD_MAC2="$zd_mac2" \
     nice -n 10 ./run-zd1200-qemu.sh \
     >>"$log_file" 2>&1 </dev/null &
 qemu_pid=$!
@@ -115,6 +142,16 @@ if [ -n "$cpu_limit" ]; then
     limiter_pid=$!
     echo "QEMU CPU duty cycle capped at ${cpu_limit}% while the VM runs."
 fi
+case "$cpu_guard" in
+    0|off|none) cpu_guard="" ;;
+esac
+if [ -n "$cpu_guard" ]; then
+    if ! [[ "$cpu_guard" =~ ^[0-9]+$ ]] || (( cpu_guard < 1 )); then
+        echo "ZD_CPU_GUARD must be a positive integer, or 0/off/none to disable." >&2
+        exit 2
+    fi
+    echo "High-CPU watchdog: stopping QEMU after ${cpu_guard} samples (${cpu_guard}x5s) above 95% CPU."
+fi
 
 echo "ZD1200 is starting; waiting for the web service..."
 wait_seconds="${WEB_WAIT_SECONDS:-${WEB_WAIT_LOOPS:-180}}"
@@ -127,7 +164,7 @@ if [ -n "$cpu_limit" ]; then
 else
     echo "Startup runs at full speed and has a ${wait_seconds}s readiness deadline."
 fi
-if [ "$network_mode" = tap ]; then
+if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
     probe_base="https://$guest_ip"
 else
     probe_base="https://127.0.0.1:$https_port"
@@ -171,7 +208,7 @@ while (( SECONDS < deadline )); do
             ready_kind="login page"
         fi
         echo "ZD1200 $ready_kind is ready:"
-        if [ "$network_mode" = tap ]; then
+        if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
             echo "HTTP:  http://$guest_ip/"
         else
             echo "HTTP:  http://127.0.0.1:$http_port/"
@@ -222,8 +259,8 @@ while kill -0 "$qemu_pid" 2>/dev/null; do
     else
         high_cpu_samples=0
     fi
-    if (( high_cpu_samples >= 4 )); then
-        echo "QEMU stayed above 95% CPU for 20 seconds; stopping it to protect the host." >&2
+    if [ -n "$cpu_guard" ] && (( high_cpu_samples >= cpu_guard )); then
+        echo "QEMU stayed above 95% CPU for $((cpu_guard * 5)) seconds; stopping it to protect the host." >&2
         exit 3
     fi
 done

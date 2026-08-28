@@ -17,23 +17,25 @@ time.  Read it before changing anything.
 | file | role |
 |---|---|
 | `patch-kernel.py` | applies the QEMU-required byte patches to the stock kernel and splices it back into a bootable `bzImage` (the old KVM-only gdb flow is gone) |
-| `make-synthetic-cf.py` | builds the synthetic CompactFlash: MBR + root image on hda1/hda2/hda3, and a **real ReiserFS** data partition on hda4 |
+| `make-synthetic-cf.py` | builds the synthetic CompactFlash: MBR + root image on hda1/hda2/hda3, and an **ext2** data partition on hda4 (the rootfs patch drops the ReiserFS-only `nolog` mount option) |
 | `write-boarddata.py` | writes the ZD board-data records (serial, MACs, model) at the exact sectors a real appliance uses, plus the `0x55AA` partition-magic sector the vendor kernel requires |
+| `boarddata-from-mac.sh` | derives serial + MAC1/MAC2 from the container's eth0 MAC for the macvlan run and feeds them into `write-boarddata.py` |
 | `run-zd1200-lab.sh` | one-shot launcher: validates/builds `image/`, patched kernel, VM disk; then execs QEMU |
-| `run-zd1200-qemu.sh` | QEMU wrapper; the NIC is `model=igb` so the stock igb2 driver binds |
+| `run-zd1200-qemu.sh` | QEMU wrapper; `NETWORK_MODE` selects `user` (SLIRP), `tap` (host bridge) or `macvtap` (macvlan container); the NIC is `model=igb` so the stock igb2 driver binds |
 
 The guest is stock: the vendor kernel (patched only where QEMU hardware
 differs), the vendor root filesystem, the vendor init scripts, the vendor
 web/emfd/controller stack.  No initramfs, no boot handoff, no dropbear-2222,
 no seeded accounts.
 
-All QEMU networking uses `NETWORK_MODE=user` (SLIRP) with host forwards bound
-to `127.0.0.1` — a loopback-only adapter.  No Docker is required.
+The standalone lab uses `NETWORK_MODE=user` (SLIRP) with host forwards bound
+to `127.0.0.1` — a loopback-only adapter.  No Docker is required.  (The
+dockerized run described in README.md adds the `tap` and `macvtap` modes.)
 
 ## 2. Prerequisites
 
 - x86_64 (or aarch64 — see hints) Linux host, `qemu-system-i386` + `qemu-img`
-  (Debian/Ubuntu: `apt install qemu-system-x86 reiserfsprogs`), `python3`,
+  (Debian/Ubuntu: `apt install qemu-system-x86 e2fsprogs`), `python3`,
   `curl`, ~6 GB free disk.
 - `/dev/kvm` optional: with KVM the same patched kernel boots (the patches are
   static bytes; no gdb flow is involved either way).
@@ -82,8 +84,8 @@ account.
    synthetic CF directly (no initramfs, exactly like the physical appliance).
 2. The vendor `v54bsp` driver reads the board data (serial, MACs, model) from
    the CF at the real sectors; the stock `sys_init` mounts hda4 at `/writable`
-   with its stock `-o …,nolog` command (hda4 is real ReiserFS, so the option
-   is valid and `mount` output matches real hardware).
+   (hda4 is plain ext2 — the rootfs patch in `patch-rootfs.sh` strips the
+   ReiserFS-only `nolog` option from `sys_init`, so the stock mount works).
 3. The stock `S40network` script loads `igb2.ko` for the COB7402 platform;
    QEMU's `igb` NIC model is an Intel 82576 (PCI 0x10C9) which igb2.ko
    supports, so eth0/br0 come up with the board-data MAC.
@@ -125,7 +127,9 @@ account.
    address onto the NIC at probe time.  A multicast MAC (e.g. `01:01:01:01:01:02`)
    makes igb2 fail the probe (`Invalid MAC Address`, error -5) and the guest
    has no network.  The default is the unicast `00:0c:e6:12:00:01`
-   (MAC2 = MAC1 + 1).
+   (MAC2 = MAC1 + 1).  In the dockerized macvlan run the MAC is derived from
+   the container's eth0 MAC (`boarddata-from-mac.sh`) — a locally administered
+   but unicast address, so it is fine for the probe.
 
 5. **The vendor kernel reads the partition table from the board-data sector.**
    `fs/partitions/msdos.c` in this kernel reads `ZD_PART_SECTOR` (3927001)
@@ -136,11 +140,12 @@ account.
    neither, printing "hda: unknown partition table" (the real CF uses 0x01,
    but this kernel refuses it).
 
-6. **hda4 must be real ReiserFS.**  The stock `sys_init` mounts the data
-   partition with `-o …,nolog`, a ReiserFS-only option; ext2 fails with
-   EINVAL and `/writable` never mounts.  `make-synthetic-cf.py` formats hda4
-   with `mkreiserfs` (requires reiserfsprogs on the build host), so the stock
-   mount works unmodified and `mount` shows `reiserfs` like a real ZD1200.
+6. **hda4 is plain ext2, with `nolog` patched out.**  The physical card uses
+   ReiserFS and the stock `sys_init` mounts the data partition with the
+   ReiserFS-only `nolog` option; an unpatched rootfs would fail with EINVAL
+   against ext2.  `patch-rootfs.sh` strips `nolog` from `sys_init` in the root
+   images (hda2/hda3), so `make-synthetic-cf.py` can format hda4 with `mke2fs`
+   (requires e2fsprogs on the build host) and the stock mount works.
 
 7. **No initramfs, no handoff.**  The physical appliance boots kernel →
    rootfs directly; this repo now does the same.  The old initramfs/handoff
@@ -172,6 +177,6 @@ account.
 | guest EIP sleds through zeros after boot | loader tail was overwritten — rebuild with `patch-kernel.py` |
 | no web on 38443; log shows `Invalid MAC Address` | board-data MAC is multicast — use a unicast MAC (hint #4) |
 | `hda: unknown partition table` | ZD_PART_SECTOR boot flag is not 0x00/0x80, or the sector is missing — re-run `write-boarddata.py` (hint #5) |
-| `/writable` mount fails with EINVAL | hda4 is ext2, not ReiserFS — rebuild with `make-synthetic-cf.py` (hint #6) |
+| `/writable` mount fails with EINVAL | root images not patched — stock `sys_init` still passes the ReiserFS-only `nolog`; run `patch-rootfs.sh` (hint #6) |
 | web never becomes ready after ~4 min | QEMU port 38080/38443 still held by a stale qemu process — kill it (hint #9) |
 | wizard hangs on key generation | low-entropy factory phase; give the guest time (first-boot keygen) |

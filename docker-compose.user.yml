@@ -7,16 +7,34 @@
 # Changes vs. base compose:
 #   - drop the /dev/kvm and /dev/net/tun device mappings (not needed here;
 #     /dev/kvm does not exist on this host)
-#   - NETWORK_MODE=user: QEMU user-mode net with hostfwd on 127.0.0.1
-#     (38080/38443/38022), so no TAP setup is required
+#   - attach to the project's default bridge instead of the macvlan network
+#     (so the container has an IP without LAN DHCP and QEMU user-mode
+#     forwards are reachable from the host at http://<container-ip>:38080)
+#   - NETWORK_MODE=user: QEMU user-mode net with hostfwd on 0.0.0.0
+#     (38080/38443), so no TAP setup is required
+#   - publish the forwarded ports with Docker `ports:` so WSL2 localhost
+#     forwarding exposes the web UI at http://localhost:38080 on Windows
 #   - healthcheck probes the loopback forward instead of the TAP guest IP
 services:
   zd1200:
     devices: !override []
+    networks: !override [default]
+    # QEMU's user-mode hostfwd listens on 0.0.0.0:38080/38443 inside the
+    # container; publish them so the host (and WSL2 localhost forwarding)
+    # can reach the guest web UI at localhost:38080 / localhost:38443.
+    ports:
+      - "38080:38080"
+      - "38443:38443"
     environment:
       NETWORK_MODE: user
+      HOSTFWD_ADDR: "0.0.0.0"
+      # Fixed board data (no eth0 MAC derivation without macvlan).
+      ZD_BOARDDATA_FROM_MAC: "0"
       # No duty-cycle limiting for this test; full-speed TCG boot.
       CPU_LIMIT: off
+      # Disable the high-CPU watchdog: TCG boot/keygen legitimately spins
+      # above 95% and was killing QEMU mid-boot (container restart loop).
+      ZD_CPU_GUARD: "0"
       # Larger TCG translation-block cache (MiB) to speed up the guest boot.
       TCG_TB_SIZE: "1024"
     healthcheck:
