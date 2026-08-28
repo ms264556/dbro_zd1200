@@ -98,13 +98,17 @@ qemu_pid=$!
 
 sleep 3
 
-# CPU_LIMIT is opt-in for KVM. TCG retains its historical 60% safety cap.
+# CPU_LIMIT is opt-in for KVM. TCG retains its historical 60% safety cap
+# unless CPU_LIMIT is set to 0/off/none (no duty-cycle limiting at all).
 if [ -z "$cpu_limit" ] && [ "$vm_accel" = tcg ]; then
     cpu_limit=60
 fi
+case "$cpu_limit" in
+    0|off|none) cpu_limit="" ;;
+esac
 if [ -n "$cpu_limit" ]; then
     if ! [[ "$cpu_limit" =~ ^[0-9]+$ ]] || (( cpu_limit < 1 || cpu_limit > 95 )); then
-        echo "CPU_LIMIT must be an integer from 1 through 95." >&2
+        echo "CPU_LIMIT must be an integer from 1 through 95, or 0/off/none to disable." >&2
         exit 2
     fi
     python3 "$work_dir/limit-process-cpu.py" "$qemu_pid" "$cpu_limit" &

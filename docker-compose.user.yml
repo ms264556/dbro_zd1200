@@ -1,0 +1,23 @@
+# Local test override: run the ZD1200 container with user-mode networking,
+# matching the way the lab was previously run on this host (no /dev/kvm,
+# no tap-zd bridge).  Merge on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.user.yml up -d
+#
+# Changes vs. base compose:
+#   - drop the /dev/kvm and /dev/net/tun device mappings (not needed here;
+#     /dev/kvm does not exist on this host)
+#   - NETWORK_MODE=user: QEMU user-mode net with hostfwd on 127.0.0.1
+#     (38080/38443/38022), so no TAP setup is required
+#   - healthcheck probes the loopback forward instead of the TAP guest IP
+services:
+  zd1200:
+    devices: !override []
+    environment:
+      NETWORK_MODE: user
+      # No duty-cycle limiting for this test; full-speed TCG boot.
+      CPU_LIMIT: off
+      # Larger TCG translation-block cache (MiB) to speed up the guest boot.
+      TCG_TB_SIZE: "1024"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -kfsS --max-time 5 https://127.0.0.1:38443/admin10/login.jsp >/dev/null || exit 1"]

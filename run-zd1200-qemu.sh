@@ -101,18 +101,24 @@ elif [[ "${PACE_GUEST:-0}" =~ ^shift=[0-9]+$ ]]; then
 fi
 
 accel_args=()
+# TCG speedups: a larger translation-block cache (TB cache) reduces re-translation
+# churn for big workloads; set TCG_TB_SIZE in MiB (e.g. 1024) to raise it.
+tcg_accel="tcg"
+if [ -n "${TCG_TB_SIZE:-}" ]; then
+    tcg_accel="tcg,tb-size=${TCG_TB_SIZE}"
+fi
 case "${ACCEL:-auto}" in
     kvm)
         accel_args+=( -accel kvm )
         ;;
     tcg)
-        accel_args+=( -accel tcg )
+        accel_args+=( -accel "$tcg_accel" )
         ;;
     auto)
         if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             accel_args+=( -accel kvm )
         else
-            accel_args+=( -accel tcg )
+            accel_args+=( -accel "$tcg_accel" )
         fi
         ;;
     *)
