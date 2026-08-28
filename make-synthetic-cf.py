@@ -3,11 +3,10 @@
 
 The layout mirrors the physical ZD1200 CompactFlash: hda1 is the boot area
 (seeded with the root tree so sys_init can mount it at /boot), hda2/hda3 are
-the dual root images, and hda4 is the **ReiserFS** writable/data partition —
-exactly the filesystem the vendor's `sys_init` mounts with `-o …,nolog` on a
-real appliance.  A plain ext2 hda4 would make that stock mount fail with
-"Invalid argument", so a real ReiserFS is created here (requires reiserfsprogs
-on the build host: `apt install reiserfsprogs`, or set MKREISERFS).
+the dual root images, and hda4 is the **ext2** writable/data partition.  The
+stock appliance ships hda4 as ReiserFS and mounts it with `-o …,nolog` (a
+ReiserFS-only option), but the lab rootfs is patched to drop `nolog`
+(`patch-rootfs.sh`), so a plain ext2 hda4 mounts fine at /writable.
 
 The data partition starts empty like a factory-fresh volume: `sys_init` and
 `rc.pre_ac_init` create /writable/etc, the airespider/config/dump directories,
@@ -39,11 +38,11 @@ p4_start, p4_sectors = 985088, 3000000   # writable area / remaining CF
 if rootfs.stat().st_size > p2_sectors * SECTOR:
     raise SystemExit("rootfs does not fit in synthetic root partition")
 
-mkreiserfs = os.environ.get("MKREISERFS") or shutil.which("mkreiserfs")
-if not mkreiserfs:
+mke2fs = os.environ.get("MKE2FS") or shutil.which("mke2fs")
+if not mke2fs:
     raise SystemExit(
-        "mkreiserfs not found: reiserfsprogs is required to build the "
-        "ReiserFS data partition (apt install reiserfsprogs, or set MKREISERFS)"
+        "mke2fs not found: e2fsprogs is required to build the "
+        "ext2 data partition (apt install e2fsprogs, or set MKE2FS)"
     )
 
 with disk.open("wb") as handle:
@@ -77,13 +76,14 @@ with disk.open("r+b") as handle:
         handle.seek(start * SECTOR)
         handle.write(data)
 
-    # hda4: a fresh ReiserFS filesystem (the vendor's stock mount command uses
-    # the ReiserFS-only `nolog` option, so ext2 would fail with EINVAL).
+    # hda4: a fresh ext2 filesystem.  The rootfs on hda2/hda3 is patched
+    # (patch-rootfs.sh) to drop the ReiserFS-only `nolog` mount option from
+    # sys_init, so a plain ext2 volume mounts fine at /writable.
     with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
         tf_path = tf.name
     try:
         os.truncate(tf_path, p4_sectors * SECTOR)
-        subprocess.run([mkreiserfs, "-f", "-q", tf_path], check=True,
+        subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", tf_path], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(tf_path, "rb") as rf:
             handle.seek(p4_start * SECTOR)
@@ -111,4 +111,4 @@ print(f"created {disk} ({DISK_SIZE // (1024 * 1024)} MiB)")
 print(f"  hda1 boot : sectors {p1_start}..{p1_start + p1_sectors} (ext2 seed)")
 print(f"  hda2 rootA: sectors {p2_start}..{p2_start + p2_sectors} (ext2 seed)")
 print(f"  hda3 rootB: sectors {p3_start}..{p3_start + p3_sectors} (ext2 seed)")
-print(f"  hda4 data : sectors {p4_start}..{p4_start + p4_sectors} (ReiserFS)")
+print(f"  hda4 data : sectors {p4_start}..{p4_start + p4_sectors} (ext2)")
