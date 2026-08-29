@@ -19,9 +19,9 @@ time.  Read it before changing anything.
 | `patch-kernel.py` | applies the QEMU-required byte patches to the stock kernel and splices it back into a bootable `bzImage` (the old KVM-only gdb flow is gone) |
 | `make-synthetic-cf.py` | builds the synthetic CompactFlash: MBR + root image on hda1/hda2/hda3, and an **ext2** data partition on hda4 (the rootfs patch drops the ReiserFS-only `nolog` mount option) |
 | `write-boarddata.py` | writes the ZD board-data records (serial, MACs, model) at the exact sectors a real appliance uses, plus the `0x55AA` partition-magic sector the vendor kernel requires |
-| `boarddata-from-mac.sh` | derives serial + MAC1/MAC2 from the container's eth0 MAC for the macvlan run and feeds them into `write-boarddata.py` |
+| `boarddata-from-mac.sh` | derives serial + MAC1/MAC2 from a MAC and feeds them into `write-boarddata.py` (used when `ZD_BOARDDATA_FROM_MAC=1`; the MAC-derived serial is rejected by the firmware's support-entitlement check, so the dockerized run uses `ZD_BOARDDATA_FROM_MAC=0`) |
 | `run-zd1200-lab.sh` | one-shot launcher: validates/builds `image/`, patched kernel, VM disk; then execs QEMU |
-| `run-zd1200-qemu.sh` | QEMU wrapper; `NETWORK_MODE` selects `user` (SLIRP), `tap` (host bridge) or `macvtap` (macvlan container); the NIC is `model=igb` so the stock igb2 driver binds |
+| `run-zd1200-qemu.sh` | QEMU wrapper; `NETWORK_MODE` selects `user` (SLIRP), `tap` (host bridge) or `macvtap` (guest on a macvtap, used by the dockerized host-netns run); the NIC is `model=igb` so the stock igb2 driver binds |
 
 The guest is stock: the vendor kernel (patched only where QEMU hardware
 differs), the vendor root filesystem, the vendor init scripts, the vendor
@@ -105,12 +105,14 @@ account.
    required.
 
 2. **`image/rootfs.ext2` is gzip, not ext2.**  The vendor archive stores
-   `rootfs.i386.ext2.director1200.img` compressed; `prepare-vendor-image.sh`
-   copies it verbatim, so the synthetic CF partitions are seeded with gzip
-   bytes and `sys_init`'s mount of hda2 fails.  Decompress it first.  Note the
-   ext2 superblock magic `0xEF53` lives at byte **1080** (`s_magic` =
-   superblock + `0x38`), not 1024.  `run-zd1200-lab.sh` decompresses
-   automatically.
+   `rootfs.i386.ext2.director1200.img` compressed.  `prepare-vendor-image.sh`
+   now decompresses it to a RAW ext2 filesystem in place (idempotent), so both
+   the standalone launch and the dockerized run see a valid rootfs.  If you
+   hand-copy the vendor image and skip that, the synthetic CF partitions are
+   seeded with gzip bytes and `sys_init`'s mount of hda2 fails.  Decompress it
+   first.  Note the ext2 superblock magic `0xEF53` lives at byte **1080**
+   (`s_magic` = superblock + `0x38`), not 1024.  `run-zd1200-lab.sh` also
+   decompresses automatically as a fallback.
 
 3. **TCG cannot run the old gdb patch, so the kernel is patched
    statically.**  The original gdb patch flow used `hbreak`, which
@@ -127,9 +129,11 @@ account.
    address onto the NIC at probe time.  A multicast MAC (e.g. `01:01:01:01:01:02`)
    makes igb2 fail the probe (`Invalid MAC Address`, error -5) and the guest
    has no network.  The default is the unicast `00:0c:e6:12:00:01`
-   (MAC2 = MAC1 + 1).  In the dockerized macvlan run the MAC is derived from
-   the container's eth0 MAC (`boarddata-from-mac.sh`) — a locally administered
-   but unicast address, so it is fine for the probe.
+   (MAC2 = MAC1 + 1).  The dockerized run now sets `ZD_BOARDDATA_FROM_MAC=0`, so
+   the fixed `00:0c:e6:12:00:01` / `123456000789` are used: the MAC-derived
+   serial (`boarddata-from-mac.sh`, `ZD_BOARDDATA_FROM_MAC=1`) is rejected by the
+   firmware's support-entitlement check (`E_InvalidSerialNumber`), so the
+   "No Support Upgrade Entitlement" banner would not clear.
 
 5. **The vendor kernel reads the partition table from the board-data sector.**
    `fs/partitions/msdos.c` in this kernel reads `ZD_PART_SECTOR` (3927001)

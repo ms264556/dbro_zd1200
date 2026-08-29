@@ -1,29 +1,44 @@
 #!/usr/bin/env bash
-# Derive the ZD1200 board-data identity from the container's eth0 MAC.
+# Derive the ZD1200 guest's board-data identity from the container's eth0 MAC.
 #
-# In macvlan mode Docker allocates the container's eth0 (macvlan) interface a
-# MAC of its own on the LAN.  That MAC is the identity of this virtual
-# appliance: it becomes MAC1 in the board data (MAC2 = MAC1 + 1), and it is
-# hashed into the serial number so every container instance is unique.
+# The container runs on a macvlan network: its eth0 has a Docker-assigned MAC
+# and, via the entrypoint's udhcpc, its own DHCP lease.  The QEMU guest shares
+# that same LAN L2 through a macvtap, and the vendor v54bsp driver forces the
+# board-data base MAC (MAC1) onto the guest NIC.  So the guest must use a MAC
+# DISTINCT from the container's eth0 MAC, otherwise the guest NIC and eth0 share
+# one identity and both grab the same DHCP lease.
+#
+# To keep the guest unique per container instance without colliding with the
+# container's own MAC, the guest base MAC is derived by nudging the container's
+# eth0 MAC forward by one (guest MAC1 = container MAC + 1); MAC2 = MAC1 + 1.
+# The serial number is hashed from the guest MAC1, so each instance is unique.
 #
 # Serial format (matches the physical appliance): "5" + 11 digits = 12 chars.
-# The 11 digits come from the first 8 hex chars of SHA-256(MAC), reduced
+# The 11 digits come from the first 8 hex chars of SHA-256(MAC1), reduced
 # modulo 100000000000.
 #
 # Prints source-able KEY=VALUE lines:
-#   MAC=<base MAC, MAC1>
+#   MAC=<guest base MAC, MAC1>
 #   MAC2=<MAC1 + 1>
 #   SERIAL=<12-char serial>
 set -euo pipefail
 
-mac="$(ip link show eth0 2>/dev/null | awk '/ether/{print $2; exit}')"
-if [ -z "$mac" ]; then
+container_mac="$(ip link show eth0 2>/dev/null | awk '/ether/{print $2; exit}')"
+if [ -z "$container_mac" ]; then
     echo "ERROR: cannot read a MAC from eth0 (is the container on a macvlan network?)" >&2
     exit 1
 fi
-mac="$(printf '%s' "$mac" | tr '[:upper:]' '[:lower:]')"
+container_mac="$(printf '%s' "$container_mac" | tr '[:upper:]' '[:lower:]')"
 
-# Serial: hash the MAC, take the low 32 bits, fit into 11 digits, prefix "5".
+# Guest MAC1 = container eth0 MAC + 1 (carry over the last octet).  This is a
+# locally administered, UNICAST address (macvlan parent MACs are locally
+# administered), stays distinct from the container's own eth0 MAC, and is the
+# one the vendor v54bsp driver forces onto the guest NIC.
+v=$((0x$(printf '%s' "$container_mac" | tr -d ':')))
+v=$(((v + 1) & 0xFFFFFFFFFFFF))
+mac="$(printf '%012x' "$v" | sed 's/\(..\)/\1:/g;s/:$//')"
+
+# Serial: hash the guest MAC1, take the low 32 bits, fit into 11 digits, prefix "5".
 hash="$(printf '%s' "$mac" | sha256sum | awk '{print $1}')"
 decimal=$((0x${hash:0:8}))
 eleven_digits=$((decimal % 100000000000))

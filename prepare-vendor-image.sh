@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 # Build the locally ignored runtime image/ directory from a user-supplied,
-# decrypted ZD1200 10.5.1.0.282 archive. No vendor material is redistributed.
+# decrypted ZD1200 archive (any version/build of the ZD1200 platform). No vendor
+# material is redistributed.
 set -euo pipefail
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
 archive_path="${1:-}"
-expected_sha256="${EXPECTED_ARCHIVE_SHA256:-64dfbf4d67cc65cafa0e258e426c664c7387b1219209ec893b9b1e41ab202cb8}"
+# Optional archive-integrity gate: set EXPECTED_ARCHIVE_SHA256 to enforce a
+# specific archive hash; leave empty to accept any (compatible) archive version.
+expected_sha256="${EXPECTED_ARCHIVE_SHA256:-}"
 
 fail() {
     echo "prepare-vendor-image: $*" >&2
     exit 1
 }
 
-[ -n "$archive_path" ] || fail "usage: $0 /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img.tgz"
+[ -n "$archive_path" ] || fail "usage: $0 /path/to/<zd1200 archive>.img.tgz"
 [ -f "$archive_path" ] || fail "archive not found: $archive_path"
 for command in tar gzip python3 md5sum sha256sum; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 
-actual_sha256="$(sha256sum "$archive_path" | awk '{print $1}')"
-[ "$actual_sha256" = "$expected_sha256" ] || fail "unexpected archive SHA-256: $actual_sha256"
+if [ -n "$expected_sha256" ]; then
+    actual_sha256="$(sha256sum "$archive_path" | awk '{print $1}')"
+    [ "$actual_sha256" = "$expected_sha256" ] || fail "unexpected archive SHA-256: $actual_sha256"
+fi
 
 # Refuse paths that would escape the temporary extraction directory.
 if tar -tzf "$archive_path" | awk '/^\// || /(^|\/)\.\.($|\/)/ { bad = 1 } END { exit bad ? 0 : 1 }'; then
@@ -44,8 +49,9 @@ done
 metadata_value() {
     awk -F= -v key="$1" '$1 == key { print $2; exit }' "$metadata"
 }
-[ "$(metadata_value VERSION)" = "10.5.1.0" ] || fail "unexpected vendor version"
-[ "$(metadata_value BUILD)" = "282" ] || fail "unexpected vendor build"
+# The firmware version/build is intentionally NOT pinned so the script is
+# portable across ZD1200 releases; only the hardware platform is validated
+# (the boot/image layout depends on it).
 [ "$(metadata_value REQUIRE_PLATFORM)" = "nar5520" ] || fail "unexpected platform"
 [ "$(metadata_value REQUIRE_SUBPLATFORM)" = "cob7402" ] || fail "unexpected subplatform"
 
@@ -58,7 +64,30 @@ output_dir="$work_dir/image"
 mkdir -p "$output_dir"
 cp -f "$source_dir/bzImage" "$output_dir/bzImage"
 cp -f "$source_dir/restoreinitramfs.gz" "$output_dir/restoreinitramfs.gz"
+# The vendor archive stores the rootfs gzip-compressed.  Both the standalone
+# lab launch and the dockerized run seed the synthetic CF partitions from
+# image/rootfs.ext2, and the controller needs a RAW ext2 filesystem (superblock
+# magic 0xEF53 at byte 1080), so decompress it here.  Idempotent: an
+# already-raw ext2 file is left untouched.
 cp -f "$source_dir/rootfs.i386.ext2.director1200.img" "$output_dir/rootfs.ext2"
+python3 - "$output_dir/rootfs.ext2" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+data = p.read_bytes()
+if data[:3] == b"\x1f\x8b\x08":          # gzip
+    import gzip as gz
+    raw = gz.decompress(data)
+    assert raw[1080:1082] == b"\x53\xef", "decompressed rootfs is not ext2"
+    p.write_bytes(raw)
+    print("image/rootfs.ext2: was gzip, decompressed to raw ext2", len(raw), "bytes")
+elif data[1080:1082] == b"\x53\xef":
+    print("image/rootfs.ext2: raw ext2 OK")
+else:
+    print("image/rootfs.ext2: unrecognized format (expected gzip or ext2)")
+    raise SystemExit(1)
+PY
 
 # The compressed ELF begins at a variable offset inside the x86 bzImage.
 # Search gzip members and keep the one that expands to an i386 ELF file.

@@ -98,6 +98,34 @@ python3 "$work_dir/write-boarddata.py" \
 if [ ! -f "$persistent_disk" ]; then
     qemu-img create -q -f qcow2 -F raw -b "$synthetic_disk" "$persistent_disk"
     echo "Created persistent VM disk overlay: $persistent_disk"
+    # Hint #6: the stock sys_init mounts the empty ext2 data volume (hda4) with
+    # the ReiserFS-only `nolog` option, which fails on ext2, so /writable never
+    # mounts rw and first-boot (certs/web/SSH) never completes.  Apply
+    # patch-rootfs.sh to the freshly created overlay, before QEMU opens it.  It
+    # runs as an ordinary user (qemu-img flatten + debugfs + qemu-io), so no
+    # root/loop/mount is needed; the overlay is patched in place.
+    echo "Patching rootfs (nolog) into the VM overlay ..."
+    QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
+        "$work_dir/patch-rootfs.sh"
+    # Bake the image-signing bypass / upgrade entitlement (the license): patches
+    # /bin/sys_wrapper.sh (check_sign_cert), writes the patch-storage payload and
+    # refreshes /file_list.txt for sys_wrapper.sh.  Runs after patch-rootfs.sh on
+    # the same freshly-created overlay, before QEMU opens it.  Needs the signing
+    # cert payload mounted at ZD_SIGN_CERT_DIR; warn (don't abort) if it's absent
+    # so the guest can still boot, just without the license baked in.
+    if [ -f "$work_dir/patch-rootfs-signing.sh" ]; then
+        echo "Baking signing bypass / upgrade entitlement into the VM overlay ..."
+        # patch-rootfs-signing.sh takes CERT_DIR as $1 (positional) and ignores a
+        # CERT_DIR env var — pass it as an argument.
+        if QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
+            "$work_dir/patch-rootfs-signing.sh" \
+            "${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"; then
+            echo "Signing bypass baked into the VM overlay."
+        else
+            echo "WARNING: could not bake the signing bypass (cert dir missing?);" >&2
+            echo "         the guest will boot WITHOUT the license/upgrade entitlement." >&2
+        fi
+    fi
 fi
 
 : > "$log_file"
@@ -108,7 +136,20 @@ fi
 # in the background until the LAN grants a lease - which also gives mDNS
 # multicast a real L2 path.
 if [ "${NETWORK_MODE:-user}" = macvtap ]; then
-    udhcpc -i eth0 -b -q -p /var/run/udhcpc.pid >>"$log_file" 2>&1 || true
+    # In host-netns mode eth0 is the host's own interface and already carries
+    # the host's IP; running udhcpc on it would try to re-lease and could
+    # disturb the host's connectivity.  Skip it unless explicitly asked.
+    if [ "${ZD_HOST_NET:-0}" != "1" ]; then
+        udhcpc -i eth0 -b -q -p /var/run/udhcpc.pid >>"$log_file" 2>&1 || true
+    fi
+    # The macvlan bridge isolates this container from its macvtap guest, so the
+    # container can neither reach nor ARP-scan the guest.  sniff-guest-dhcp.py
+    # watches the LAN (eth0) for the DHCP reply addressed to the guest MAC and
+    # records the guest's dynamic lease to $state_dir/guest-ip (and the log).
+    if [ -f "$work_dir/sniff-guest-dhcp.py" ]; then
+        python3 "$work_dir/sniff-guest-dhcp.py" "$zd_mac1" "$state_dir/guest-ip" \
+            >>"$log_file" 2>&1 &
+    fi
 fi
 setsid env KERNEL="$patched_kernel" \
     INITRD="" \
@@ -118,6 +159,7 @@ setsid env KERNEL="$patched_kernel" \
     HTTPS_PORT="$https_port" \
     NETWORK_MODE="$network_mode" \
     TAP_IF="${TAP_IF:-tap-zd}" \
+    ZD_MAC1="$zd_mac1" \
     ZD_MAC2="$zd_mac2" \
     nice -n 10 ./run-zd1200-qemu.sh \
     >>"$log_file" 2>&1 </dev/null &
@@ -169,57 +211,100 @@ if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
 else
     probe_base="https://127.0.0.1:$https_port"
 fi
+# A macvlan parent does not loop broadcasts back to its own port, so an
+# macvtap guest (a sibling macvlan on the same parent) is NOT reachable from
+# this container by its LAN IP: curling $guest_ip would always time out.  In
+# macvtap mode detect readiness from the guest's serial console instead, which
+# this entrypoint writes to $log_file.  Other modes keep the HTTP probe.
+if [ "$network_mode" = macvtap ]; then
+    probe_method=console
+else
+    probe_method=http
+fi
+ready_marker="System go into READY status."
 deadline=$((SECONDS + wait_seconds))
 next_notice=$((SECONDS + 30))
 while (( SECONDS < deadline )); do
-    http_status="$(curl -ksS --max-time 3 -o /tmp/zd1200-login.html \
-        -w '%{http_code}' \
-        "$probe_base/admin10/login.jsp" \
-        2>/dev/null || true)"
-    if { [ "$http_status" = 302 ] && rg -q 'wizard\.jsp' /tmp/zd1200-login.html; } \
-        || { [ "$http_status" = 200 ] \
-            && [ "$(wc -c < /tmp/zd1200-login.html)" -gt 1000 ] \
-            && ! rg -q '~(SystemName|Username|GP_Login)~' /tmp/zd1200-login.html; }; then
-        if [ "$http_status" = 302 ] || rg -q 'form-wizard|Setup Wizard' /tmp/zd1200-login.html; then
-            # Seeing HTML is insufficient: the stock factory session has an
-            # empty CID, while its AJAX modules still enforce a CSRF match.
-            # Confirm that our factory-only compatibility patch reaches the
-            # backend before inviting the user to complete the wizard.
-            cookie_jar="/tmp/zd1200-web-cookie.$qemu_pid"
-            factory_reply="/tmp/zd1200-factory-probe.$qemu_pid.xml"
-            curl -ksS --max-time 5 -c "$cookie_jar" -b "$cookie_jar" \
-                -o /dev/null "$probe_base/admin10/wizard.jsp" 2>/dev/null || true
-            curl -ksS --max-time 8 -c "$cookie_jar" -b "$cookie_jar" \
-                -H 'X-Requested-With: XMLHttpRequest' \
-                -H 'X-Rico-Version: 1.1.2' -H 'X-CSRF-Token;' \
-                -H 'Content-Type: text/xml' \
-                --data-binary '<ajax-request action="getconf" comp="system" updater="readiness-probe"/>' \
-                -o "$factory_reply" "$probe_base/admin10/_conf.jsp" 2>/dev/null || true
-            if ! rg -q '<ajax-response>.*<system>' "$factory_reply" 2>/dev/null; then
-                rm -f "$cookie_jar" "$factory_reply"
-                sleep 1
-                continue
+    if [ "$probe_method" = console ]; then
+        # macvtap: the guest is a sibling macvlan on the same parent as this
+        # container, so it is unreachable by LAN IP from here.  Detect READY
+        # from the guest's serial console (written to $log_file) instead.
+        if rg -qF "$ready_marker" "$log_file" 2>/dev/null; then
+            # Prefer the guest lease learned from the LAN by sniff-guest-dhcp.py
+            # (the macvlan bridge isolates this container from its guest).
+            if [ -s "$state_dir/guest-ip" ]; then
+                ready_ip="$(cat "$state_dir/guest-ip")"
+            else
+                ready_ip="$guest_ip"
             fi
-            rm -f "$cookie_jar" "$factory_reply"
-            ready_url="$probe_base/admin10/wizard.jsp"
-            ready_kind="factory setup wizard"
-        else
-            ready_url="$probe_base/admin10/login.jsp"
-            ready_kind="login page"
+            ready_url="https://$ready_ip/admin10/login.jsp"
+            ready_kind="web service"
+            echo "ZD1200 $ready_kind is ready (guest console reported: '$ready_marker')."
+            echo "HTTP:  http://$ready_ip/"
+            echo "HTTPS: $ready_url"
+            if [ "$ready_ip" = "$guest_ip" ]; then
+                # No lease observed yet — the guest IP may not match the
+                # configured ZD_GUEST_IP; tell the user how to confirm it.
+                echo "Note: guest IP is dynamic on DHCP; if $guest_ip is not its lease,"
+                echo "      find it from another LAN host (e.g. arp-scan --localnet)."
+            fi
+            if [ "$vm_accel" = kvm ]; then
+                echo "Hardware acceleration: KVM"
+            fi
+            echo "Press Ctrl-C to stop the virtual ZoneDirector."
+            ready=1
+            break
         fi
-        echo "ZD1200 $ready_kind is ready:"
-        if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
-            echo "HTTP:  http://$guest_ip/"
-        else
-            echo "HTTP:  http://127.0.0.1:$http_port/"
+    else
+        http_status="$(curl -ksS --max-time 3 -o /tmp/zd1200-login.html \
+            -w '%{http_code}' \
+            "$probe_base/admin10/login.jsp" \
+            2>/dev/null || true)"
+        if { [ "$http_status" = 302 ] && rg -q 'wizard\.jsp' /tmp/zd1200-login.html; } \
+            || { [ "$http_status" = 200 ] \
+                && [ "$(wc -c < /tmp/zd1200-login.html)" -gt 1000 ] \
+                && ! rg -q '~(SystemName|Username|GP_Login)~' /tmp/zd1200-login.html; }; then
+            if [ "$http_status" = 302 ] || rg -q 'form-wizard|Setup Wizard' /tmp/zd1200-login.html; then
+                # Seeing HTML is insufficient: the stock factory session has an
+                # empty CID, while its AJAX modules still enforce a CSRF match.
+                # Confirm that our factory-only compatibility patch reaches the
+                # backend before inviting the user to complete the wizard.
+                cookie_jar="/tmp/zd1200-web-cookie.$qemu_pid"
+                factory_reply="/tmp/zd1200-factory-probe.$qemu_pid.xml"
+                curl -ksS --max-time 5 -c "$cookie_jar" -b "$cookie_jar" \
+                    -o /dev/null "$probe_base/admin10/wizard.jsp" 2>/dev/null || true
+                curl -ksS --max-time 8 -c "$cookie_jar" -b "$cookie_jar" \
+                    -H 'X-Requested-With: XMLHttpRequest' \
+                    -H 'X-Rico-Version: 1.1.2' -H 'X-CSRF-Token;' \
+                    -H 'Content-Type: text/xml' \
+                    --data-binary '<ajax-request action="getconf" comp="system" updater="readiness-probe"/>' \
+                    -o "$factory_reply" "$probe_base/admin10/_conf.jsp" 2>/dev/null || true
+                if ! rg -q '<ajax-response>.*<system>' "$factory_reply" 2>/dev/null; then
+                    rm -f "$cookie_jar" "$factory_reply"
+                    sleep 1
+                    continue
+                fi
+                rm -f "$cookie_jar" "$factory_reply"
+                ready_url="$probe_base/admin10/wizard.jsp"
+                ready_kind="factory setup wizard"
+            else
+                ready_url="$probe_base/admin10/login.jsp"
+                ready_kind="login page"
+            fi
+            echo "ZD1200 $ready_kind is ready:"
+            if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
+                echo "HTTP:  http://$guest_ip/"
+            else
+                echo "HTTP:  http://127.0.0.1:$http_port/"
+            fi
+            echo "HTTPS: $ready_url"
+            if [ "$vm_accel" = kvm ]; then
+                echo "Hardware acceleration: KVM"
+            fi
+            echo "Press Ctrl-C to stop the virtual ZoneDirector."
+            ready=1
+            break
         fi
-        echo "HTTPS: $ready_url"
-        if [ "$vm_accel" = kvm ]; then
-            echo "Hardware acceleration: KVM"
-        fi
-        echo "Press Ctrl-C to stop the virtual ZoneDirector."
-        ready=1
-        break
     fi
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
         echo "QEMU exited before the web service became ready." >&2

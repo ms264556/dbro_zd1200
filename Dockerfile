@@ -24,8 +24,11 @@ COPY boarddata-from-mac.sh \
      limit-process-cpu.py \
      make-synthetic-cf.py \
      patch-kernel.py \
+     patch-rootfs.sh \
+     patch-rootfs-signing.sh \
      run-zd1200-qemu.sh \
      run-zd1200-web.sh \
+     sniff-guest-dhcp.py \
      write-boarddata.py \
      /opt/zd1200/
 
@@ -42,6 +45,6 @@ ENV STATE_DIR=/var/lib/zd1200 \
 VOLUME ["/var/lib/zd1200"]
 
 HEALTHCHECK --interval=30s --timeout=8s --start-period=10m --retries=3 \
-    CMD curl -kfsS --max-time 5 https://192.168.50.10/admin10/login.jsp >/dev/null || exit 1
+    CMD rg -qF 'System go into READY status.' /tmp/zd1200-web.log || exit 1
 
 CMD ["./run-zd1200-web.sh"]

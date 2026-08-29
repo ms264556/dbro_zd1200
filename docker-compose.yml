@@ -12,17 +12,26 @@ services:
       - /dev/kvm:/dev/kvm
       - /dev/net/tun:/dev/net/tun
 
-    # macvlan: the container gets its own MAC on the LAN (so mDNS works) and
-    # the entrypoint's udhcpc obtains an IP from the LAN DHCP server.  The
-    # parent interface is configurable via ZD_MACVLAN_PARENT.
-    networks:
-      - zd1200-macvlan
+    # Host netns: the container shares the host's network namespace, so the
+    # macvtap for the QEMU guest is created on the host's PHYSICAL interface
+    # (eth0) and forwards to the LAN.  A macvtap layered on a Docker macvlan
+    # does NOT forward to the parent (verified: the guest's frames never left
+    # the container), so the guest must use a top-level macvtap on eth0.
+    # NOTE: the container now shares eth0 with the host; the entrypoint does NOT
+    # run udhcpc on it (ZD_HOST_NET=1) so the host's IP is never disturbed.
+    network_mode: host
 
     # The QEMU guest attaches through a macvtap created on eth0 (needs
     # NET_ADMIN) and opens the kernel's tap char device, whose major number
     # is host-dependent (hence the wildcard device-cgroup rule).
+    #   CAP_MKNOD - the tap char node is not in the container /dev; the entrypoint
+    #               mknods it (host-dependent major) so QEMU can open it.
+    #   CAP_NET_RAW - the entrypoint's udhcpc needs an AF_PACKET/raw socket to
+    #                 request a DHCP lease on the macvlan interface.
     cap_add:
       - NET_ADMIN
+      - MKNOD
+      - NET_RAW
     device_cgroup_rules:
       - "c *:* rwm"
 
@@ -30,12 +39,17 @@ services:
       CPU_MODEL: pentium3
       MEMORY_MB: "2048"
       NETWORK_MODE: macvtap
+      ZD_HOST_NET: "1"
+      ZD_SIGN_CERT_DIR: /opt/zd1200/signing-cert
       TAP_IF: ${ZD_TAP_IF:-tap-zd}
       GUEST_IP: ${ZD_GUEST_IP:-192.168.50.10}
       # Board data written into the CF image: serial + base MAC (MAC2=MAC1+1).
-      # In macvlan mode the serial and MACs are derived from the container's
-      # eth0 MAC; set ZD_BOARDDATA_FROM_MAC=0 to force the fixed values below.
-      ZD_BOARDDATA_FROM_MAC: "1"
+      # The MAC-derived serial (boarddata-from-mac.sh, used when
+      # ZD_BOARDDATA_FROM_MAC=1) is REJECTED by the firmware's support-entitlement
+      # check (E_InvalidSerialNumber = "serial number mismatch"), so the banner
+      # persists.  Use the known-valid default serial/MAC below instead — this is
+      # what the standalone (non-docker) flow used and which passed the check.
+      ZD_BOARDDATA_FROM_MAC: "0"
       ZD_SERIAL: ${ZD_SERIAL:-123456000789}
       ZD_MAC1: ${ZD_MAC1:-00:0c:e6:12:00:01}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
@@ -45,6 +59,9 @@ services:
 
     volumes:
       - ${ZD_IMAGE_DIR:-./image}:/opt/zd1200/image:ro
+      # Signing cert payload consumed by patch-rootfs-signing.sh (the license
+      # bypass).  Host path configurable via ZD_SIGN_CERT_HOST (set in .env).
+      - ${ZD_SIGN_CERT_HOST:-/home/tony/dev/ms264556.net/scripts/create_zd1200_signing_bypass/cert}:/opt/zd1200/signing-cert:ro
       - zd1200-state:/var/lib/zd1200
 
     cap_drop:
@@ -54,22 +71,15 @@ services:
     stop_grace_period: 20s
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -kfsS --max-time 5 https://${ZD_GUEST_IP:-192.168.50.10}/admin10/login.jsp >/dev/null || exit 1"]
+      # macvlan isolates the container from its own macvtap guest, so the
+      # guest's HTTPS is not reachable from inside the container.  Mark healthy
+      # on the guest's READY marker in the serial-console log (written by
+      # run-zd1200-web.sh) instead of curling an unreachable static IP.
+      test: ["CMD-SHELL", "rg -qF 'System go into READY status.' /tmp/zd1200-web.log 2>/dev/null || exit 1"]
       interval: 30s
       timeout: 8s
       start_period: 10m
       retries: 3
-
-networks:
-  # L2 network for the container: its own MAC on the LAN, IP from the LAN's
-  # DHCP server (obtained by udhcpc in the entrypoint).  The parent must be
-  # the host interface that carries the LAN: a real NIC, or a vSwitch/bridge
-  # port with MAC spoofing enabled (macvlan uses MACs other than the host's).
-  zd1200-macvlan:
-    driver: macvlan
-    driver_opts:
-      parent: ${ZD_MACVLAN_PARENT:-eth0}
-      mode: bridge
 
 volumes:
   zd1200-state:

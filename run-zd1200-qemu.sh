@@ -81,6 +81,15 @@ case "${NETWORK_MODE:-user}" in
         if ! ip link show "$macvtap_if" >/dev/null 2>&1; then
             ip link add link eth0 name "$macvtap_if" type macvtap mode bridge
         fi
+        # The kernel assigns the macvtap an auto-generated MAC, but the guest NIC
+        # carries the board-data MAC1 ($ZD_MAC1).  The macvlan bridge routes
+        # inbound frames by destination MAC, so the macvtap MAC MUST equal the
+        # guest NIC MAC, otherwise the LAN's DHCP offer/ack (and any unicast to
+        # the guest) is dropped before it reaches the guest — the guest never
+        # completes DHCP.  Set it before the interface is brought up.
+        if [ -n "${ZD_MAC1:-}" ]; then
+            ip link set "$macvtap_if" address "$ZD_MAC1"
+        fi
         ip link set "$macvtap_if" up
         tap_idx="$(cat "/sys/class/net/$macvtap_if/ifindex")"
         dev_t="$(cat "/sys/class/macvtap/tap$tap_idx/dev" 2>/dev/null)"
@@ -110,10 +119,13 @@ if [ "${NETWORK_MODE:-user}" != none ]; then
     # the igb2 driver.  QEMU's `igb` model emulates the Intel 82576 (PCI
     # 0x10C9) which igb2.ko supports, so the stock driver binds and brings up
     # eth0/br0 exactly like real hardware.
-    if [ "${NETWORK_MODE:-user}" = macvtap ] && [ -n "${ZD_MAC2:-}" ]; then
-        # MAC2 = MAC1 + 1 (board data): unique per container and distinct from
-        # the container's own eth0 (MAC1) on the same LAN segment.
-        nic_args=( -net "nic,model=igb,macaddr=$ZD_MAC2" )
+    if [ "${NETWORK_MODE:-user}" = macvtap ] && [ -n "${ZD_MAC1:-}" ]; then
+        # The QEMU NIC must carry the guest's base MAC (board-data MAC1, the
+        # one the vendor v54bsp driver forces onto NIC[0]).  This is derived
+        # FROM the container's eth0 MAC but is a distinct value (eth0 + 1), so
+        # the guest does NOT share the container's MAC, and both request their
+        # own (separate) DHCP lease on the same LAN segment.
+        nic_args=( -net "nic,model=igb,macaddr=$ZD_MAC1" )
     else
         nic_args=( -net nic,model=igb,macaddr=52:54:00:12:00:01 )
     fi
