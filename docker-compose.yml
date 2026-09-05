@@ -47,8 +47,7 @@ services:
       # The MAC-derived serial (boarddata-from-mac.sh, used when
       # ZD_BOARDDATA_FROM_MAC=1) is REJECTED by the firmware's support-entitlement
       # check (E_InvalidSerialNumber = "serial number mismatch"), so the banner
-      # persists.  Use the known-valid default serial/MAC below instead — this is
-      # what the standalone (non-docker) flow used and which passed the check.
+      # persists.  This is the known-valid default serial/MAC that passes the check.
       ZD_BOARDDATA_FROM_MAC: "0"
       ZD_SERIAL: ${ZD_SERIAL:-123456000789}
       ZD_MAC1: ${ZD_MAC1:-00:0c:e6:12:00:01}
@@ -61,7 +60,7 @@ services:
       - ${ZD_IMAGE_DIR:-./image}:/opt/zd1200/image:ro
       # Signing cert payload consumed by patch-rootfs-signing.sh (the license
       # bypass).  Host path configurable via ZD_SIGN_CERT_HOST (set in .env).
-      - ${ZD_SIGN_CERT_HOST:-/home/tony/dev/ms264556.net/scripts/create_zd1200_signing_bypass/cert}:/opt/zd1200/signing-cert:ro
+      - ${ZD_SIGN_CERT_HOST:-./image/signing-cert}:/opt/zd1200/signing-cert:ro
       - zd1200-state:/var/lib/zd1200
 
     cap_drop:

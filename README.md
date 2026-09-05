@@ -1,5 +1,12 @@
 # Virtual ZoneDirector 1200 — 10.5.1.0.282 proof of concept
 
+> **This is a Docker Compose project.** The guest runs inside a Docker container
+> with a complete, verified host-netns + macvtap network stack. **Run it with
+> `sudo ./build-container.sh`** (= `docker compose up -d --build`). Do **not**
+> run `run-zd1200-qemu.sh` / `run-zd1200-web.sh` directly, and do **not**
+> re-implement macvlan/macvtap/TAP/bridge networking — it is already done
+> (RUNBOOK.md §7b). If you are an agent, read `AGENTS.md` first.
+
 This project boots the x86 ZoneDirector 1200 software in QEMU/KVM and exposes
 it through the web UI (and the stock administrative SSH once configured). It
 is an experimental, unsupported lab port; it is not affiliated with or
@@ -38,7 +45,7 @@ by Git and must never be committed.
 
 ## Prerequisites
 
-- x86_64 (or aarch64 — see ZD1200-LAB-GUIDE.md) Linux host with QEMU
+- x86_64 (or aarch64 — see RUNBOOK.md) Linux host with QEMU
   (`qemu-system-i386`, `qemu-img`) and e2fsprogs (`mke2fs`); KVM is
   optional.
 - For the host-TAP path (`host/zd1200-bridge`): a dedicated Layer-2 interface
@@ -146,15 +153,15 @@ networks. Use a dedicated management VLAN and firewall rules.
 The source-only public repository should contain these files:
 
 ```text
-Dockerfile                    docker-compose.yml             docker-compose.user.yml
-.env.example                  make-synthetic-cf.py           patch-kernel.py
-patch-rootfs.sh               patch-rootfs-signing.sh        write-boarddata.py
-run-zd1200-lab.sh             run-zd1200-web.sh              boarddata-from-mac.sh
+AGENTS.md                     Dockerfile                    docker-compose.yml
+docker-compose.user.yml       .env.example                  make-synthetic-cf.py
+patch-kernel.py               patch-rootfs.sh               patch-rootfs-signing.sh
+write-boarddata.py            run-zd1200-qemu.sh            run-zd1200-web.sh
+build-container.sh            inject-dropbear.sh            boarddata-from-mac.sh
 sniff-guest-dhcp.py           limit-process-cpu.py           prepare-vendor-image.sh
 host/zd1200-bridge            host/zd1200-bridge.service     host/zd1200-bridge.env.example
-README.md                     WRITABLE_PARTITION.md          ZD1200-LAB-GUIDE.md
-RUNBOOK.md                    LICENSE                        .gitignore
-.dockerignore
+README.md                     WRITABLE_PARTITION.md         RUNBOOK.md
+LICENSE                       .gitignore                    .dockerignore
 ```
 
 `limit-process-cpu.py` is retained for the automatic TCG fallback only.

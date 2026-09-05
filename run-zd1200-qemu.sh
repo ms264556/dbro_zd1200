@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# NOTE: This is the container's GUEST LAUNCHER. It is invoked by
+# run-zd1200-web.sh (the container entrypoint) — do NOT run it directly on the
+# host. The supported way to run this project is `sudo ./build-container.sh`
+# (= docker compose up -d --build). See AGENTS.md and RUNBOOK.md.
 set -u
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -176,6 +180,18 @@ if [ -n "$initrd" ]; then
     initrd_args=( -initrd "$initrd" )
 fi
 
+# The ZD1200 CLI login authenticates users through a BMC chip over IPMI (see
+# the ipmi_cmdraw_ia / "BMC KCS Initialized" / GetUser/SetPasswd strings in the
+# rootfs).  A physical ZD has that BMC; QEMU's '-machine pc' does not, so the
+# login gets "No Response from BMC...Exiting".  Attach a software BMC
+# (ipmi-bmc-sim) on the ISA KCS interface (default I/O 0xca2) so the guest's
+# ipmi_si driver can reach it.  Set ZD_IPMI=0 to disable.
+ipmi_args=()
+if [ "${ZD_IPMI:-1}" != "0" ]; then
+    ipmi_args+=( -device ipmi-bmc-sim,id=bmc0 )
+    ipmi_args+=( -device isa-ipmi-kcs,id=isa0,bmc=bmc0 )
+fi
+
 exec qemu-system-i386 \
     -name zd1200-10.5.1-lab \
     "${accel_args[@]}" \
@@ -190,6 +206,7 @@ exec qemu-system-i386 \
     "${snapshot_args[@]}" \
     "${net_args[@]}" \
     "${nic_args[@]}" \
+    "${ipmi_args[@]}" \
     -nographic \
     -no-reboot \
     "${pacing_args[@]}" \

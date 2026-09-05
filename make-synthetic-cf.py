@@ -45,6 +45,43 @@ if not mke2fs:
         "ext2 data partition (apt install e2fsprogs, or set MKE2FS)"
     )
 
+def seed_writable_config(ext2_path):
+    """Populate the /writable data partition (hda4) with the passwd/shadow that
+    the rootfs /etc/passwd symlink resolves to.
+
+    The vendor /etc/passwd is a symlink -> /writable/etc/config/passwd and
+    /etc/shadow is a regular vendor file in the rootfs.  On a factory-fresh
+    volume the controller only writes /writable/etc/config/passwd at first boot,
+    so a port-2222 dropbear (static musl getpwnam) could not resolve 'root'
+    before that.  Seeding the target makes root resolvable on the very first
+    boot; the first-run wizard overwrites these files later.
+    """
+    passwd_src = base / "dropbear-provision" / "passwd"
+    shadow_src = base / "dropbear-provision" / "shadow"
+    if not passwd_src.exists() or not shadow_src.exists():
+        # The /writable passwd/shadow seed is an optional dropbear prep step
+        # (inject-dropbear.sh).  In the container these files are not present,
+        # and a factory-virgin /writable is exactly the vendor default, so skip
+        # rather than abort (doing so would break every `docker compose up`).
+        print("  dropbear-provision/passwd/shadow missing; leaving /writable unseeded")
+        return
+    cmds = [
+        "mkdir /etc",
+        "mkdir /etc/config",
+        f"write {passwd_src} /etc/config/passwd",
+        f"write {shadow_src} /etc/config/shadow",
+        "set_inode_field /etc/config/shadow mode 0100640",
+    ]
+    cmdfile = base / ".seed-writable.cmds"
+    cmdfile.write_text("\n".join(cmds) + "\n")
+    try:
+        subprocess.run(["debugfs", "-w", "-f", str(cmdfile), ext2_path],
+                       check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    finally:
+        cmdfile.unlink()
+
+
 with disk.open("wb") as handle:
     handle.truncate(DISK_SIZE)
 
@@ -85,6 +122,7 @@ with disk.open("r+b") as handle:
         os.truncate(tf_path, p4_sectors * SECTOR)
         subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", tf_path], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        seed_writable_config(tf_path)
         with open(tf_path, "rb") as rf:
             handle.seek(p4_start * SECTOR)
             while True:

@@ -42,7 +42,7 @@ sudo apt-get install -y docker.io docker-compose-v2
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER"         # NEXT login; until then use `sudo docker …`
 
-# Host tooling for prepare-vendor-image.sh and the standalone lab:
+# Host tooling for prepare-vendor-image.sh:
 sudo apt-get install -y qemu-utils e2fsprogs gzip python3 curl
 ```
 
@@ -89,7 +89,7 @@ cp .env.example .env
 #   ZD_GUEST_IP=192.168.50.10     # guest's mgmt IP (it leases from DHCP; the
 #                                 # readiness is console-based, so the exact IP
 #                                 # only affects the printed URL)
-#   ZD_SIGN_CERT_HOST=/home/<you>/dev/ms264556.net/scripts/create_zd1200_signing_bypass/cert
+#   ZD_SIGN_CERT_HOST=./image/signing-cert  # default; extracted from the ZD firmware archive by prepare-vendor-image.sh
 vim .env
 
 docker compose up -d --build

@@ -34,7 +34,7 @@ p4_start, p4_sectors = 985088, 3000000   # writable area / remaining CF
 hda4 is formatted as ext2, not ReiserFS like the physical card, because the
 lab rootfs is patched: `patch-rootfs.sh` removes the ReiserFS-only `nolog`
 option from `etc/init.d/sys_init` (hda2/hda3), so the stock mount command
-works against a plain ext2 volume (see ZD1200-LAB-GUIDE.md hint #6).
+works against a plain ext2 volume (see RUNBOOK.md §7).
 
 ### The formatting step
 
@@ -99,6 +99,6 @@ tmpfs on /writable/etc/airespider-images/firmwares/supportxt type tmpfs (rw,rela
   `synthetic-cf.img`.  Every write to `/writable` during a run lands in the
   overlay, so config/certs/keygen survive across reboots.  (In the dockerized
   run the same overlay lives in the named state volume.)
-- `./run-zd1200-lab.sh --reset-disk` deletes both `synthetic-cf.img` and
-  `zd1200-vm.qcow2`; the next launch rebuilds hda4 from scratch → an empty
-  factory volume again (the wizard re-runs).
+- `docker compose down -v` deletes the named state volume (which holds both
+  `synthetic-cf.img` and `zd1200-vm.qcow2`); the next `up` rebuilds hda4 from
+  scratch → an empty factory volume again (the wizard re-runs).

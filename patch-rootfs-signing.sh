@@ -30,10 +30,10 @@
 #
 # Usage:  ./patch-rootfs-signing.sh [CERT_DIR]
 #
-# CERT_DIR defaults to the create_zd1200_signing_bypass cert directory and
-# must contain signing_cert.pem + digital_sig_sha256.bin +
-# digital_sig_sha384.bin + all_checksums.txt (they are packed into cert.tgz
-# exactly like 1_generate_cert_uu.sh does).
+# CERT_DIR defaults to image/signing-cert, which prepare-vendor-image.sh fills
+# from the ZD firmware archive.  It must contain signing_cert.pem +
+# digital_sig_sha256.bin + digital_sig_sha384.bin + all_checksums.txt (packed
+# into cert.tgz exactly like the create_zd1200_signing_bypass tool does).
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +41,7 @@ QCOW="${QCOW:-$BASE/zd1200-vm.qcow2}"
 WORK="${WORK:-$BASE/.rootfs-patch-work}"
 ALIGN=512
 
-CERT_DIR="${1:-$HOME/dev/ms264556.net/scripts/create_zd1200_signing_bypass/cert}"
+CERT_DIR="${1:-$BASE/image/signing-cert}"
 
 # name|start_sector|sector_count   (mirrors make-synthetic-cf.py / patch-rootfs.sh)
 PARTITIONS=(

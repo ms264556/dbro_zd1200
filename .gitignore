@@ -9,6 +9,11 @@ rootfs/
 bootinitramfs.runtime.gz
 bootinitramfs.runtime.gz.sha256
 
+# Dropbear provisioning inputs (keypair, hostkey, 2222 init) and patch work dirs
+dropbear-provision/
+.rootfs-patch-work/
+bzImage.patched
+
 # Original packages, diagnostics and logs
 *.img
 *.tgz
@@ -30,3 +35,7 @@ __pycache__/
 .env
 *.key
 *.pem
+
+# Local agent and test state
+.reasonix/
+reasonix.toml

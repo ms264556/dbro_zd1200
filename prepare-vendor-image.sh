@@ -64,12 +64,32 @@ output_dir="$work_dir/image"
 mkdir -p "$output_dir"
 cp -f "$source_dir/bzImage" "$output_dir/bzImage"
 cp -f "$source_dir/restoreinitramfs.gz" "$output_dir/restoreinitramfs.gz"
-# The vendor archive stores the rootfs gzip-compressed.  Both the standalone
-# lab launch and the dockerized run seed the synthetic CF partitions from
-# image/rootfs.ext2, and the controller needs a RAW ext2 filesystem (superblock
+# The vendor archive stores the rootfs gzip-compressed.  The dockerized run
+# seeds the synthetic CF partitions from image/rootfs.ext2, and the controller
+# needs a RAW ext2 filesystem (superblock
 # magic 0xEF53 at byte 1080), so decompress it here.  Idempotent: an
 # already-raw ext2 file is left untouched.
 cp -f "$source_dir/rootfs.i386.ext2.director1200.img" "$output_dir/rootfs.ext2"
+
+# The ZD1200 firmware-signing cert payload (image-signing / upgrade-entitlement
+# bypass cert) ships in the vendor archive.  Extract it into image/signing-cert/
+# so the container can mount it at /opt/zd1200/signing-cert for
+# patch-rootfs-signing.sh (the license).  Override with ZD_SIGN_CERT_HOST if you
+# have a specific cert.  Missing files are warned, not fatal (the guest then
+# boots without the license).
+signing_out="$output_dir/signing-cert"
+mkdir -p "$signing_out"
+for f in signing_cert.pem digital_sig_sha256.bin digital_sig_sha384.bin all_checksums.txt; do
+    if [ -f "$source_dir/$f" ]; then
+        cp -f "$source_dir/$f" "$signing_out/"
+    else
+        echo "prepare-vendor-image: warning: $f not found in vendor archive" >&2
+    fi
+done
+# The vendor ships the two signature blobs 0600 (owner-only); make them readable
+# so the container (which runs under user-namespace remap, not host-root) can
+# read them during patch-rootfs-signing.sh.  Public signing material, not a secret.
+chmod 644 "$signing_out"/* 2>/dev/null || true
 python3 - "$output_dir/rootfs.ext2" <<'PY'
 import sys
 from pathlib import Path

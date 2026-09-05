@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# NOTE: This is the container's ENTRYPOINT. It is run by Docker Compose as the
+# zd1200 container command — do NOT run it directly on the host as a standalone
+# flow. The supported way to run this project is `sudo ./build-container.sh`
+# (= docker compose up -d --build). See AGENTS.md and RUNBOOK.md.
 set -euo pipefail
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -158,6 +162,7 @@ setsid env KERNEL="$patched_kernel" \
     HTTP_PORT="$http_port" \
     HTTPS_PORT="$https_port" \
     NETWORK_MODE="$network_mode" \
+    EXTRA_HOSTFWD="$(printf '%s' "${EXTRA_HOSTFWD:-}")" \
     TAP_IF="${TAP_IF:-tap-zd}" \
     ZD_MAC1="$zd_mac1" \
     ZD_MAC2="$zd_mac2" \
