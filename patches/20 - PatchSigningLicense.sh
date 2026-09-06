@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# patch-rootfs-signing.sh — bake the ZD1200 image-signing bypass and upgrade
+# 20 - PatchSigningLicense.sh — bake the ZD1200 image-signing bypass and upgrade
 # entitlement into the lab VM rootfs partitions (hda2/hda3), writing the
 # result into the qcow2 overlay only.  Runs as a standard user: no root, no
 # loop devices, no nbd, no mount.
@@ -39,7 +39,7 @@ QCOW="${QCOW:-$BASE/zd1200-vm.qcow2}"
 WORK="${WORK:-$BASE/.rootfs-patch-work}"
 ALIGN=512
 
-CERT_DIR="${1:-$BASE/image/signing-cert}"
+CERT_DIR="${1:-$(dirname "$BASE")/image/signing-cert}"
 
 # name|start_sector|sector_count   (mirrors make-synthetic-cf.py / patch-rootfs.sh)
 PARTITIONS=(
@@ -47,9 +47,22 @@ PARTITIONS=(
     "hda3|657408|327680"
 )
 
+# The signing/license patch is OPTIONAL from the coordinator's point of view:
+# if the signing-cert payload is absent (e.g. a bare firmware archive without a
+# cert, or ZD_SIGN_CERT_DIR not mounted) the guest can still boot, just without
+# the baked-in license/upgrade entitlement.  Warn and no-op instead of failing
+# so the coordinator does not abort the whole pipeline over it.  A patch that
+# DOES touch the rootfs (e.g. the ARM/nolog fix) is genuinely required and
+# still aborts on failure.
+missing=0
 for c in signing_cert.pem digital_sig_sha256.bin digital_sig_sha384.bin all_checksums.txt; do
-    [ -f "$CERT_DIR/$c" ] || { echo "missing $CERT_DIR/$c (set CERT_DIR)" >&2; exit 1; }
+    if [ ! -f "$CERT_DIR/$c" ]; then
+        echo "WARNING: missing $CERT_DIR/$c; skipping the signing/license patch" >&2
+        echo "         (guest will boot WITHOUT the upgrade entitlement)" >&2
+        missing=1
+    fi
 done
+[ "$missing" = 0 ] || exit 0
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 

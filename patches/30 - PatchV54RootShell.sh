@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# patch-rootfs-v54.sh — bake the vendor "!v54!" root-shell escape fix.
+# 30 - PatchV54RootShell.sh — bake the vendor "!v54!" root-shell escape fix.
 #
 # The ZD1200 CLI command `!v54!` verifies a passphrase through /usr/sbin/sesame2
 # and drops to a root shell only if that call succeeds.  We make it always
@@ -19,16 +19,16 @@
 # untouched).
 #
 # Usage:
-#   QCOW=<overlay.qcow2> WORK=<workdir> ./patch-rootfs-v54.sh
+#   QCOW=<overlay.qcow2> WORK=<workdir> ./"30 - PatchV54RootShell.sh"
 #
 # Idempotent: a partition whose sesame2 is already the exit-0 script is left
 # alone.
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$BASE/zd1200-vm.qcow2}"
+QCOW="${QCOW:-$(dirname "$BASE")/zd1200-vm.qcow2}"
 # Work dir holds the ~2 GiB flatten file, so keep it on disk-backed storage.
-WORK="${WORK:-$BASE/.rootfs-patch-work}"
+WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
 
 TARGET="/usr/sbin/sesame2"

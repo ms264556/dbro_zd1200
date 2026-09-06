@@ -5,6 +5,13 @@ Purpose: a ZD1200 controller guest (run inside the **Docker container**) with an
 `authorized_keys` users (static musl dropbear + sftp-server). The container
 approach is the primary/authoritative path — see RUNBOOK.md and README.md.
 
+> **Current state:** the port-2222 dropbear is **optional** and is **not**
+> injected in the default setup — `inject-dropbear.sh` must be run on the host
+> before the image is prepared for the 2222 instance to exist. Without it the
+> stock controller boots normally, and after the first-run wizard + a reboot the
+> stock admin SSH (port 22) comes up.  (The in-guest reboot that follows the
+> wizard now completes in place — `-no-reboot` is no longer used.)
+
 ---
 
 ## 0. Build the container (the obvious entry point)

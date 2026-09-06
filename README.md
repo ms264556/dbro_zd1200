@@ -120,9 +120,12 @@ alone:
 docker compose -f docker-compose.yml -f docker-compose.user.yml up -d
 ```
 
-After the first factory-wizard completion, restart the container once. That
-allows the configured system to generate its persistent Dropbear host key and
-start the stock administrative SSH (port 22), exactly like a real appliance.
+After the first factory-wizard completion, reboot the appliance once. That allows
+the configured system to generate its persistent Dropbear host key and start the
+stock administrative SSH (port 22), exactly like a real appliance. The guest
+reboots **in place** (its patched `machine_restart()` issues a QEMU i8042 reset;
+`-no-reboot` is never used), so a guest reboot completes and the container stays
+up — you do not need to `docker restart` it.
 
 ## Runtime notes
 
@@ -134,11 +137,20 @@ start the stock administrative SSH (port 22), exactly like a real appliance.
   and only lowers scheduling priority under contention.
 - The board data (serial + unicast MAC, MAC2 = MAC1 + 1) is written into the
   CF image by `write-boarddata.py`; the kernel's v54bsp driver reads it from
-  the CompactFlash at boot, exactly like a physical ZD1200.  The MAC-derived
-  serial (`boarddata-from-mac.sh`, `ZD_BOARDDATA_FROM_MAC=1`) is **rejected** by
-  the firmware's support-entitlement check, so use `ZD_BOARDDATA_FROM_MAC=0` with
-  the default `ZD_SERIAL`/`ZD_MAC1` unless you supply a serial that passes.
-  Do not run two instances on the same Layer-2 network with the same MAC.
+  the CompactFlash at boot, exactly like a physical ZD1200. It is written only
+  when the synthetic base is built (first run / base rebuild) and is preserved
+  across re-patches, so changing `ZD_SERIAL`/`ZD_MAC1` after the first run needs a
+  state reset. The MAC-derived serial (`boarddata-from-mac.sh`,
+  `ZD_BOARDDATA_FROM_MAC=1`) is **rejected** by the firmware's support-entitlement
+  check, so use `ZD_BOARDDATA_FROM_MAC=0` with the default `ZD_SERIAL`/`ZD_MAC1`
+  unless you supply a serial that passes. Do not run two instances on the same
+  Layer-2 network with the same MAC.
+- The rootfs is patched before QEMU boots by an ordered `patches/` pipeline
+  (`apply-rootfs-patches.sh`): the coordinator decides first-run / upgrade /
+  patch-set-change / no-op and, whenever it patches, recreates the overlay then
+  applies the `patches/` scripts. The patches modify only the rootfs (hda2/hda3)
+  and never touch `/writable` (hda4), which is preserved along with the board data
+  across a re-patch — so re-patching never resets the controller config.
 - The generated state volume contains controller configuration and AP state.
   Back it up before experiments; deleting it returns the VM to factory setup.
 
@@ -155,7 +167,7 @@ The source-only public repository should contain these files:
 ```text
 AGENTS.md                     Dockerfile                    docker-compose.yml
 docker-compose.user.yml       .env.example                  make-synthetic-cf.py
-patch-kernel.py               patch-rootfs.sh               patch-rootfs-signing.sh
+patch-kernel.py               apply-rootfs-patches.sh       patches/ (NN - Name.sh)
 write-boarddata.py            run-zd1200-qemu.sh            run-zd1200-web.sh
 build-container.sh            inject-dropbear.sh            boarddata-from-mac.sh
 sniff-guest-dhcp.py           limit-process-cpu.py           prepare-vendor-image.sh

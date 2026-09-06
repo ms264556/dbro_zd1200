@@ -140,6 +140,13 @@ if [ "${SNAPSHOT:-1}" = "1" ]; then
     snapshot_args+=( -snapshot )
 fi
 
+# Reboot: the guest reboots IN PLACE on `reboot`.  Its (patched)
+# machine_restart() requests a QEMU i8042 system reset, which QEMU honours by
+# resetting and re-running the kernel - so NO -no-reboot is used here (and a
+# guest reboot does not tear down the container).  The firmware-upgrade
+# workflow that needs QEMU to exit on each guest reboot supplies its own
+# -no-reboot in a separate harness; this container never passes it.
+
 pacing_args=()
 if [ "${PACE_GUEST:-0}" = "auto" ]; then
     pacing_args+=( -icount auto,sleep=on )
@@ -235,6 +242,5 @@ exec qemu-system-i386 \
     "${nic_args[@]}" \
     "${ipmi_args[@]}" \
     "${console_args[@]}" \
-    -no-reboot \
     "${pacing_args[@]}" \
     "${debug_args[@]}"

@@ -73,10 +73,6 @@ if ! command -v qemu-img >/dev/null 2>&1; then
     echo "qemu-img is required" >&2
     exit 1
 fi
-if [ ! -f "$synthetic_disk" ]; then
-    echo "Creating persistent synthetic CF base image in $state_dir ..."
-    SYNTHETIC_DISK="$synthetic_disk" python3 "$work_dir/make-synthetic-cf.py"
-fi
 # The serial number and MACs live in the board-data records on the CF image
 # (read by the kernel's v54bsp driver; NOT patched into the kernel).  Rewrite
 # them on every launch so env changes take effect.  MAC2 = MAC1 + 1.
@@ -93,72 +89,22 @@ else
     zd_mac1="${ZD_MAC1:-00:0c:e6:12:00:01}"
     zd_mac2="${ZD_MAC2:-}"
 fi
-python3 "$work_dir/write-boarddata.py" \
-    --disk "$synthetic_disk" \
-    --serial "$zd_serial" \
-    --mac "$zd_mac1" \
-    --model "${ZD_MODEL:-ZD1200}" \
-    --customer "${ZD_CUSTOMER:-ruckus}"
-if [ ! -f "$persistent_disk" ]; then
-    qemu-img create -q -f qcow2 -F raw -b "$synthetic_disk" "$persistent_disk"
-    echo "Created persistent VM disk overlay: $persistent_disk"
-    # Hint #6: the stock sys_init mounts the empty ext2 data volume (hda4) with
-    # the ReiserFS-only `nolog` option, which fails on ext2, so /writable never
-    # mounts rw and first-boot (certs/web/SSH) never completes.  Apply
-    # patch-rootfs.sh to the freshly created overlay, before QEMU opens it.  It
-    # runs as an ordinary user (qemu-img flatten + debugfs + qemu-io), so no
-    # root/loop/mount is needed; the overlay is patched in place.
-    echo "Patching rootfs (nolog) into the VM overlay ..."
-    QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
-        "$work_dir/patch-rootfs.sh"
-    # Bake the image-signing bypass / upgrade entitlement (the license): patches
-    # /bin/sys_wrapper.sh (check_sign_cert), writes the patch-storage payload and
-    # refreshes /file_list.txt for sys_wrapper.sh.  Runs after patch-rootfs.sh on
-    # the same freshly-created overlay, before QEMU opens it.  Needs the signing
-    # cert payload mounted at ZD_SIGN_CERT_DIR; warn (don't abort) if it's absent
-    # so the guest can still boot, just without the license baked in.
-    if [ -f "$work_dir/patch-rootfs-signing.sh" ]; then
-        echo "Baking signing bypass / upgrade entitlement into the VM overlay ..."
-        # patch-rootfs-signing.sh takes CERT_DIR as $1 (positional) and ignores a
-        # CERT_DIR env var — pass it as an argument.
-        if QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
-            "$work_dir/patch-rootfs-signing.sh" \
-            "${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"; then
-            echo "Signing bypass baked into the VM overlay."
-        else
-            echo "WARNING: could not bake the signing bypass (cert dir missing?);" >&2
-            echo "         the guest will boot WITHOUT the license/upgrade entitlement." >&2
-        fi
-    fi
-    # Make the vendor `!v54!` CLI escape always drop to a root shell by replacing
-    # /usr/sbin/sesame2 with a trivial exit-0 script (its passphrase check is the
-    # only thing standing between `!v54!` and a root shell).  Runs after the other
-    # patches on the same freshly-created overlay, before QEMU opens it.
-    if [ -f "$work_dir/patch-rootfs-v54.sh" ]; then
-        echo "Baking the !v54! root-shell bypass (sesame2 -> exit 0) into the VM overlay ..."
-        if QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
-            "$work_dir/patch-rootfs-v54.sh"; then
-            echo "!v54! bypass baked into the VM overlay."
-        else
-            echo "WARNING: could not bake the !v54! bypass; the CLI escape won't drop to a shell." >&2
-        fi
-    fi
-    # Silence the rootfs integrity checker for our patched files: rewrite every
-    # FILE/LINK/DIR/OTHER entry in /file_list.txt to SKIP: so chk_integrity.sh
-    # no longer reports `file:[...] corrupted` for modified binaries.
-    # MUST run after every other patch that touches /file_list.txt (currently
-    # none do, since the signing bypass no longer refreshes it) so the all-SKIP
-    # list is always the final word.
-    if [ -f "$work_dir/patch-rootfs-skip-integrity.sh" ]; then
-        echo "Baking the integrity-skip (all /file_list.txt entries -> SKIP) into the VM overlay ..."
-        if QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
-            "$work_dir/patch-rootfs-skip-integrity.sh"; then
-            echo "Integrity-skip baked into the VM overlay."
-        else
-            echo "WARNING: could not bake the integrity-skip; modified files will still be flagged." >&2
-        fi
-    fi
-fi
+# Prepare the writable synthetic disk (creates+populates the /writable partition),
+# write the board data, create the persistent qcow2 overlay, and -- whenever the
+# coordinator decides the rootfs needs patching (first run, a changed base rootfs,
+# or a changed patch set) -- recreate the overlay and run the ordered rootfs
+# patches from patches/ into it.  The coordinator is the ONLY place that builds
+# the overlay or patches the rootfs.
+STATE_DIR="$state_dir" \
+SYNTHETIC_DISK="$synthetic_disk" \
+PERSISTENT_DISK="$persistent_disk" \
+WORK="$state_dir/.rootfs-patch-work" \
+ZD_SERIAL="$zd_serial" \
+ZD_MAC1="$zd_mac1" \
+ZD_MODEL="${ZD_MODEL:-ZD1200}" \
+ZD_CUSTOMER="${ZD_CUSTOMER:-ruckus}" \
+ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
+"$work_dir/apply-rootfs-patches.sh"
 
 : > "$log_file"
 

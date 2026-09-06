@@ -16,13 +16,21 @@ the one authoritative recipe: read it top to bottom before running anything.
 
 ## 0. Current status (read first)
 
-**Verified working (2026-08-29).**  On a Linux host the container starts, the
-guest boots to READY, gets its **own DHCP lease on the LAN**, the web stack
-(`Emfd`), `sshd` and `mDNSResponder` come up, and the **"No Support Upgrade
-Entitlement" banner is gone** (the signing bypass + a valid serial are baked).
-Container reports `Up (healthy)`.
+**Verified working.**  On a Linux host the container starts, the guest boots to
+READY, gets its **own DHCP lease on the LAN**, the web stack (`Emfd`), `sshd` and
+`mDNSResponder` come up, and the **"No Support Upgrade Entitlement" banner is
+gone** (the signing bypass + a valid serial are baked).  Container reports
+`Up (healthy)`.
 
-Two things had to be right (both fixed in the repo):
+The rootfs is patched before QEMU boots by an ordered `patches/` pipeline
+(`apply-rootfs-patches.sh`); the patches modify only the rootfs, and `/writable`
+(hda4) plus the board data are **preserved** across a re-patch (see §4).  The
+guest **reboots in place** — its patched `machine_restart()` issues a QEMU i8042
+system reset and `-no-reboot` is **not** used — so a guest reboot completes and
+the container stays up (no `docker restart` needed).  After the first-run wizard
+completes and the appliance reboots, the stock admin SSH (port 22) comes up.
+
+Things that had to be right (all fixed in the repo):
 
 1. **Host-netns networking** — the guest's macvtap must be on the host's physical
    interface, or the guest never gets onto the LAN (§7b).
@@ -31,6 +39,8 @@ Two things had to be right (both fixed in the repo):
    (`E_InvalidSerialNumber` = "serial number mismatch"), which leaves the banner
    up even though the signing bypass works.  Set `ZD_BOARDDATA_FROM_MAC=0` to use
    the known-valid default serial (§7d).
+3. **In-guest reboot** — `machine_restart()` is patched to request a QEMU i8042
+   reset (§7e), and `-no-reboot` is never passed, so the guest reboots cleanly.
 
 ---
 
@@ -109,22 +119,51 @@ Notes:
   `ZD_SERIAL=123456000789` and `ZD_MAC1=00:0c:e6:12:00:01` (a Ruckus-OUI MAC).
   A MAC-derived serial is rejected by the firmware (§7d).  Only one instance may
   run per L2 (fixed MAC); otherwise keep `ZD_BOARDDATA_FROM_MAC=1` and set a
-  serial that passes the check.
-- **Signing bypass / license.**  On first boot `run-zd1200-web.sh` runs
-  `patch-rootfs.sh` (strips the ReiserFS-only `nolog` mount option) then
-  `patch-rootfs-signing.sh` (patches `/bin/sys_wrapper.sh` check/entitlement,
-  writes `/etc/persistent-scripts/patch-storage/`, refreshes `/file_list.txt`).
-  **`patch-rootfs-signing.sh` takes its cert dir as `$1` (positional), not an env
-  var**; the entrypoint passes `${ZD_SIGN_CERT_DIR}` (default
-  `/opt/zd1200/signing-cert`, bind-mounted from `${ZD_SIGN_CERT_HOST}`).
-- **`!v54!` root-shell bypass.**  On first boot `patch-rootfs-v54.sh` replaces
+  serial that passes the check.  Board data is written **only** when the synthetic
+  base is built (first run / a base rebuild after a firmware change) — it is
+  preserved across re-patches, so changing `ZD_SERIAL`/`ZD_MAC1` after the first
+  run needs a state reset (`docker compose down -v`) to take effect.
+- **Rootfs patching (first run / after an upgrade).** Before QEMU boots,
+  `run-zd1200-web.sh` calls `apply-rootfs-patches.sh`, which (a) creates the
+  writable synthetic disk and its `/writable` partition (hda4), (b) writes the
+  board data, (c) creates the persistent qcow2 overlay, and (d) runs every patch
+  in `patches/` **in lexical filename order** (so `10 - …`, `20 - …`, `30 - …`,
+  `40 - …`).  Each patch examines the current rootfs + overlay and makes its own
+  changes to the overlay.  **The patches only ever modify the ROOTFS (hda2/hda3).**
+  **Whenever the coordinator decides the rootfs needs patching it first (re)creates
+  a clean overlay, then applies the patches** — it never patches an existing overlay
+  in place.  It decides to patch on:
+  - **first run** (no overlay yet) — builds the base, writes board data, patches;
+  - **no patch marker** (an overlay exists but no `.patches-applied` marker, e.g.
+    first run of this code over a previous state volume) — keeps the base and
+    `/writable`, recreates the overlay, re-patches; and
+  - an **upgrade** (the base `image/rootfs.ext2` hash changed, e.g. a new firmware
+    archive was prepared): the synthetic base disk (which bakes the old rootfs)
+    and the overlay are rebuilt from the new image, then re-patched.
+  When only the **patch set** changed (a patch added/edited) and the base rootfs
+  is unchanged, the base is kept, just the overlay is recreated + re-patched.
+  **`/writable` (hda4) is preserved across any re-patch** (a copy is taken from the
+  old overlay and restored afterwards), and **board data is preserved the same
+  way**: it is written only when the base is built (first run / base rebuild), and
+  on a re-patch the current board data (including any runtime changes) is kept
+  untouched.  The applied `rootfs` + `patches` hashes are recorded in
+  `/var/lib/zd1200/.patches-applied`, so a subsequent boot with no change is a
+  no-op.
+- **Signing bypass / license.**  `patches/20 - PatchSigningLicense.sh` patches
+  `/bin/sys_wrapper.sh` (check/entitlement), writes
+  `/etc/persistent-scripts/patch-storage/`, and refreshes `/file_list.txt`.  It
+  takes its cert dir as `$1` (positional), **not** an env var; the coordinator
+  passes `${ZD_SIGN_CERT_DIR}` (default `/opt/zd1200/signing-cert`, bind-mounted
+  from `${ZD_SIGN_CERT_HOST}`).  If the cert payload is absent it warns and
+  no-ops, so the guest still boots (just without the baked-in entitlement).
+- **`!v54!` root-shell bypass.**  `patches/30 - PatchV54RootShell.sh` replaces
   `/usr/sbin/sesame2` (the passphrase gate the CLI `!v54!` escape checks) with a
   trivial `#!/bin/sh` script that exits 0, so `!v54!` always drops to a root
   shell.  It is a regular script rather than a symlink to `true` because
   `/bin/true` here is a busybox *applet* symlink (busybox dispatches on argv[0],
   so a `sesame2 -> /bin/true` symlink would hit "applet not found" and exit 127).
-- **Integrity-skip.**  On first boot `patch-rootfs-skip-integrity.sh` rewrites
-  every `FILE`/`LINK`/`DIR`/`OTHER` entry in `/file_list.txt` to `SKIP:`, so
+- **Integrity-skip.**  `patches/40 - PatchSkipIntegrity.sh` rewrites every
+  `FILE`/`LINK`/`DIR`/`OTHER` entry in `/file_list.txt` to `SKIP:`, so
   `/etc/init.d/chk_integrity.sh` (which only acts on those types) finds zero
   errors and no longer prints `file:[...] corrupted` for our patched binaries.
 - **Capabilities.**  `CAP_MKNOD` (mknod the tap char node), `CAP_NET_RAW`
@@ -192,8 +231,12 @@ Find the guest IP from `docker exec zd1200 cat /var/lib/zd1200/guest-ip`, or
 `arp-scan --localnet` for the guest MAC (`00:0c:e6:12:00:01` when
 `ZD_BOARDDATA_FROM_MAC=0`).
 
-After completing the wizard, restart once so the configured system generates its
-persistent Dropbear host key and starts admin SSH.
+After completing the wizard, reboot the appliance once so the configured system
+generates its persistent Dropbear host key and starts admin SSH.  The guest
+reboots **in place** (its `machine_restart()` issues a QEMU i8042 reset and
+`-no-reboot` is never used), so a guest reboot — from the web UI, the CLI, or
+`/sbin/reboot` — completes and the container stays up; you do **not** need to
+`docker restart` the container.
 
 ---
 
@@ -219,7 +262,7 @@ MAC (`ip link set mvt0 address $ZD_MAC1`) so the LAN's replies reach the guest.
 
 ### 7c. The support banner persists because the serial is invalid — FIXED
 
-The signing bypass (`patch-rootfs-signing.sh`) *works* — the patched
+The signing bypass (`patches/20 - PatchSigningLicense.sh`) *works* — the patched
 `sys_wrapper.sh` methods write `/writable/etc/airespider/support-list.xml` with
 `status="1"`.  But if that record carries a **MAC-derived** serial
 (`boarddata-from-mac.sh`) it is rejected by the firmware's support-entitlement
@@ -232,9 +275,27 @@ Entitlement file", from the firmware's own strings) — so the banner stays.
 
 `sniff-guest-dhcp.py` prints the guest's dynamic lease to the container log and
 `/var/lib/zd1200/guest-ip` (the container can't see its guest by IP, so it watches
-the DHCP exchange on the wire).  `patch-rootfs-signing.sh` takes `CERT_DIR` as a
+the DHCP exchange on the wire).  `patches/20 - PatchSigningLicense.sh` takes `CERT_DIR` as a
 **positional** `$1`, not an env var; the entrypoint passes
 `${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}`.
+
+### 7e. In-guest reboot used to hang at "Restarting system." — FIXED
+
+`machine_restart()` was originally patched to a bare `ret` (no-op) and QEMU ran
+with `-no-reboot`, so a guest reboot never reset the CPU — the guest froze at
+`Restarting system.` and the web UI stayed down until the container was restarted.
+**Fix:** `patch-kernel.py` now patches `machine_restart()` to request a QEMU i8042
+system reset (`b0 fe e6 64 f4 eb fd`; signature-matched, so it tracks across
+firmware versions), and `run-zd1200-qemu.sh` never passes `-no-reboot`.  The guest
+now reboots in place and reaches READY again; the container stays up.
+
+### 7f. `/writable` + board data are preserved (never reset by a re-patch)
+
+The qcow2 overlay COWs the whole disk, so recreating it would reset `/writable`.
+`apply-rootfs-patches.sh` therefore preserves the current hda4 (extract → recreate
+overlay → restore) and writes board data only when the base is built; the patches
+themselves never write into `/writable`.  Keep this when adding patches — a
+re-patch must not destroy the controller config or the serial/MAC.
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# patch-rootfs-skip-integrity.sh — make the ZD1200 rootfs integrity checker skip
+# 40 - PatchSkipIntegrity.sh — make the ZD1200 rootfs integrity checker skip
 # every entry, so vendor "corrupted" warnings (e.g. `file:[./usr/sbin/sesame2]
 # corrupted`) never appear for our patched files.
 #
@@ -14,15 +14,15 @@
 # user; only changed byte ranges are written to the overlay (backing untouched).
 #
 # Usage:
-#   QCOW=<overlay.qcow2> WORK=<workdir> ./patch-rootfs-skip-integrity.sh
+#   QCOW=<overlay.qcow2> WORK=<workdir> ./"40 - PatchSkipIntegrity.sh"
 #
 # Idempotent: a partition whose /file_list.txt already has no FILE/LINK/DIR/OTHER
 # entries (all SKIP) is left alone.
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$BASE/zd1200-vm.qcow2}"
-WORK="${WORK:-$BASE/.rootfs-patch-work}"
+QCOW="${QCOW:-$(dirname "$BASE")/zd1200-vm.qcow2}"
+WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
 
 TARGET="/file_list.txt"

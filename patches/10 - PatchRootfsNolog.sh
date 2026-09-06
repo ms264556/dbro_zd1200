@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# patch-rootfs.sh — patch files inside the ZD1200 lab VM rootfs partitions,
+# 10 - PatchRootfsNolog.sh — patch files inside the ZD1200 lab VM rootfs partitions,
 # writing the result into the qcow2 overlay only.  Runs as a standard user:
 # no root, no loop devices, no nbd, no mount.
 #
@@ -9,7 +9,8 @@
 #   write : qemu-io           (writes only the changed byte ranges into the
 #                              qcow2 overlay; the backing file is untouched)
 #
-# Usage:  ./patch-rootfs.sh
+# Usage:  run from the patches/ pipeline via apply-rootfs-patches.sh
+# (QCOW=<overlay.qcow2> WORK=<workdir> ./"10 - PatchRootfsNolog.sh")
 #
 # Configure PARTITIONS and PATCHES below.  Each PATCHES entry is
 #   <rootfs-path>|<sed-expression>
@@ -19,10 +20,10 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$BASE/zd1200-vm.qcow2}"
+QCOW="${QCOW:-$(dirname "$BASE")/zd1200-vm.qcow2}"
 # Work dir holds two ~2 GiB flatten files, so keep it on disk-backed storage
 # (a small /tmp tmpfs fills up; the repo dir is on real disk).
-WORK="${WORK:-$BASE/.rootfs-patch-work}"
+WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
 
 # name|start_sector|sector_count   (mirrors make-synthetic-cf.py; hda1 is the

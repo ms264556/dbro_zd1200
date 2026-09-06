@@ -20,22 +20,23 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/zd1200
-COPY boarddata-from-mac.sh \
+COPY apply-rootfs-patches.sh \
+     boarddata-from-mac.sh \
      attach-console.py \
      limit-process-cpu.py \
      make-synthetic-cf.py \
      patch-kernel.py \
-     patch-rootfs.sh \
-     patch-rootfs-signing.sh \
-     patch-rootfs-skip-integrity.sh \
-     patch-rootfs-v54.sh \
      run-zd1200-qemu.sh \
      run-zd1200-web.sh \
      sniff-guest-dhcp.py \
      write-boarddata.py \
      /opt/zd1200/
+# The ordered rootfs patches live in patches/ and run (in lexical filename
+# order) against the qcow2 overlay; apply-rootfs-patches.sh decides whether
+# they are needed (first run / after an upgrade) before launching QEMU.
+COPY patches/ /opt/zd1200/patches/
 
-RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py \
+RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py /opt/zd1200/patches/*.sh \
     && mkdir -p /opt/zd1200/image /var/lib/zd1200
 
 ENV STATE_DIR=/var/lib/zd1200 \
