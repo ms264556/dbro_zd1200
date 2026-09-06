@@ -178,6 +178,42 @@ LICENSE                       .gitignore                    .dockerignore
 
 `limit-process-cpu.py` is retained for the automatic TCG fallback only.
 
+## `bootfs.img` (the `/boot` bootloader image)
+
+`make-synthetic-cf.py` **`zcat`'s `bootfs.img.gz`** onto the base CF image's
+`/boot` partition (hda1) and then copies the patched kernel onto it (`/bzImage`),
+so `/boot` is self-contained (grub + kernel). `bootfs.img.gz` is a pre-built,
+gzipped artifact (gitignored by the existing `*.img` rule) and must exist before
+the build; the build decompresses it with `zcat`.
+
+It is created from the **vendor GRUB-legacy binaries only** — a host recompile
+of GRUB 0.97 does not boot in QEMU (the `Error 17` in the small `/boot` mount
+path). Everything else in the disk is rebuilt from `image/`.
+
+**mkfs options used to build `bootfs.img` (before gzipping to `bootfs.img.gz`):**
+```sh
+mkfs.ext2 -F -q -b 1024 -I 128 \
+  -O ^64bit,^extent,^dir_index,^resize_inode,^sparse_super,^filetype,^ext_attr \
+  bootfs.img
+```
+i.e. 1 KiB blocks, **128-byte inodes**, and `large_file` **enabled** (it is
+*not* in the `-O ^...` disable list — disabling `large_file` makes the vendor
+grub `Error 17`). Resize inode, dir_index, sparse_super, filetype and ext_attr
+are all disabled.
+
+**Files in `bootfs.img`:**
+```
+/boot/grub/stage2                      zd1200_task stage2 (must be at BOTH this path and /lib/grub/i386-pc/)
+/lib/grub/i386-pc/stage2               zd1200_task stage2
+/lib/grub/i386-pc/e2fs_stage1_5        zd1200_task stage1_5
+/lib/grub/i386-pc/stage1               zd1200_task GRUB 0.97 stage1
+/lib/grub/i386-pc/default              zd1200_task default form (first line "1" + comment block)
+/lib/grub/i386-pc/menu.lst             zd1200_task menu.lst  (root (hd0,0); kernel (hd0,0)/bzImage root=/dev/hda2)
+/boot/grub/menu.lst                    zd1200_task menu.lst (same)
+```
+`/bzImage` (the patched kernel) is **copied onto it at build time** — it is not
+part of `bootfs.img` itself.
+
 ## Known limitation
 
 Do not use the ZoneDirector web-upgrade workflow inside this VM. QEMU boots an

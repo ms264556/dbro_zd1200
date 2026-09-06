@@ -25,6 +25,7 @@ COPY apply-rootfs-patches.sh \
      attach-console.py \
      limit-process-cpu.py \
      make-synthetic-cf.py \
+     bootfs.img.gz \
      patch-kernel.py \
      run-zd1200-qemu.sh \
      run-zd1200-web.sh \

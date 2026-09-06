@@ -233,10 +233,8 @@ exec qemu-system-i386 \
     -cpu "${CPU_MODEL:-pentium3}" \
     -m "${MEMORY_MB:-2048}" \
     -smp 1 \
-    -kernel "$kernel" \
     "${initrd_args[@]}" \
     -drive "file=$disk_image,format=$disk_format,if=ide,index=0,media=disk,cache=${DISK_CACHE:-writeback}" \
-    -append "root=/dev/hda2 ro console=ttyS0,115200n8 ${KERNEL_EXTRA-}" \
     "${snapshot_args[@]}" \
     "${net_args[@]}" \
     "${nic_args[@]}" \

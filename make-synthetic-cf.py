@@ -1,83 +1,86 @@
 #!/usr/bin/env python3
-"""Build a disposable, partitioned disk around the extracted ZD rootfs.
+"""Build a synthetic CF disk that BIOS-boots like the real ZD1200.
 
-The layout mirrors the physical ZD1200 CompactFlash: hda1 is the boot area
-(seeded with the root tree so sys_init can mount it at /boot), hda2/hda3 are
-the dual root images, and hda4 is the **ext2** writable/data partition.  The
-stock appliance ships hda4 as ReiserFS and mounts it with `-o …,nolog` (a
-ReiserFS-only option), but the lab rootfs is patched to drop `nolog`
-(`patch-rootfs.sh`), so a plain ext2 hda4 mounts fine at /writable.
+Layout mirrors the physical ZD1200 CompactFlash (see write-boarddata.py /
+HANDOFF):
+    hda1  start 62    count 84506    boot  (GRUB boots this, /boot)
+    hda2  start 84568 count 415152   root A
+    hda3  start 499720 count 415152  root B
+    hda4  start 914872 count 3006008 data  (/writable, ext2)
+    disk  3931200 sectors (1872 MiB), partition table at ZD_PART_SECTOR=3927001.
 
-The data partition starts empty like a factory-fresh volume: `sys_init` and
-`rc.pre_ac_init` create /writable/etc, the airespider/config/dump directories,
-certs and SSH keys themselves on first boot.
+The whole boot area — MBR (stage1 at the stage1_5 load address) + the embedded
+stage1_5 (self-load count baked in) + the /boot filesystem (stage2 / menu.lst /
+default) — is pre-built and shipped as `bootfs.img.gz` (fixed geometry, so it's
+baked once).  make-synthetic-cf.py just writes `bootfs.img.gz` (decompressed,
+with the patched kernel placed on /boot as /bzImage) at sector 0, then lays down
+hda2/hda3 (rootfs) and hda4 (/writable) from `image/`.  No per-build repatching.
+
+Bootfs/GRUB binaries are the only vendor-provided pieces; kernel / rootfs /
+/writable come from `image/`.
 """
 
 from pathlib import Path
 import os
-import shutil
+import gzip
+from shutil import which
 import struct
 import subprocess
 import tempfile
 
 base = Path(__file__).resolve().parent
 rootfs = base / "image" / "rootfs.ext2"
+bootfs_gz = base / "bootfs.img.gz"
+kernel_src = base / "image" / "bzImage"     # raw; patch below for QEMU
 disk = Path(os.environ.get("SYNTHETIC_DISK", base / "synthetic-cf.img"))
 disk.parent.mkdir(parents=True, exist_ok=True)
 
 SECTOR = 512
-DISK_SIZE = 2 * 1024 * 1024 * 1024
+H1, C1 = 62, 84506          # boot (/boot)
+H2, C2 = 84568, 415152      # root A
+H3, C3 = 499720, 415152     # root B
+H4, C4 = 914872, 3006008    # data (/writable)
+DISK_SIZE = 3931200 * SECTOR
 
-# Conservative CF-like layout: three ext2-sized areas. The first area is the
-# boarddata/himem partition that the kernel opens through the ext2 layer.
-p1_start, p1_sectors = 2048, 327680      # 160 MiB (boot, mounted at /boot)
-p2_start, p2_sectors = 329728, 327680    # 160 MiB (root A)
-p3_start, p3_sectors = 657408, 327680    # 160 MiB (root B / dual image)
-p4_start, p4_sectors = 985088, 3000000   # writable area / remaining CF
+if not bootfs_gz.exists():
+    raise SystemExit(f"missing {bootfs_gz} (pre-built GRUB bootloader fs)")
+if rootfs.stat().st_size > C2 * SECTOR:
+    raise SystemExit("rootfs does not fit in root partition")
 
-if rootfs.stat().st_size > p2_sectors * SECTOR:
-    raise SystemExit("rootfs does not fit in synthetic root partition")
-
-mke2fs = os.environ.get("MKE2FS") or shutil.which("mke2fs")
+mke2fs = os.environ.get("MKE2FS") or which("mke2fs")
 if not mke2fs:
-    raise SystemExit(
-        "mke2fs not found: e2fsprogs is required to build the "
-        "ext2 data partition (apt install e2fsprogs, or set MKE2FS)"
-    )
+    raise SystemExit("mke2fs not found: e2fsprogs is required to build the ext2 data partition")
+
+# Patch the kernel for QEMU (the same patch build-cf-image.sh uses); the raw
+# bzImage triggers a kernel `BUG: scheduling while atomic` early in init.
+with tempfile.TemporaryDirectory() as _kp:
+    _kp = Path(_kp)
+    patched = _kp / "bzImage.patched"
+    subprocess.run(["python3", str(base / "patch-kernel.py"),
+                    "--in", str(kernel_src), "--out", str(patched)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kernel = patched.read_bytes()
+    # persist the patched kernel to a temp file so debugfs can reference it.
+    _kf = tempfile.NamedTemporaryFile(prefix="bzImage.patched.", suffix=".bin", delete=False)
+    _kf.write(kernel); _kf.close()
+    kernel_file = Path(_kf.name)
+
 
 def seed_writable_config(ext2_path):
-    """Populate the /writable data partition (hda4) with the passwd/shadow that
-    the rootfs /etc/passwd symlink resolves to.
-
-    The vendor /etc/passwd is a symlink -> /writable/etc/config/passwd and
-    /etc/shadow is a regular vendor file in the rootfs.  On a factory-fresh
-    volume the controller only writes /writable/etc/config/passwd at first boot,
-    so a port-2222 dropbear (static musl getpwnam) could not resolve 'root'
-    before that.  Seeding the target makes root resolvable on the very first
-    boot; the first-run wizard overwrites these files later.
-    """
     passwd_src = base / "dropbear-provision" / "passwd"
     shadow_src = base / "dropbear-provision" / "shadow"
     if not passwd_src.exists() or not shadow_src.exists():
-        # The /writable passwd/shadow seed is an optional dropbear prep step
-        # (inject-dropbear.sh).  In the container these files are not present,
-        # and a factory-virgin /writable is exactly the vendor default, so skip
-        # rather than abort (doing so would break every `docker compose up`).
         print("  dropbear-provision/passwd/shadow missing; leaving /writable unseeded")
         return
-    cmds = [
-        "mkdir /etc",
-        "mkdir /etc/config",
-        f"write {passwd_src} /etc/config/passwd",
-        f"write {shadow_src} /etc/config/shadow",
-        "set_inode_field /etc/config/shadow mode 0100640",
-    ]
+    cmds = ["mkdir /etc", "mkdir /etc/config",
+            f"write {passwd_src} /etc/config/passwd",
+            f"write {shadow_src} /etc/config/shadow",
+            "set_inode_field /etc/config/shadow mode 0100640"]
     cmdfile = base / ".seed-writable.cmds"
     cmdfile.write_text("\n".join(cmds) + "\n")
     try:
         subprocess.run(["debugfs", "-w", "-f", str(cmdfile), ext2_path],
-                       check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     finally:
         cmdfile.unlink()
 
@@ -85,68 +88,67 @@ def seed_writable_config(ext2_path):
 with disk.open("wb") as handle:
     handle.truncate(DISK_SIZE)
 
-mbr = bytearray(SECTOR)
-entries = [
-    (0x00, 0x83, p1_start, p1_sectors),
-    (0x80, 0x83, p2_start, p2_sectors),
-    (0x00, 0x83, p3_start, p3_sectors),
-    (0x00, 0x83, p4_start, p4_sectors),
-]
+# ---- boot area (MBR + embedded stage1_5 + /boot) from bootfs.img.gz ---------
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    bootfs_img = td / "bootfs.img"
+    with gzip.open(bootfs_gz, "rb") as gz, open(bootfs_img, "wb") as out:
+        out.write(gz.read())
 
-for index, (boot, part_type, start, count) in enumerate(entries):
-    # CHS is intentionally saturated; modern kernels use the LBA fields.
-    offset = 446 + index * 16
-    mbr[offset] = boot
-    mbr[offset + 1:offset + 4] = b"\xfe\xff\xff"
-    mbr[offset + 4] = part_type
-    mbr[offset + 5:offset + 8] = b"\xfe\xff\xff"
-    struct.pack_into("<II", mbr, offset + 8, start, count)
+    # kernel onto /boot: the bootfs is the whole boot area (MBR+gap+hda1 fs),
+    # so debugfs the hda1 filesystem portion only (its superblock is at sector H1).
+    kb = bootfs_img.read_bytes()
+    h1_fs = kb[H1 * SECTOR:H1 * SECTOR + C1 * SECTOR]
+    h1_tmp = td / "h1_fs.img"
+    open(h1_tmp, "wb").write(h1_fs)
+    ker_cmds = td / "ker.cmds"
+    ker_cmds.write_text(f"write {kernel_file} /bzImage\n")
+    subprocess.run(["debugfs", "-w", "-f", str(ker_cmds), str(h1_tmp)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    h1_fs = open(h1_tmp, "rb").read()
+    kb = kb[:H1 * SECTOR] + h1_fs + kb[H1 * SECTOR + len(h1_fs):]
+    bootfs_bytes = kb
 
-mbr[510:512] = b"\x55\xaa"
+    with disk.open("r+b") as h:
+        h.write(bootfs_bytes)                                # sectors 0..H1+C1-1
 
-with disk.open("r+b") as handle:
-    handle.write(mbr)
-    data = rootfs.read_bytes()
-    # Seed the boot area and the two root images with the base filesystem
-    # tree, as the physical appliance does.
-    for start in (p1_start, p2_start, p3_start):
-        handle.seek(start * SECTOR)
-        handle.write(data)
+# ---- hda2/hda3 rootfs (with kernel at /bzImage, as build-cf-image.sh does) ----
+rfs = rootfs.read_bytes()
+with tempfile.TemporaryDirectory() as td2:
+    td2 = Path(td2)
+    # add /bzImage to the rootfs copy via debugfs (matches build-cf-image.sh)
+    rt = td2 / "rt.img"
+    open(rt, "wb").write(rfs)
+    cmds = td2 / "r.cmds"
+    cmds.write_text(f"write {kernel_file} /bzImage\n")
+    subprocess.run(["debugfs", "-w", "-f", str(cmds), str(rt)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rfs = open(rt, "rb").read()
+with disk.open("r+b") as h:
+    for start in (H2, H3):
+        h.seek(start * SECTOR)
+        h.write(rfs)
 
-    # hda4: a fresh ext2 filesystem.  The rootfs on hda2/hda3 is patched
-    # (patch-rootfs.sh) to drop the ReiserFS-only `nolog` mount option from
-    # sys_init, so a plain ext2 volume mounts fine at /writable.
-    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
-        tf_path = tf.name
-    try:
-        os.truncate(tf_path, p4_sectors * SECTOR)
-        subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", tf_path], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        seed_writable_config(tf_path)
-        with open(tf_path, "rb") as rf:
-            handle.seek(p4_start * SECTOR)
-            while True:
-                chunk = rf.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-    finally:
-        os.unlink(tf_path)
-
-    # The boarddata helper reads raw 512-byte sectors. For the first record it
-    # adds 0x8000 / 1024 = 32 sectors to 0x3BD3F1; the second starts at the
-    # base sector. These are only signatures for the first bring-up attempt;
-    # write-boarddata.py overwrites them with the full records.
-    base_sector = 0x3BD3F1
-    for delta in (16, 32, 64, 128, 0x8000 // 9, 0x8000 // 10,
-                  0x8000 // 11, 0x8000 // 12):
-        handle.seek((base_sector + delta) * SECTOR)
-        handle.write(b"SKCR")
-    handle.seek(base_sector * SECTOR)
-    handle.write(b"1135")
+# ---- hda4 /writable (ext2) ---------------------------------------------------
+with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+    tf_path = tf.name
+try:
+    os.truncate(tf_path, C4 * SECTOR)
+    subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", tf_path],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    seed_writable_config(tf_path)
+    with open(tf_path, "rb") as rf, disk.open("r+b") as h:
+        h.seek(H4 * SECTOR)
+        while True:
+            chunk = rf.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            h.write(chunk)
+finally:
+    os.unlink(tf_path)
 
 print(f"created {disk} ({DISK_SIZE // (1024 * 1024)} MiB)")
-print(f"  hda1 boot : sectors {p1_start}..{p1_start + p1_sectors} (ext2 seed)")
-print(f"  hda2 rootA: sectors {p2_start}..{p2_start + p2_sectors} (ext2 seed)")
-print(f"  hda3 rootB: sectors {p3_start}..{p3_start + p3_sectors} (ext2 seed)")
-print(f"  hda4 data : sectors {p4_start}..{p4_start + p4_sectors} (ext2)")
+print(f"  hda1 boot : sectors {H1}..{H1 + C1} (bootfs + kernel)")
+print(f"  hda2 rootA: sectors {H2}..{H2 + C2} (rootfs)")
+print(f"  hda3 rootB: sectors {H3}..{H3 + C3} (rootfs)")
+print(f"  hda4 data : sectors {H4}..{H4 + C4} (ext2)")

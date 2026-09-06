@@ -73,10 +73,10 @@ ZD_PART_SECTOR_P0 = 3982101         # CONFIG_V54_ZD_PLATFORM == 0
 # boot indicator is neither, so a raw 0x01 (as on the real CF) would make the
 # kernel report "unknown partition table".
 CF_PARTITIONS = [
-    (0x00, 2048, 327680),      # boot flag, start sector, count (hda1)
-    (0x80, 329728, 327680),    # hda2 (root A)
-    (0x00, 657408, 327680),    # hda3 (root B)
-    (0x00, 985088, 3000000),   # hda4 (data / writable)
+    (0x00, 62, 84506),        # boot flag, start sector, count (hda1 /boot)
+    (0x80, 84568, 415152),    # hda2 (root A)
+    (0x00, 499720, 415152),   # hda3 (root B)
+    (0x00, 914872, 3006008),  # hda4 (data / writable)
 ]
 
 RKS_STRUCT_SIZE = 0xD0             # sizeof(struct rks_boarddata), rev 4
