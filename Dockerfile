@@ -21,11 +21,14 @@ RUN apt-get update \
 
 WORKDIR /opt/zd1200
 COPY boarddata-from-mac.sh \
+     attach-console.py \
      limit-process-cpu.py \
      make-synthetic-cf.py \
      patch-kernel.py \
      patch-rootfs.sh \
      patch-rootfs-signing.sh \
+     patch-rootfs-skip-integrity.sh \
+     patch-rootfs-v54.sh \
      run-zd1200-qemu.sh \
      run-zd1200-web.sh \
      sniff-guest-dhcp.py \

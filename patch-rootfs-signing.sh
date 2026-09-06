@@ -21,8 +21,6 @@
 #      serial already set.  Original bodies are preserved under *_unpatched.
 #   2. /etc/persistent-scripts/patch-storage/ — payload dir (SKIPped in
 #      file_list.txt): cert.tgz, support, support.spt.
-#   3. /file_list.txt — MD5 entry refreshed for ./bin/sys_wrapper.sh only
-#      (patch-storage files are under SKIP and need none).
 #
 # No support-list.xml is pre-populated and no boot script is touched: the
 # patched sys_wrapper function creates the entitlement record when the web
@@ -181,22 +179,6 @@ EOF
     done
     debugfs -w -f "$WORK/cmds2.txt" "$WORK/$name.img" 2>/dev/null
 
-    # ---- 3. /file_list.txt MD5 refresh (sys_wrapper.sh only) ----
-    say "[$name] refreshing /file_list.txt MD5"
-    debugfs -R "dump /file_list.txt $WORK/file_list.orig" "$WORK/$name.img" 2>/dev/null
-    cp "$WORK/file_list.orig" "$WORK/file_list.new"
-    f=./bin/sys_wrapper.sh
-    debugfs -R "dump $f $WORK/md5src" "$WORK/$name.img" 2>/dev/null
-    new_md5="$(md5sum "$WORK/md5src" | awk '{print $1}')"
-    old_md5="$(awk -v p="$f" '$1 ~ /^FILE:/ && $2 == p { sub(/^FILE:/, "", $1); print $1 }' "$WORK/file_list.new")"
-    if [ -n "$old_md5" ]; then
-        sed -i "s/$old_md5/$new_md5/" "$WORK/file_list.new"
-        echo "  $f: $old_md5 -> $new_md5"
-    else
-        echo "  ! $f not tracked in file_list.txt (nothing to refresh)"
-    fi
-    replace_file /file_list.txt "$WORK/file_list.new"
-
     # ---- delta: only changed 512-byte blocks reach the overlay ----
     say "[$name] writing changed blocks into the overlay"
     python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
@@ -255,7 +237,5 @@ echo "--- /bin/sys_wrapper.sh (patched anchors) ---"
 debugfs -R "cat /bin/sys_wrapper.sh" "$WORK/hda2.verify.img" 2>/dev/null | grep -n -E "check_sign_cert_unpatched|verify-upload-support-unpatched|wget-support-entitlement-unpatched|Have signed|support-list.xml" | head
 echo "--- patch-storage payload ---"
 debugfs -R "ls -l /etc/persistent-scripts/patch-storage" "$WORK/hda2.verify.img" 2>/dev/null | grep -v "^debugfs"
-echo "--- file_list.txt sys_wrapper entry ---"
-debugfs -R "cat /file_list.txt" "$WORK/hda2.verify.img" 2>/dev/null | grep "sys_wrapper"
 
 say "done — signing bypass + upgrade entitlement baked into $QCOW; backing file untouched"

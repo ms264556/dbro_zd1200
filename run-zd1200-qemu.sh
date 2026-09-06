@@ -192,6 +192,33 @@ if [ "${ZD_IPMI:-1}" != "0" ]; then
     ipmi_args+=( -device isa-ipmi-kcs,id=isa0,bmc=bmc0 )
 fi
 
+# Interactive console (ttyS0).  The guest kernel boots with console=ttyS0 and
+# /etc/inittab runs `/dev/console::respawn:/bin/login.sh` on it, so this is the
+# SAME console the ZD1200 CLI login is presented on.  We forward it to a QEMU
+# chardev that (1) appends every byte to $ZD_CONSOLE_LOG so the entrypoint's
+# READY detection (grep on /tmp/zd1200-web.log) and `docker exec … tail -f`
+# keep working, and (2) serves an interactive socket so you can attach to the
+# login prompt.  Set ZD_CONSOLE=0 for the old -nographic behaviour (console ->
+# stdio -> the entrypoint's log only, not interactive).
+console_args=()
+if [ "${ZD_CONSOLE:-1}" != "0" ]; then
+    console_sock="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}"
+    console_log="${ZD_CONSOLE_LOG:-/tmp/zd1200-web.log}"
+    # 'path=' for a unix socket (default); 'host='/'port=' for a TCP listener
+    # when ZD_CONSOLE_SOCK looks like host:port (e.g. 127.0.0.1:5555).
+    if [[ "$console_sock" == *":"* && "$console_sock" != *"/"* ]]; then
+        _host="${console_sock%%:*}"; _port="${console_sock##*:}"
+        _chardev="socket,id=con0,host=$_host,port=$_port"
+    else
+        _chardev="socket,id=con0,path=$console_sock"
+    fi
+    # wait=off: QEMU must not block booting until a console client attaches.
+    _chardev="$_chardev,server=on,wait=off,logfile=$console_log,logappend=on"
+    console_args=( -display none -chardev "$_chardev" -serial chardev:con0 )
+else
+    console_args=( -nographic )
+fi
+
 exec qemu-system-i386 \
     -name zd1200-10.5.1-lab \
     "${accel_args[@]}" \
@@ -207,7 +234,7 @@ exec qemu-system-i386 \
     "${net_args[@]}" \
     "${nic_args[@]}" \
     "${ipmi_args[@]}" \
-    -nographic \
+    "${console_args[@]}" \
     -no-reboot \
     "${pacing_args[@]}" \
     "${debug_args[@]}"

@@ -117,6 +117,16 @@ Notes:
   **`patch-rootfs-signing.sh` takes its cert dir as `$1` (positional), not an env
   var**; the entrypoint passes `${ZD_SIGN_CERT_DIR}` (default
   `/opt/zd1200/signing-cert`, bind-mounted from `${ZD_SIGN_CERT_HOST}`).
+- **`!v54!` root-shell bypass.**  On first boot `patch-rootfs-v54.sh` replaces
+  `/usr/sbin/sesame2` (the passphrase gate the CLI `!v54!` escape checks) with a
+  trivial `#!/bin/sh` script that exits 0, so `!v54!` always drops to a root
+  shell.  It is a regular script rather than a symlink to `true` because
+  `/bin/true` here is a busybox *applet* symlink (busybox dispatches on argv[0],
+  so a `sesame2 -> /bin/true` symlink would hit "applet not found" and exit 127).
+- **Integrity-skip.**  On first boot `patch-rootfs-skip-integrity.sh` rewrites
+  every `FILE`/`LINK`/`DIR`/`OTHER` entry in `/file_list.txt` to `SKIP:`, so
+  `/etc/init.d/chk_integrity.sh` (which only acts on those types) finds zero
+  errors and no longer prints `file:[...] corrupted` for our patched binaries.
 - **Capabilities.**  `CAP_MKNOD` (mknod the tap char node), `CAP_NET_RAW`
   (AF_PACKET for `sniff-guest-dhcp.py`), `NET_ADMIN` (create/bring up the
   macvtap).  `cap_drop: ALL`, `device_cgroup_rules: c *:* rwm`,
@@ -136,6 +146,25 @@ docker logs -f zd1200
 # Guest serial console (separate from docker logs):
 docker exec zd1200 tail -f /tmp/zd1200-web.log
 ```
+
+### Interactive guest console (login)
+
+The guest's primary serial (`ttyS0`, where `/bin/login.sh` runs on `/dev/console`)
+is forwarded by QEMU to an interactive socket **in addition to** the log above, so
+you can log into the ZD1200 CLI from the host — no change to the guest's network,
+bridging, or DHCP (it still looks like a real ZD1200 from inside and out).  Once
+the guest reaches READY, attach with:
+
+```sh
+sudo docker exec -it zd1200 python3 /opt/zd1200/attach-console.py
+# Ctrl-C (sometimes twice) detaches; the guest keeps running.
+```
+
+- Socket path default: `/tmp/zd1200-console.sock` (override with
+  `ZD_CONSOLE_SOCK`, either a unix path or a `host:port` TCP listener).
+- `ZD_CONSOLE=0` reverts to the old non-interactive `-nographic` console.
+- The chardev appends to the same log the READY/healthcheck grep, so readiness
+  detection is unchanged.
 
 `sniff-guest-dhcp.py` watches the LAN (AF_PACKET on `eth0`) for the DHCP reply to
 the guest MAC and writes the guest's lease to `/var/lib/zd1200/guest-ip`; the

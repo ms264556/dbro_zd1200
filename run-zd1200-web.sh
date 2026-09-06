@@ -130,6 +130,34 @@ if [ ! -f "$persistent_disk" ]; then
             echo "         the guest will boot WITHOUT the license/upgrade entitlement." >&2
         fi
     fi
+    # Make the vendor `!v54!` CLI escape always drop to a root shell by replacing
+    # /usr/sbin/sesame2 with a trivial exit-0 script (its passphrase check is the
+    # only thing standing between `!v54!` and a root shell).  Runs after the other
+    # patches on the same freshly-created overlay, before QEMU opens it.
+    if [ -f "$work_dir/patch-rootfs-v54.sh" ]; then
+        echo "Baking the !v54! root-shell bypass (sesame2 -> exit 0) into the VM overlay ..."
+        if QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
+            "$work_dir/patch-rootfs-v54.sh"; then
+            echo "!v54! bypass baked into the VM overlay."
+        else
+            echo "WARNING: could not bake the !v54! bypass; the CLI escape won't drop to a shell." >&2
+        fi
+    fi
+    # Silence the rootfs integrity checker for our patched files: rewrite every
+    # FILE/LINK/DIR/OTHER entry in /file_list.txt to SKIP: so chk_integrity.sh
+    # no longer reports `file:[...] corrupted` for modified binaries.
+    # MUST run after every other patch that touches /file_list.txt (currently
+    # none do, since the signing bypass no longer refreshes it) so the all-SKIP
+    # list is always the final word.
+    if [ -f "$work_dir/patch-rootfs-skip-integrity.sh" ]; then
+        echo "Baking the integrity-skip (all /file_list.txt entries -> SKIP) into the VM overlay ..."
+        if QCOW="$persistent_disk" WORK="$state_dir/.rootfs-patch-work" \
+            "$work_dir/patch-rootfs-skip-integrity.sh"; then
+            echo "Integrity-skip baked into the VM overlay."
+        else
+            echo "WARNING: could not bake the integrity-skip; modified files will still be flagged." >&2
+        fi
+    fi
 fi
 
 : > "$log_file"
@@ -155,6 +183,9 @@ if [ "${NETWORK_MODE:-user}" = macvtap ]; then
             >>"$log_file" 2>&1 &
     fi
 fi
+# Interactive serial console (see run-zd1200-qemu.sh): the chardev logfile must be
+# the SAME file the READY detect + healthcheck grep, and the socket path is where
+# you attach to the guest's /dev/console login (set ZD_CONSOLE=0 to disable).
 setsid env KERNEL="$patched_kernel" \
     INITRD="" \
     DISK_IMAGE="$persistent_disk" DISK_FORMAT=qcow2 DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
@@ -166,6 +197,9 @@ setsid env KERNEL="$patched_kernel" \
     TAP_IF="${TAP_IF:-tap-zd}" \
     ZD_MAC1="$zd_mac1" \
     ZD_MAC2="$zd_mac2" \
+    ZD_CONSOLE="${ZD_CONSOLE:-1}" \
+    ZD_CONSOLE_LOG="$log_file" \
+    ZD_CONSOLE_SOCK="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}" \
     nice -n 10 ./run-zd1200-qemu.sh \
     >>"$log_file" 2>&1 </dev/null &
 qemu_pid=$!
