@@ -118,7 +118,7 @@ fi
 # after, so re-patching only ever modifies the rootfs (hda2/hda3).  /writable is
 # (re)initialised only when the base is built (first run / base rebuild).
 #   hda4 geometry mirrors make-synthetic-cf.py.
-HDA4_START=985088; HDA4_SECTORS=3000000; SECTOR=512
+HDA4_START=914872; HDA4_SECTORS=3006008; SECTOR=512
 preserved_hda4=""
 if [ "$patch_needed" = 1 ] && [ "$rebuild_synthetic" = 0 ] && [ -f "$PERSISTENT_DISK" ]; then
     mkdir -p "$WORK"

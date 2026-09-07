@@ -29,8 +29,8 @@ ALIGN=512
 # name|start_sector|sector_count   (mirrors make-synthetic-cf.py; hda1 is the
 # /boot seed and is deliberately not patched — it never boots as a root fs)
 PARTITIONS=(
-    "hda2|329728|327680"
-    "hda3|657408|327680"
+    "hda2|84568|415152"
+    "hda3|499720|415152"
 )
 
 # rootfs-path|sed-expression

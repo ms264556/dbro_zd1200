@@ -43,8 +43,8 @@ CERT_DIR="${1:-$(dirname "$BASE")/image/signing-cert}"
 
 # name|start_sector|sector_count   (mirrors make-synthetic-cf.py / patch-rootfs.sh)
 PARTITIONS=(
-    "hda2|329728|327680"
-    "hda3|657408|327680"
+    "hda2|84568|415152"
+    "hda3|499720|415152"
 )
 
 # The signing/license patch is OPTIONAL from the coordinator's point of view:
