@@ -2,7 +2,7 @@ services:
   zd1200:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
     image: local/zd1200-qemu:10.5.1.0.282
     container_name: ${ZD_CONTAINER_NAME:-zd1200}
     restart: unless-stopped
@@ -41,14 +41,15 @@ services:
       NETWORK_MODE: macvtap
       ZD_HOST_NET: "1"
       ZD_SIGN_CERT_DIR: /opt/zd1200/signing-cert
-      TAP_IF: ${ZD_TAP_IF:-tap-zd}
       GUEST_IP: ${ZD_GUEST_IP:-192.168.50.10}
       # Board data written into the CF image: serial + base MAC (MAC2=MAC1+1).
-      # The MAC-derived serial (boarddata-from-mac.sh, used when
-      # ZD_BOARDDATA_FROM_MAC=1) is REJECTED by the firmware's support-entitlement
-      # check (E_InvalidSerialNumber = "serial number mismatch"), so the banner
-      # persists.  This is the known-valid default serial/MAC that passes the check.
-      ZD_BOARDDATA_FROM_MAC: "0"
+      # By default the identity is derived from ZD_CONTAINER_MAC (a unique,
+      # locally-administered MAC generated into .env by build-container.sh):
+      # MAC1 = ZD_CONTAINER_MAC, serial hashed from MAC1.  Set
+      # ZD_BOARDDATA_FROM_MAC=0 to pin the fixed ZD_SERIAL/ZD_MAC1 below instead
+      # (that serial is the known-good one for the firmware's support check).
+      ZD_CONTAINER_MAC: ${ZD_CONTAINER_MAC:-}
+      ZD_BOARDDATA_FROM_MAC: ${ZD_BOARDDATA_FROM_MAC:-1}
       ZD_SERIAL: ${ZD_SERIAL:-123456000789}
       ZD_MAC1: ${ZD_MAC1:-00:0c:e6:12:00:01}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
@@ -57,8 +58,10 @@ services:
       VM_SNAPSHOT: "0"
 
     volumes:
-      - ${ZD_IMAGE_DIR:-./image}:/opt/zd1200/image:ro
-      # Signing cert payload consumed by patch-rootfs-signing.sh (the license
+      # Vendor-derived artifacts extracted from the firmware archive by
+      # scripts/prepare-vendor-image.sh (see README.md "The image/ directory").
+      - ./image:/opt/zd1200/image:ro
+      # Signing cert payload consumed by the license patch (the license
       # bypass).  Host path configurable via ZD_SIGN_CERT_HOST (set in .env).
       - ${ZD_SIGN_CERT_HOST:-./image/signing-cert}:/opt/zd1200/signing-cert:ro
       - zd1200-state:/var/lib/zd1200

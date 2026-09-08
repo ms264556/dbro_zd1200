@@ -2,7 +2,7 @@
 # NOTE: This is the container's GUEST LAUNCHER. It is invoked by
 # run-zd1200-web.sh (the container entrypoint) — do NOT run it directly on the
 # host. The supported way to run this project is `sudo ./build-container.sh`
-# (= docker compose up -d --build). See AGENTS.md and RUNBOOK.md.
+# (= docker compose up -d --build). See README.md.
 set -u
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"

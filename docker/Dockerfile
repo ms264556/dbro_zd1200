@@ -20,18 +20,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/zd1200
-COPY apply-rootfs-patches.sh \
-     boarddata-from-mac.sh \
-     attach-console.py \
-     build-bootfs.py \
-     limit-process-cpu.py \
-     make-synthetic-cf.py \
-     patch-kernel.py \
-     run-zd1200-qemu.sh \
-     run-zd1200-web.sh \
-     sniff-guest-dhcp.py \
-     write-boarddata.py \
-     /opt/zd1200/
+# Container-side scripts (entrypoint, guest-image prep, console helper).  The
+# host-side prepare-vendor-image.sh rides along; it is only used by
+# build-container.sh before the image exists.
+COPY scripts/ /opt/zd1200/
 # Source-built GRUB artifacts (see bootfs-src/README.md); make-synthetic-cf.py
 # builds the boot area from them via build-bootfs.py.
 COPY bootfs-src/ /opt/zd1200/bootfs-src/
@@ -45,7 +37,7 @@ RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py /opt/zd1200/patches/*.sh \
     && /opt/zd1200/build-bootfs.py --check
 
 ENV STATE_DIR=/var/lib/zd1200 \
-    NETWORK_MODE=tap \
+    NETWORK_MODE=macvtap \
     TAP_IF=tap-zd \
     GUEST_IP=192.168.50.10 \
     MEMORY_MB=2048 \

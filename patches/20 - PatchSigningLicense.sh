@@ -26,7 +26,7 @@
 # patched sys_wrapper function creates the entitlement record when the web
 # UI invokes it.
 #
-# Usage:  ./patch-rootfs-signing.sh [CERT_DIR]
+# Usage:  ./"20 - PatchSigningLicense.sh" [CERT_DIR]
 #
 # CERT_DIR defaults to image/signing-cert, which prepare-vendor-image.sh fills
 # from the ZD firmware archive.  It must contain signing_cert.pem +

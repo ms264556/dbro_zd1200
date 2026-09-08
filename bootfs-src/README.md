@@ -54,3 +54,20 @@ BR=~/zd1200/zd1200_task/buildroot/build/zd1200/build_i386_release/grub_bld/lib/g
 cp -p "$BR"/{stage1,stage2,e2fs_stage1_5,menu.lst,default} bootfs-src/lib/grub/i386-pc/
 sha256sum bootfs-src/lib/grub/i386-pc/*    # update the table above
 ```
+
+## License / GPL compliance
+
+The GRUB 0.97 sources these binaries were built from are **GNU GPL version 2 or
+later**; `COPYING` in this directory is the license text that ships with that
+source. Distributing the compiled GRUB binaries here means the corresponding
+source must be available:
+
+- Upstream ZD1200 GPL release: <https://sourceforge.net/projects/zd1200.arris/files/>
+- Mirror: <https://github.com/ms264556/zd1200_task> — the `zd1200` profile,
+  the GRUB tarball (`buildroot/dl/grub-0.97.tar.gz`) and the Ruckus patches
+  (`buildroot/package/grub/`)
+- Local checkout the copy here came from: `~/zd1200/zd1200_task`
+
+`build-bootfs.py` only rearranges and patches these binaries at build time; it
+adds no third-party code. Everything else in this repository is MIT-licensed —
+see the root `LICENSE`.

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Build a synthetic CF disk that BIOS-boots like the real ZD1200.
 
-Layout mirrors the physical ZD1200 CompactFlash (see write-boarddata.py /
-HANDOFF):
+Layout mirrors the physical ZD1200 CompactFlash (see write-boarddata.py):
     hda1  start 62    count 84506    boot  (GRUB boots this, /boot)
     hda2  start 84568 count 415152   root A
     hda3  start 499720 count 415152  root B
@@ -55,7 +54,7 @@ mke2fs = os.environ.get("MKE2FS") or which("mke2fs")
 if not mke2fs:
     raise SystemExit("mke2fs not found: e2fsprogs is required to build the ext2 data partition")
 
-# Patch the kernel for QEMU (the same patch build-cf-image.sh uses); the raw
+# Patch the kernel for QEMU (scripts/patch-kernel.py); the raw
 # bzImage triggers a kernel `BUG: scheduling while atomic` early in init.
 with tempfile.TemporaryDirectory() as _kp:
     _kp = Path(_kp)
@@ -120,11 +119,11 @@ with tempfile.TemporaryDirectory() as td:
     with disk.open("r+b") as h:
         h.write(bootfs_bytes)                                # sectors 0..H1+C1-1
 
-# ---- hda2/hda3 rootfs (with kernel at /bzImage, as build-cf-image.sh does) ----
+# ---- hda2/hda3 rootfs (with kernel at /bzImage) ----
 rfs = rootfs.read_bytes()
 with tempfile.TemporaryDirectory() as td2:
     td2 = Path(td2)
-    # add /bzImage to the rootfs copy via debugfs (matches build-cf-image.sh)
+    # add /bzImage to the rootfs copy via debugfs
     rt = td2 / "rt.img"
     open(rt, "wb").write(rfs)
     cmds = td2 / "r.cmds"

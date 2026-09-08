@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Build the locally ignored runtime image/ directory from a user-supplied,
-# decrypted ZD1200 archive (any version/build of the ZD1200 platform). No vendor
+# Build the locally ignored runtime image/ directory from a ZD1200 firmware
+# upgrade file downloaded from Ruckus/CommScope (any version/build of the ZD1200
+# platform).  The download is TAC-encrypted; it is decrypted here.  No vendor
 # material is redistributed.
 set -euo pipefail
 
-work_dir="$(cd "$(dirname "$0")" && pwd)"
+work_dir="$(cd "$(dirname "$0")/.." && pwd)"   # repo root: image/ lives there
 archive_path="${1:-}"
-# Optional archive-integrity gate: set EXPECTED_ARCHIVE_SHA256 to enforce a
-# specific archive hash; leave empty to accept any (compatible) archive version.
+# Optional payload-integrity gate: set EXPECTED_ARCHIVE_SHA256 to enforce a
+# specific (decrypted payload) hash; leave empty to accept any compatible build.
 expected_sha256="${EXPECTED_ARCHIVE_SHA256:-}"
 
 fail() {
@@ -15,25 +16,35 @@ fail() {
     exit 1
 }
 
-[ -n "$archive_path" ] || fail "usage: $0 /path/to/<zd1200 archive>.img.tgz"
-[ -f "$archive_path" ] || fail "archive not found: $archive_path"
+[ -n "$archive_path" ] || fail "usage: $0 /path/to/zd1200_<version>.img"
+[ -f "$archive_path" ] || fail "firmware file not found: $archive_path"
 for command in tar gzip python3 md5sum sha256sum; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 
+staging="$(mktemp -d "${TMPDIR:-/tmp}/zd1051-vendor.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+
+# The downloaded firmware is TAC-encrypted; decrypt it to the gzip-TAR payload
+# this script consumes.  A payload that is already gzip is used as-is.
+payload="$archive_path"
+if ! gzip -t "$archive_path" >/dev/null 2>&1; then
+    payload="$staging/payload.tgz"
+    python3 "$work_dir/scripts/ruckus_tac_decrypt.py" "$archive_path" "$payload" \
+        || fail "could not decrypt $archive_path"
+fi
+
 if [ -n "$expected_sha256" ]; then
-    actual_sha256="$(sha256sum "$archive_path" | awk '{print $1}')"
-    [ "$actual_sha256" = "$expected_sha256" ] || fail "unexpected archive SHA-256: $actual_sha256"
+    actual_sha256="$(sha256sum "$payload" | awk '{print $1}')"
+    [ "$actual_sha256" = "$expected_sha256" ] || fail "unexpected payload SHA-256: $actual_sha256"
 fi
 
 # Refuse paths that would escape the temporary extraction directory.
-if tar -tzf "$archive_path" | awk '/^\// || /(^|\/)\.\.($|\/)/ { bad = 1 } END { exit bad ? 0 : 1 }'; then
-    fail "archive contains an unsafe path"
+if tar -tzf "$payload" | awk '/^\// || /(^|\/)\.\.($|\/)/ { bad = 1 } END { exit bad ? 0 : 1 }'; then
+    fail "firmware payload contains an unsafe path"
 fi
 
-staging="$(mktemp -d "${TMPDIR:-/tmp}/zd1051-vendor.XXXXXX")"
-trap 'rm -rf "$staging"' EXIT
-tar -xzf "$archive_path" -C "$staging"
+tar -xzf "$payload" -C "$staging"
 metadata="$(find "$staging" -type f -name metadata -print -quit)"
 [ -n "$metadata" ] || fail "vendor metadata file not found"
 source_dir="$(dirname "$metadata")"

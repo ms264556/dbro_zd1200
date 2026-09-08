@@ -1,237 +1,225 @@
-# Virtual ZoneDirector 1200 — 10.5.1.0.282 proof of concept
+# Ruckus ZoneDirector ZD1200 in Docker
 
-> **This is a Docker Compose project.** The guest runs inside a Docker container
-> with a complete, verified host-netns + macvtap network stack. **Run it with
-> `sudo ./build-container.sh`** (= `docker compose up -d --build`). Do **not**
-> run `run-zd1200-qemu.sh` / `run-zd1200-web.sh` directly, and do **not**
-> re-implement macvlan/macvtap/TAP/bridge networking — it is already done
-> (RUNBOOK.md §7b). If you are an agent, read `AGENTS.md` first.
+Run the Ruckus ZoneDirector 1200 (ZD1200) wireless controller firmware as a
+virtual appliance in a Docker container. QEMU runs the stock ZD1200 kernel and
+rootfs inside the container, and the guest attaches to your LAN through a
+**macvtap on the host's physical NIC**, so it behaves like the real box: it gets
+its own DHCP lease, answers mDNS, and serves the web UI and SSH.
 
-This project boots the x86 ZoneDirector 1200 software in QEMU/KVM and exposes
-it through the web UI (and the stock administrative SSH once configured). It
-is an experimental, unsupported lab port; it is not affiliated with or
-endorsed by Ruckus.
+No firmware or vendor binaries are committed. The vendor-derived artifacts are
+built into `image/` locally from your firmware archive; the GRUB bootloader is
+compiled from Ruckus's published ZD1200 GPL source and lives in `bootfs-src/`.
 
-The guest runs the **stock vendor userspace with no initramfs and no boot
-handoff**: QEMU loads the patched kernel, the kernel mounts `root=/dev/hda2`
-from the synthetic CompactFlash directly, and the vendor userspace boots
-unmodified — exactly like the physical appliance. The kernel is patched only
-where QEMU hardware differs (watchdog, power controller, board-data retry),
-the data partition is plain ext2 (the rootfs patch drops the ReiserFS-only
-`nolog` mount option, so the stock `sys_init` mount works), and
-the serial number / MACs come from the board-data records on the CF image,
-just like a real ZD1200. A root shell on the guest sees a real appliance.
+---
 
-## Firmware and licensing boundary
+## What you need
 
-This repository intentionally contains **no Ruckus binaries, firmware, root
-filesystems, keys, or AP images**. Obtain the matching ZD1200 10.5.1.0.282
-package yourself from [Ruckus Support](https://support.ruckuswireless.com/software/4537-zd1200-10-5-1-ga-refresh-9-software-release), and ensure that your download, decryption and use comply with the applicable terms.
+### Host
 
-The included [MIT License](LICENSE) applies only to this repository's original
-glue code and documentation. It grants no rights to Ruckus materials.
+- Linux with Docker Engine + **Compose v2** (`docker compose`, not the old
+  `docker-compose` script). `build-container.sh` uses `sudo` for Docker only if
+  your user is not in the `docker` group.
+- A LAN interface that can pass **foreign MAC addresses** (MAC spoofing, or a
+  bridge port that doesn't filter MACs). The guest is a macvtap device on the
+  host NIC and needs its own MAC on the wire — the appliance must be a real L2
+  device on the LAN, because access points connect to it directly.
+  There is deliberately **no NAT/user-mode fallback**: it would hide the appliance
+  from the APs. WSL2 and other hosts that cannot pass foreign  MACs are not
+  supported.
+- `/dev/kvm` — optional. Without it QEMU falls back to TCG and the guest takes
+  several minutes to boot instead of ~1–2.
+- Host tools for the prepare step: `tar`, `gzip`, `python3`, `md5sum`,
+  `sha256sum` (coreutils) and `bash`.
 
-`prepare-vendor-image.sh` accepts a user-supplied *decrypted* ZD1200 archive and
-creates the ignored `image/` directory locally. An online decryption tool
-is [here](https://ms264556.net/ruckus/DecryptRuckusBackups). It does not pin a
-firmware version. To enforce a specific archive hash, set
-`EXPECTED_ARCHIVE_SHA256` (e.g. the 10.5.1.0.282 archive's
-`64dfbf4d67cc65cafa0e258e426c664c7387b1219209ec893b9b1e41ab202cb8`).
+### Firmware
 
-The script verifies the archive identity, vendor metadata and vendor kernel/
-rootfs MD5 values before extracting `bzImage`, `vmlinux`, `rootfs.ext2`, the
-base initramfs, and the complete AP/aidfs payload. Generated output is ignored
-by Git and must never be committed.
+This repo does **not** ship firmware. Download the ZD1200 firmware upgrade file
+from Ruckus/CommScope support (an account is required), e.g.
 
-## Prerequisites
+```
+zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
+```
 
-- x86_64 (or aarch64 — see RUNBOOK.md) Linux host with QEMU
-  (`qemu-system-i386`, `qemu-img`) and e2fsprogs (`mke2fs`); KVM is
-  optional.
-- For the host-TAP path (`host/zd1200-bridge`): a dedicated Layer-2 interface
-  for the guest if it will manage real APs; the host must not have an IP
-  address on that adapter, bridge, or TAP interface.  (The host-netns path uses
-  the host's normal LAN interface instead.)
-- Host tools for preparation: Bash, Python 3, `tar`, `gzip`, `md5sum`, and
-  `sha256sum`.
+Pass that file to `build-container.sh` as-is. The download is TAC-encrypted, and
+`scripts/prepare-vendor-image.sh` decrypts it with
+`scripts/ruckus_tac_decrypt.py` before extracting. The decrypted payload is a
+gzipped tar containing `metadata`, `bzImage`,
+`rootfs.i386.ext2.director1200.img`, `restoreinitramfs.gz`, `firmwares/` and the
+AP models list.
 
-## Build the local image
+Any ZD1200 release works — `scripts/prepare-vendor-image.sh` validates the
+`metadata` (`REQUIRE_PLATFORM=nar5520`, `REQUIRE_SUBPLATFORM=cob7402`) and the
+kernel/rootfs MD5s, and does not pin a version. The prepared artifacts land in
+`image/` (gitignored).
+
+Pass the file to the build script, or set `ZD_ARCHIVE`. To pin the payload
+integrity, set `EXPECTED_ARCHIVE_SHA256`; the 10.5.1.0.282 payload is
+`64dfbf4d67cc65cafa0e258e426c664c7387b1219209ec893b9b1e41ab202cb8`.
+
+The GRUB bootloader is *not* taken from the firmware: it is compiled from the
+ZD1200 GPL source and committed under `bootfs-src/` (provenance, hashes and the
+GPL notice are in `bootfs-src/README.md`).
+
+### The `image/` directory
+
+`build-container.sh` runs `scripts/prepare-vendor-image.sh` once to unpack the
+firmware archive into `image/` at the repo root (gitignored). It holds the
+vendor-derived `rootfs.ext2`, `bzImage`, `restoreinitramfs.gz`, the signing-cert
+payload and the AP firmware payload, and is mounted read-only into the container
+at `/opt/zd1200/image`. Later runs reuse it; delete the directory (or re-run
+`scripts/prepare-vendor-image.sh <archive>`) to extract again.
+
+---
+
+## Quick start
 
 ```sh
-cp .env.example .env
-./prepare-vendor-image.sh /absolute/path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img.tgz
-docker compose up -d --build
+sudo ./build-container.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
 ```
 
-`ZD_IMAGE_DIR` in `.env` defaults to `./image`. Set it to an external absolute
-path if the large, generated files should live elsewhere. `.env`, `image/`, VM
-disks, logs and state are excluded by `.gitignore`.
+That one command prepares `image/` (once), creates `.env`, builds the container
+image and starts it. On later runs, omit the archive path.
 
-For a physical Ethernet attachment, configure the dedicated adapter in
-`host/zd1200-bridge.env.example`, then install the files as follows:
+Watch it boot:
 
 ```sh
-sudo install -m 0755 host/zd1200-bridge /usr/local/sbin/zd1200-bridge
-sudo install -m 0644 host/zd1200-bridge.service /etc/systemd/system/
-sudo install -m 0600 host/zd1200-bridge.env.example /etc/default/zd1200-bridge
-sudoedit /etc/default/zd1200-bridge
-sudo systemctl daemon-reload
-sudo systemctl enable --now zd1200-bridge.service
+docker logs -f zd1200
+docker exec zd1200 tail -f /tmp/zd1200-web.log     # guest serial console
 ```
 
-The bridge service refuses to repurpose an interface carrying the host default
-route. Set `ZD_USB_MAC` in its configuration to the dedicated adapter's MAC as
-an additional guard.
+The container reports `Up (healthy)` once the guest prints
+`System go into READY status.` on the console — a couple of minutes under KVM,
+longer under TCG.
 
-Alternatively, the container itself can run in **host network mode**
-(`network_mode: host`) so the QEMU guest is a real device on the LAN: the
-entrypoint creates a macvtap on the host's **physical** interface (e.g. `eth0`)
-and the guest shares that L2 segment, exactly like a real appliance plugged into
-the network. No host-side bridge or systemd service is needed:
+Flags: `--no-up` builds the image without starting it; `--help` prints the usage.
+
+---
+
+## Reaching the appliance
+
+The guest leases an address **from your LAN's DHCP server**. It is a normal
+device on the network, not a published container port:
 
 ```sh
-cp .env.example .env       # set ZD_SIGN_CERT_HOST to the signing-cert dir
-docker compose up -d --build
+docker exec zd1200 cat /var/lib/zd1200/guest-ip
 ```
 
-The parent NIC must pass foreign MACs (MAC-spoofing enabled; Hyper-V vSwitch
-ports need "Enable MAC address spoofing").  The guest gets its own DHCP lease
-through the macvtap; the container shares the host netns, so the entrypoint does
-**not** run its own `udhcpc` on `eth0` (that would disturb the host's IP).
+Open `https://<guest-ip>/` (the entrypoint prints the URL once it has the lease)
+from a machine on the same LAN. First boot runs the factory setup wizard. After
+the wizard, reboot the appliance once so it generates its SSH host key, then
+`ssh admin@<guest-ip>`.
 
-> **Important — use the fixed board data.**  The **MAC-derived** serial
-> (`boarddata-from-mac.sh`, enabled by `ZD_BOARDDATA_FROM_MAC=1`) is rejected by
-> the firmware's support-entitlement check (`E_InvalidSerialNumber` = "serial
-> number mismatch"), which keeps the "No Support Upgrade Entitlement" banner up
-> even though the signing bypass works.  Use `ZD_BOARDDATA_FROM_MAC=0` to bake
-> the known-valid default `ZD_SERIAL`/`ZD_MAC1`.  (In host-netns the guest MAC is
-> a fixed Ruckus-OUI MAC; run a single instance per L2, or use
-> `ZD_BOARDDATA_FROM_MAC=1` with a serial that passes the check.)
+### The guest IP is not reachable from this host
 
-**Running under WSL2:** the WSL2 vSwitch drops frames from foreign MACs and has
-no MAC-spoofing toggle (microsoft/WSL#7192, #11616), so both the macvlan path and
-the host-netns/macvtap path get **no** DHCP lease for the guest.  Either needs a
-real VM or host whose vSwitch/NIC passes foreign MACs.  Under WSL2 (or on any
-host without `/dev/kvm`), merge the `docker-compose.user.yml` override
-(user-mode networking, no device passthrough) instead of using the base file
-alone:
+By design. The guest is a macvtap device on the host's NIC, and a macvlan parent
+does not loop frames back to its sibling macvtap, so **the Docker host cannot
+reach its own guest**. Verify the appliance from another machine on the LAN:
 
 ```sh
-docker compose -f docker-compose.yml -f docker-compose.user.yml up -d
+curl -kI https://<guest-ip>/admin10/login.jsp
 ```
 
-After the first factory-wizard completion, reboot the appliance once. That allows
-the configured system to generate its persistent Dropbear host key and start the
-stock administrative SSH (port 22), exactly like a real appliance. The guest
-reboots **in place** (its patched `machine_restart()` issues a QEMU i8042 reset;
-`-no-reboot` is never used), so a guest reboot completes and the container stays
-up — you do not need to `docker restart` it.
+This is expected behaviour, not a fault — there is nothing to "fix" with routes,
+bridges or iptables.
 
-## Runtime notes
+### Serial console
 
-- Keep `KERNEL_EXTRA: nohz=off`. The 2.6.32 guest's tickless-idle path spins a
-  host CPU while idle; this option reduced observed KVM QEMU CPU use from about
-  25% to about 2% of one host CPU.
-- `CPU_LIMIT` is intentionally absent for KVM. The old duty-cycle limiter only
-  added SIGSTOP/SIGCONT pauses and delayed useful work. `nice -n 10` remains
-  and only lowers scheduling priority under contention.
-- The board data (serial + unicast MAC, MAC2 = MAC1 + 1) is written into the
-  CF image by `write-boarddata.py`; the kernel's v54bsp driver reads it from
-  the CompactFlash at boot, exactly like a physical ZD1200. It is written only
-  when the synthetic base is built (first run / base rebuild) and is preserved
-  across re-patches, so changing `ZD_SERIAL`/`ZD_MAC1` after the first run needs a
-  state reset. The MAC-derived serial (`boarddata-from-mac.sh`,
-  `ZD_BOARDDATA_FROM_MAC=1`) is **rejected** by the firmware's support-entitlement
-  check, so use `ZD_BOARDDATA_FROM_MAC=0` with the default `ZD_SERIAL`/`ZD_MAC1`
-  unless you supply a serial that passes. Do not run two instances on the same
-  Layer-2 network with the same MAC.
-- The rootfs is patched before QEMU boots by an ordered `patches/` pipeline
-  (`apply-rootfs-patches.sh`): the coordinator decides first-run / upgrade /
-  patch-set-change / no-op and, whenever it patches, recreates the overlay then
-  applies the `patches/` scripts. The patches modify only the rootfs (hda2/hda3)
-  and never touch `/writable` (hda4), which is preserved along with the board data
-  across a re-patch — so re-patching never resets the controller config.
-- The generated state volume contains controller configuration and AP state.
-  Back it up before experiments; deleting it returns the VM to factory setup.
+The guest's serial console is the appliance's console (the same prompt you would
+get on the physical box). It is logged, and also exposed interactively:
 
-## Security warning
+```sh
+# raw console log (also what the healthcheck greps)
+docker exec zd1200 tail -f /tmp/zd1200-web.log
 
-This is a lab proof of concept, not a hardened appliance. Do not expose the
-VM's HTTPS, SSH, FTP, management network, or host Docker API to untrusted
-networks. Use a dedicated management VLAN and firewall rules.
-
-## Repository contents
-
-The source-only public repository should contain these files:
-
-```text
-AGENTS.md                     Dockerfile                    docker-compose.yml
-docker-compose.user.yml       .env.example                  make-synthetic-cf.py
-patch-kernel.py               apply-rootfs-patches.sh       patches/ (NN - Name.sh)
-write-boarddata.py            run-zd1200-qemu.sh            run-zd1200-web.sh
-build-container.sh            inject-dropbear.sh            boarddata-from-mac.sh
-sniff-guest-dhcp.py           limit-process-cpu.py           prepare-vendor-image.sh
-host/zd1200-bridge            host/zd1200-bridge.service     host/zd1200-bridge.env.example
-README.md                     WRITABLE_PARTITION.md         RUNBOOK.md
-LICENSE                       .gitignore                    .dockerignore
+# interactive console (ZD1200 CLI login prompt)
+docker exec -it zd1200 python3 /opt/zd1200/attach-console.py
+# Ctrl-C (sometimes twice) detaches; the guest keeps running
 ```
 
-`limit-process-cpu.py` is retained for the automatic TCG fallback only.
+QEMU also exposes an IPMI BMC (`ipmi-bmc-sim` + `isa-ipmi-kcs`), which the
+firmware uses for watchdog and power handling.
 
-## The `/boot` bootloader image
+---
 
-`make-synthetic-cf.py` builds the boot area in-process from the source-built GRUB
-artifacts in `bootfs-src/` (see `bootfs-src/README.md`) and writes it at sector 0
-of the base CF image, then copies the patched kernel onto `/boot` (`/bzImage`), so
-`/boot` is self-contained (grub + kernel). There is no bootfs image file in the
-repo, and no vendor binaries are redistributed.
+## How it works
 
-`build-bootfs.py` produces that boot area. The layout is the one the ZD1200
-expects:
+- `docker/Dockerfile` builds a Debian image with QEMU and the guest-image
+  tooling; `docker/docker-compose.yml` runs it with `network_mode: host`, the
+  `NET_ADMIN`/`MKNOD`/`NET_RAW` capabilities and the `zd1200-state` volume.
+- On start, the entrypoint (`scripts/run-zd1200-web.sh`) patches the kernel for
+  QEMU, then `scripts/apply-rootfs-patches.sh` builds the synthetic CompactFlash
+  (`scripts/make-synthetic-cf.py` + `scripts/write-boarddata.py`), creates the
+  persistent qcow2 overlay and runs the ordered patches in `patches/`.
+- The board data (serial + MACs) is **authoritative**: it is seeded into the CF
+  when the base disk is built, and `scripts/read-boarddata.py` reads it back from
+  the disk on every start. The macvtap, the QEMU NIC and the DHCP sniffer all use
+  the value read back, so a MAC changed in the appliance's web UI is honoured on
+  the next start.
+- The `/boot` bootloader filesystem is built from `bootfs-src/` by
+  `scripts/build-bootfs.py` and written at sector 0 of the synthetic CF.
+- QEMU boots the guest with a macvtap (`mvt0`) on the host's physical NIC.
+- Re-runs are cheap: the coordinator records a signature (`rootfs`/`bootfs`/
+  `patches` hashes) in the state volume and no-ops when nothing changed.
+
+## Configuration
+
+`build-container.sh` copies `docker/.env.example` to `.env` on first run. The
+usual knobs:
+
+| variable | purpose |
+|---|---|
+| `ZD_GUEST_IP` | guest management IP used for the printed URL (readiness itself is console-based) |
+| `ZD_SIGN_CERT_HOST` | host path to the signing-cert payload for the license patch (extracted from the firmware archive by default) |
+| `ZD_CONTAINER_MAC` | unique container MAC the guest identity is derived from (auto-generated into `.env` on first run) |
+| `ZD_SERIAL`, `ZD_MAC1` | only used if you pin the identity (`ZD_BOARDDATA_FROM_MAC=0`) |
+| `ZD_CONTAINER_NAME`, `ZD_STATE_VOLUME` | container and volume names |
+
+## Gotchas
+
+- **Board data is authoritative.** `ZD_CONTAINER_MAC` (a unique,
+  locally-administered MAC that `build-container.sh` generates into `.env` on
+  first run) seeds the identity when the synthetic CF is first built — the guest
+  MAC1 is that value and the serial is hashed from it. From then on the board data
+  on the disk wins: it is read back on every start, so changing the MAC in the
+  appliance's web UI takes effect on the next start. Re-seeding it (new
+  `ZD_CONTAINER_MAC`, or pinning `ZD_BOARDDATA_FROM_MAC=0` with
+  `ZD_SERIAL`/`ZD_MAC1`) needs a fresh state volume (see *Factory reset*).
+- **The guest reboots in place.** Its patched `machine_restart()` issues a QEMU
+  i8042 reset, so a reboot from the web UI, CLI or `/sbin/reboot` completes and
+  the container stays `Up`. Do not add `-no-reboot`.
+- **No in-guest firmware upgrades.** QEMU boots an external kernel, so a web-UI
+  upgrade would leave a mixed version. Update the archive/`bootfs-src/` and
+  rebuild instead.
+- **No NAT fallback.** The container shares the host's network namespace and the
+  guest is a macvtap on the host NIC, so APs reach it directly on the LAN. A
+  user-mode NAT setup would hide the appliance from the APs, so there is none —
+  the host must be able to pass foreign MACs.
+
+- **First boot is the factory wizard.** The state volume persists the controller
+  configuration; `/writable` is preserved across rootfs re-patches.
+
+## Factory reset / clean state
+
+```sh
+docker compose --project-directory . -f docker/docker-compose.yml down -v
+```
+
+Removes the container **and** the `zd1200-state` volume, so the next
+`build-container.sh` boots a factory appliance again.
+
+## Repository layout
 
 ```
-sector 0            MBR  = GRUB stage1 (patched) + partition-table area + 0x55AA
-sectors 1..61       installed e2fs_stage1_5, raw (outside any fs)
-sectors 62..84567   hda1 ext2 filesystem (C1 = 84506 sectors), /lib/grub + /boot/grub
+build-container.sh   the one entry point
+docker/              Dockerfile, compose files, .env.example, Dockerfile.dockerignore
+scripts/             host prepare step + container entrypoint, guest-image prep, console helper
+patches/             ordered rootfs patches applied before each boot
+bootfs-src/          source-built GRUB artifacts (GPLv2) + provenance
+image/               vendor-derived artifacts built from your firmware (gitignored)
 ```
 
-`build-bootfs.py` does three things the source-built artifacts need:
+## License
 
-1. **stage1 → MBR**: sets the stage1_5 load address (`0x2000:0x0200`) and source
-   sector (1), and nops the boot-drive-check `jmp` — exactly what GRUB's `install`
-   does for a hard disk.
-2. **installs stage1_5**: the shipped `e2fs_stage1_5` has an empty self-blocklist
-   (`blocklist_default_len: .word 0`), so the first sector's blocklist entry is
-   filled in for the rest of the stage1_5 (LBA 2, 14 sectors, segment `0x220`),
-   and the second sector gets the `(hd0,0)` device + stage2 path that `install`
-   writes back.
-3. **patches `ZD_PART_SECTOR`**: Ruckus's `grub-partition.patch` makes GRUB read
-   the partition table from a fixed sector instead of the MBR. The GPL source
-   hard-codes the platform-0 value (`3982101`, past the end of the
-   3,931,200-sector CF), while the ZD1200 (platform 1) and `write-boarddata.py`
-   both use `3927001` — so that compiled-in constant is patched in `stage2` and
-   `e2fs_stage1_5`. Without it GRUB falls back to the empty MBR partition table
-   and fails to mount hda1 (`Error 17`).
-
-It also rewrites `menu.lst` to the ZD1200 geometry (`/dev/hda*`, current = root B
-= hda3, backup = root A = hda2); the profile ships the ZD3000-era `/dev/sda*` +
-root-A-current variant.
-
-Files in the generated `/boot` filesystem (1 KiB blocks, 128-byte inodes, no
-optional features — what GRUB 0.97's ext2 driver expects):
-
-```
-/lib/grub/i386-pc/{stage1,stage2,e2fs_stage1_5,menu.lst,default}
-/boot/grub/{stage1,stage2,e2fs_stage1_5,menu.lst,default}
-```
-
-`/bzImage` (the patched kernel) and `/restoreinitramfs.gz` (the rescue initrd)
-are **copied onto it at build time** — they are not part of the boot area.
-
-## Known limitation
-
-Do not use the ZoneDirector web-upgrade workflow inside this VM. QEMU boots an
-external kernel, so an in-guest upgrade would create a mixed version unless
-this port is updated and rebuilt for that release.
-
-
+MIT — see `LICENSE`. The GRUB bootloader binaries under `bootfs-src/` are
+**GPLv2-or-later**; see `bootfs-src/COPYING` and `bootfs-src/README.md` for the
+license and the corresponding-source offer.

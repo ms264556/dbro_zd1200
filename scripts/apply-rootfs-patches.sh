@@ -83,10 +83,10 @@ command -v qemu-img >/dev/null 2>&1 || { echo "apply-rootfs-patches: qemu-img is
 
 # --- signature of the current base rootfs + bootfs inputs + patch set ---------
 # The synthetic base disk bakes both the rootfs and the boot area (built from
-# bootfs-src/ by build-bootfs.py), so a change to either means the base must be
-# rebuilt (and the overlay re-patched).
+# bootfs-src/lib/ by build-bootfs.py), so a change to either means the base must
+# be rebuilt (and the overlay re-patched).
 rootfs_sig="$(sha256sum "$ROOTFS" | awk '{print $1}')"
-bootfs_sig="$( cd "$BASE" && { find bootfs-src -type f -print | LC_ALL=C sort | xargs sha256sum; sha256sum build-bootfs.py; } | sha256sum | awk '{print $1}')"
+bootfs_sig="$( cd "$BASE" && { find bootfs-src/lib -type f -print | LC_ALL=C sort | xargs sha256sum; sha256sum build-bootfs.py; } | sha256sum | awk '{print $1}')"
 patch_sig="$( cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}')"
 
 stored_rootfs=""; stored_bootfs=""; stored_patches=""

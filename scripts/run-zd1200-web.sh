@@ -2,7 +2,7 @@
 # NOTE: This is the container's ENTRYPOINT. It is run by Docker Compose as the
 # zd1200 container command — do NOT run it directly on the host as a standalone
 # flow. The supported way to run this project is `sudo ./build-container.sh`
-# (= docker compose up -d --build). See AGENTS.md and RUNBOOK.md.
+# (= docker compose up -d --build). See README.md.
 set -euo pipefail
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -74,11 +74,15 @@ if ! command -v qemu-img >/dev/null 2>&1; then
     exit 1
 fi
 # The serial number and MACs live in the board-data records on the CF image
-# (read by the kernel's v54bsp driver; NOT patched into the kernel).  Rewrite
-# them on every launch so env changes take effect.  MAC2 = MAC1 + 1.
-# In macvlan mode the identity is derived from the container's eth0 MAC (the
-# MAC Docker allocated on the macvlan network), so every instance is unique on
-# the LAN; set ZD_BOARDDATA_FROM_MAC=0 to force fixed ZD_SERIAL/ZD_MAC1.
+# (read by the kernel's v54bsp driver; NOT patched into the kernel).  This block
+# only computes the identity to WRITE when the synthetic base is first built
+# (see apply-rootfs-patches.sh below); on every start the board data is read
+# back afterwards and takes precedence.
+# By default the identity is derived from ZD_CONTAINER_MAC, a unique
+# locally-administered MAC generated into .env by build-container.sh
+# (scripts/boarddata-from-mac.sh: MAC1 = ZD_CONTAINER_MAC, serial hashed
+# from MAC1); MAC2 = MAC1 + 1.  Set ZD_BOARDDATA_FROM_MAC=0 to pin the fixed
+# ZD_SERIAL/ZD_MAC1 instead.
 if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_BOARDDATA_FROM_MAC:-1}" != "0" ]; then
     eval "$("$work_dir/boarddata-from-mac.sh")"
     zd_serial="$SERIAL"
@@ -107,6 +111,23 @@ ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
 "$work_dir/apply-rootfs-patches.sh"
 
 : > "$log_file"
+
+# The board data is authoritative: a ZD1200 can change its MAC in the web UI and
+# the firmware writes it back into the board-data record.  Read it back now and
+# use it for the macvtap, the QEMU NIC and the DHCP sniffer, so a MAC changed
+# inside the guest is honoured on the next start.  Only a freshly built base disk
+# gets the identity derived above written into it (apply-rootfs-patches.sh).
+if [ -f "$work_dir/read-boarddata.py" ]; then
+    if boarddata="$(python3 "$work_dir/read-boarddata.py" "$persistent_disk" 2>>"$log_file")"; then
+        eval "$boarddata"
+        zd_serial="${SERIAL:-$zd_serial}"
+        zd_mac1="${MAC:-$zd_mac1}"
+        zd_mac2="${MAC2:-$zd_mac2}"
+        echo "board data: serial=$zd_serial MAC1=$zd_mac1 MAC2=$zd_mac2" >>"$log_file"
+    else
+        echo "warning: no board data read from $persistent_disk; using the derived identity" >>"$log_file"
+    fi
+fi
 
 # macvlan: obtain the container's LAN IP from the DHCP server.  The macvlan
 # network carries no useful Docker-assigned address (Docker only pools a
