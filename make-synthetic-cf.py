@@ -11,18 +11,17 @@ HANDOFF):
 
 The whole boot area — MBR (stage1 at the stage1_5 load address) + the embedded
 stage1_5 (self-load count baked in) + the /boot filesystem (stage2 / menu.lst /
-default) — is pre-built and shipped as `bootfs.img.gz` (fixed geometry, so it's
-baked once).  make-synthetic-cf.py just writes `bootfs.img.gz` (decompressed,
-with the patched kernel placed on /boot as /bzImage) at sector 0, then lays down
-hda2/hda3 (rootfs) and hda4 (/writable) from `image/`.  No per-build repatching.
+default) — is built in-process by `build-bootfs.py` from the source-built GRUB
+artifacts in `bootfs-src/`, with the patched kernel placed on /boot as /bzImage.
+make-synthetic-cf.py writes those bytes at sector 0, then lays down hda2/hda3
+(rootfs) and hda4 (/writable) from `image/`.  No per-build repatching.
 
-Bootfs/GRUB binaries are the only vendor-provided pieces; kernel / rootfs /
-/writable come from `image/`.
+kernel / rootfs / /writable come from `image/`.
 """
 
 from pathlib import Path
+import importlib.util
 import os
-import gzip
 from shutil import which
 import struct
 import subprocess
@@ -30,7 +29,6 @@ import tempfile
 
 base = Path(__file__).resolve().parent
 rootfs = base / "image" / "rootfs.ext2"
-bootfs_gz = base / "bootfs.img.gz"
 kernel_src = base / "image" / "bzImage"     # raw; patch below for QEMU
 disk = Path(os.environ.get("SYNTHETIC_DISK", base / "synthetic-cf.img"))
 disk.parent.mkdir(parents=True, exist_ok=True)
@@ -42,10 +40,16 @@ H3, C3 = 499720, 415152     # root B
 H4, C4 = 914872, 3006008    # data (/writable)
 DISK_SIZE = 3931200 * SECTOR
 
-if not bootfs_gz.exists():
-    raise SystemExit(f"missing {bootfs_gz} (pre-built GRUB bootloader fs)")
 if rootfs.stat().st_size > C2 * SECTOR:
     raise SystemExit("rootfs does not fit in root partition")
+
+
+def build_bootfs() -> bytes:
+    """Build the boot area (MBR + stage1_5 + hda1 fs) from bootfs-src/."""
+    spec = importlib.util.spec_from_file_location("zd_build_bootfs", base / "build-bootfs.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_bootfs()
 
 mke2fs = os.environ.get("MKE2FS") or which("mke2fs")
 if not mke2fs:
@@ -88,21 +92,25 @@ def seed_writable_config(ext2_path):
 with disk.open("wb") as handle:
     handle.truncate(DISK_SIZE)
 
-# ---- boot area (MBR + embedded stage1_5 + /boot) from bootfs.img.gz ---------
+# ---- boot area (MBR + embedded stage1_5 + /boot) built from bootfs-src/ -----
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
-    bootfs_img = td / "bootfs.img"
-    with gzip.open(bootfs_gz, "rb") as gz, open(bootfs_img, "wb") as out:
-        out.write(gz.read())
+    # Build the boot area (MBR + embedded stage1_5 + hda1 ext2) from bootfs-src/.
+    kb = build_bootfs()
 
-    # kernel onto /boot: the bootfs is the whole boot area (MBR+gap+hda1 fs),
-    # so debugfs the hda1 filesystem portion only (its superblock is at sector H1).
-    kb = bootfs_img.read_bytes()
+    # kernel onto /boot: the boot area is MBR+gap+hda1 fs, so debugfs the hda1
+    # filesystem portion only (its superblock is at sector H1).
     h1_fs = kb[H1 * SECTOR:H1 * SECTOR + C1 * SECTOR]
     h1_tmp = td / "h1_fs.img"
     open(h1_tmp, "wb").write(h1_fs)
     ker_cmds = td / "ker.cmds"
-    ker_cmds.write_text(f"write {kernel_file} /bzImage\n")
+    cmds = [f"write {kernel_file} /bzImage"]
+    # The vendor /boot also carried the rescue initrd; menu.lst's "System rescue
+    # from image" entry needs it at (hd0,0)/restoreinitramfs.gz.
+    rescue = base / "image" / "restoreinitramfs.gz"
+    if rescue.exists():
+        cmds.append(f"write {rescue} /restoreinitramfs.gz")
+    ker_cmds.write_text("\n".join(cmds) + "\n")
     subprocess.run(["debugfs", "-w", "-f", str(ker_cmds), str(h1_tmp)],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     h1_fs = open(h1_tmp, "rb").read()

@@ -23,22 +23,26 @@ WORKDIR /opt/zd1200
 COPY apply-rootfs-patches.sh \
      boarddata-from-mac.sh \
      attach-console.py \
+     build-bootfs.py \
      limit-process-cpu.py \
      make-synthetic-cf.py \
-     bootfs.img.gz \
      patch-kernel.py \
      run-zd1200-qemu.sh \
      run-zd1200-web.sh \
      sniff-guest-dhcp.py \
      write-boarddata.py \
      /opt/zd1200/
+# Source-built GRUB artifacts (see bootfs-src/README.md); make-synthetic-cf.py
+# builds the boot area from them via build-bootfs.py.
+COPY bootfs-src/ /opt/zd1200/bootfs-src/
 # The ordered rootfs patches live in patches/ and run (in lexical filename
 # order) against the qcow2 overlay; apply-rootfs-patches.sh decides whether
 # they are needed (first run / after an upgrade) before launching QEMU.
 COPY patches/ /opt/zd1200/patches/
 
 RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py /opt/zd1200/patches/*.sh \
-    && mkdir -p /opt/zd1200/image /var/lib/zd1200
+    && mkdir -p /opt/zd1200/image /var/lib/zd1200 \
+    && /opt/zd1200/build-bootfs.py --check
 
 ENV STATE_DIR=/var/lib/zd1200 \
     NETWORK_MODE=tap \

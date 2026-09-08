@@ -178,41 +178,55 @@ LICENSE                       .gitignore                    .dockerignore
 
 `limit-process-cpu.py` is retained for the automatic TCG fallback only.
 
-## `bootfs.img` (the `/boot` bootloader image)
+## The `/boot` bootloader image
 
-`make-synthetic-cf.py` **`zcat`'s `bootfs.img.gz`** onto the base CF image's
-`/boot` partition (hda1) and then copies the patched kernel onto it (`/bzImage`),
-so `/boot` is self-contained (grub + kernel). `bootfs.img.gz` is a pre-built,
-gzipped artifact (gitignored by the existing `*.img` rule) and must exist before
-the build; the build decompresses it with `zcat`.
+`make-synthetic-cf.py` builds the boot area in-process from the source-built GRUB
+artifacts in `bootfs-src/` (see `bootfs-src/README.md`) and writes it at sector 0
+of the base CF image, then copies the patched kernel onto `/boot` (`/bzImage`), so
+`/boot` is self-contained (grub + kernel). There is no bootfs image file in the
+repo, and no vendor binaries are redistributed.
 
-It is created from the **vendor GRUB-legacy binaries only** — a host recompile
-of GRUB 0.97 does not boot in QEMU (the `Error 17` in the small `/boot` mount
-path). Everything else in the disk is rebuilt from `image/`.
+`build-bootfs.py` produces that boot area. The layout is the one the ZD1200
+expects:
 
-**mkfs options used to build `bootfs.img` (before gzipping to `bootfs.img.gz`):**
-```sh
-mkfs.ext2 -F -q -b 1024 -I 128 \
-  -O ^64bit,^extent,^dir_index,^resize_inode,^sparse_super,^filetype,^ext_attr \
-  bootfs.img
 ```
-i.e. 1 KiB blocks, **128-byte inodes**, and `large_file` **enabled** (it is
-*not* in the `-O ^...` disable list — disabling `large_file` makes the vendor
-grub `Error 17`). Resize inode, dir_index, sparse_super, filetype and ext_attr
-are all disabled.
+sector 0            MBR  = GRUB stage1 (patched) + partition-table area + 0x55AA
+sectors 1..61       installed e2fs_stage1_5, raw (outside any fs)
+sectors 62..84567   hda1 ext2 filesystem (C1 = 84506 sectors), /lib/grub + /boot/grub
+```
 
-**Files in `bootfs.img`:**
+`build-bootfs.py` does three things the source-built artifacts need:
+
+1. **stage1 → MBR**: sets the stage1_5 load address (`0x2000:0x0200`) and source
+   sector (1), and nops the boot-drive-check `jmp` — exactly what GRUB's `install`
+   does for a hard disk.
+2. **installs stage1_5**: the shipped `e2fs_stage1_5` has an empty self-blocklist
+   (`blocklist_default_len: .word 0`), so the first sector's blocklist entry is
+   filled in for the rest of the stage1_5 (LBA 2, 14 sectors, segment `0x220`),
+   and the second sector gets the `(hd0,0)` device + stage2 path that `install`
+   writes back.
+3. **patches `ZD_PART_SECTOR`**: Ruckus's `grub-partition.patch` makes GRUB read
+   the partition table from a fixed sector instead of the MBR. The GPL source
+   hard-codes the platform-0 value (`3982101`, past the end of the
+   3,931,200-sector CF), while the ZD1200 (platform 1) and `write-boarddata.py`
+   both use `3927001` — so that compiled-in constant is patched in `stage2` and
+   `e2fs_stage1_5`. Without it GRUB falls back to the empty MBR partition table
+   and fails to mount hda1 (`Error 17`).
+
+It also rewrites `menu.lst` to the ZD1200 geometry (`/dev/hda*`, current = root B
+= hda3, backup = root A = hda2); the profile ships the ZD3000-era `/dev/sda*` +
+root-A-current variant.
+
+Files in the generated `/boot` filesystem (1 KiB blocks, 128-byte inodes, no
+optional features — what GRUB 0.97's ext2 driver expects):
+
 ```
-/boot/grub/stage2                      zd1200_task stage2 (must be at BOTH this path and /lib/grub/i386-pc/)
-/lib/grub/i386-pc/stage2               zd1200_task stage2
-/lib/grub/i386-pc/e2fs_stage1_5        zd1200_task stage1_5
-/lib/grub/i386-pc/stage1               zd1200_task GRUB 0.97 stage1
-/lib/grub/i386-pc/default              zd1200_task default form (first line "1" + comment block)
-/lib/grub/i386-pc/menu.lst             zd1200_task menu.lst  (root (hd0,0); kernel (hd0,0)/bzImage root=/dev/hda2)
-/boot/grub/menu.lst                    zd1200_task menu.lst (same)
+/lib/grub/i386-pc/{stage1,stage2,e2fs_stage1_5,menu.lst,default}
+/boot/grub/{stage1,stage2,e2fs_stage1_5,menu.lst,default}
 ```
-`/bzImage` (the patched kernel) is **copied onto it at build time** — it is not
-part of `bootfs.img` itself.
+
+`/bzImage` (the patched kernel) and `/restoreinitramfs.gz` (the rescue initrd)
+are **copied onto it at build time** — they are not part of the boot area.
 
 ## Known limitation
 

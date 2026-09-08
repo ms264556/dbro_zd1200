@@ -53,16 +53,20 @@ Before QEMU boots, the entrypoint runs `apply-rootfs-patches.sh` (the **only**
 place that builds the disk/overlay or patches the rootfs).  It builds the writable
 synthetic disk + `/writable` (hda4), writes the board data, creates the qcow2
 overlay, then runs every patch in `patches/` in lexical order.  The patches only
-ever modify the **rootfs** (hda2/hda3) — **never** `/writable`.
+ever modify the **rootfs** (hda2/hda3) — **never** `/writable`.  The boot area is
+built from the source-built GRUB artifacts in `bootfs-src/` by `build-bootfs.py`
+(called by `make-synthetic-cf.py` when it writes the synthetic disk).
 
 The coordinator reconciles state against a signature file
-(`/var/lib/zd1200/.patches-applied`, holding the base-rootfs + patch-set hashes):
+(`/var/lib/zd1200/.patches-applied`, holding the base-rootfs + bootfs +
+patch-set hashes):
 
 | state | what it does |
 |---|---|
 | first run (no overlay) | build base + overlay, write board data, patch |
 | overlay exists, no marker | keep base + `/writable`, recreate overlay, re-patch |
 | base rootfs hash changed (upgrade) | rebuild base + overlay, re-patch |
+| bootfs hash changed | rebuild base + overlay, re-patch |
 | patch set changed | keep base, recreate overlay, re-patch |
 | nothing changed | no-op |
 
@@ -88,6 +92,8 @@ i8042 reset), so the container stays `Up (healthy)` across a guest reboot.
 | `patches/` (NN - Name.sh) | ordered rootfs patches run into the qcow2 overlay before QEMU; **rootfs only**, never `/writable` |
 | `patch-kernel.py` | signature-matches and bytes-patches the kernel for QEMU (incl. `machine_restart()` → i8042 reset so reboot works) |
 | `make-synthetic-cf.py`, `write-boarddata.py` | guest image prep; run **inside** the container |
+| `build-bootfs.py` | builds the boot area (MBR + stage1_5 + hda1 fs) from `bootfs-src/`; called by `make-synthetic-cf.py` |
+| `bootfs-src/` | source-built GRUB artifacts (from Ruckus's ZD1200 GPL source); no vendor binaries |
 | `build-container.sh` | the one command everyone should run |
 
 ## Read these before doing anything

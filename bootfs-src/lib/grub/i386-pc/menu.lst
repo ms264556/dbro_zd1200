@@ -1,0 +1,35 @@
+#Load boot item from /grub/default
+default saved
+#Menu will be timeout in one second
+timeout 1 
+#Menu hides by default
+hiddenmenu 
+#Menu password encrypted by MD5
+password --md5 $1$VnwJv1$qKseROlaJDPCxD1fYO7X3/
+device (hd0) /dev/sda
+#redirect everything to serial console
+serial --unit=0 --speed=115200 --word=8 --stop=1
+terminal serial
+#setled --color=RED --status=ON
+fallback 1 2
+
+title Normal bootup from system image (current)
+	kernel (hd0,1)/bzImage console=ttyS0,115200n8 root=/dev/sda2 ro quiet
+	savedefault 1
+
+title Normal bootup from system image (backup)
+	kernel (hd0,2)/bzImage console=ttyS0,115200n8 root=/dev/sda3 ro quiet
+	savedefault 2
+
+title System rescue from image
+	kernel (hd0,0)/bzImage console=ttyS0,115200n8 quiet
+	initrd (hd0,0)/restoreinitramfs.gz
+	savedefault 0
+
+#Password required for USB rescue
+title System rescue from USB (password required)
+	password --md5 $1$VnwJv1$qKseROlaJDPCxD1fYO7X3/
+	kernel (hd1,0)/bzImage console=ttyS0,115200n8 quiet
+	initrd (hd1,0)/usbinitramfs.gz
+	savedefault 0
+
