@@ -1,0 +1,114 @@
+diff -ru a/stage2/char_io.c b/stage2/char_io.c
+--- a/stage2/char_io.c	2005-02-01 20:51:23.000000000 +0000
++++ b/stage2/char_io.c	2026-09-09 04:31:53.088837082 +0000
+@@ -101,9 +101,9 @@
+ }
+ 
+ char *
+-convert_to_ascii (char *buf, int c,...)
++convert_to_ascii (char *buf, int c, unsigned long num)
+ {
+-  unsigned long num = *((&c) + 1), mult = 10;
++  unsigned long mult = 10;
+   char *ptr = buf;
+ 
+ #ifndef STAGE1_5
+@@ -152,10 +152,10 @@
+ void
+ grub_printf (const char *format,...)
+ {
+-  int *dataptr = (int *) &format;
++  __builtin_va_list ap;
+   char c, str[16];
+   
+-  dataptr++;
++  __builtin_va_start (ap, format);
+ 
+   while ((c = *(format++)) != 0)
+     {
+@@ -170,21 +170,23 @@
+ 	  case 'X':
+ #endif
+ 	  case 'u':
+-	    *convert_to_ascii (str, c, *((unsigned long *) dataptr++)) = 0;
++	    *convert_to_ascii (str, c, __builtin_va_arg (ap, unsigned long)) = 0;
+ 	    grub_putstr (str);
+ 	    break;
+ 
+ #ifndef STAGE1_5
+ 	  case 'c':
+-	    grub_putchar ((*(dataptr++)) & 0xff);
++	    grub_putchar (__builtin_va_arg (ap, int) & 0xff);
+ 	    break;
+ 
+ 	  case 's':
+-	    grub_putstr ((char *) *(dataptr++));
++	    grub_putstr (__builtin_va_arg (ap, char *));
+ 	    break;
+ #endif
+ 	  }
+     }
++
++  __builtin_va_end (ap);
+ }
+ 
+ #ifndef STAGE1_5
+@@ -193,11 +195,11 @@
+ {
+   /* XXX hohmuth
+      ugly hack -- should unify with printf() */
+-  int *dataptr = (int *) &format;
++  __builtin_va_list ap;
+   char c, *ptr, str[16];
+   char *bp = buffer;
+ 
+-  dataptr++;
++  __builtin_va_start (ap, format);
+ 
+   while ((c = *format++) != 0)
+     {
+@@ -207,7 +209,7 @@
+ 	switch (c = *(format++))
+ 	  {
+ 	  case 'd': case 'u': case 'x':
+-	    *convert_to_ascii (str, c, *((unsigned long *) dataptr++)) = 0;
++	    *convert_to_ascii (str, c, __builtin_va_arg (ap, unsigned long)) = 0;
+ 
+ 	    ptr = str;
+ 
+@@ -215,12 +217,12 @@
+ 	      *bp++ = *(ptr++); /* putchar(*(ptr++)); */
+ 	    break;
+ 
+-	  case 'c': *bp++ = (*(dataptr++))&0xff;
+-	    /* putchar((*(dataptr++))&0xff); */
++	  case 'c': *bp++ = __builtin_va_arg (ap, int)&0xff;
++
+ 	    break;
+ 
+ 	  case 's':
+-	    ptr = (char *) (*(dataptr++));
++	    ptr = __builtin_va_arg (ap, char *);
+ 
+ 	    while ((c = *ptr++) != 0)
+ 	      *bp++ = c; /* putchar(c); */
+@@ -229,6 +231,7 @@
+     }
+ 
+   *bp = 0;
++  __builtin_va_end (ap);
+   return bp - buffer;
+ }
+ 
+diff -ru a/stage2/shared.h b/stage2/shared.h
+--- a/stage2/shared.h	2004-06-19 16:40:09.000000000 +0000
++++ b/stage2/shared.h	2026-09-09 04:31:53.089072250 +0000
+@@ -904,7 +904,7 @@
+ /* misc */
+ void init_page (void);
+ void print_error (void);
+-char *convert_to_ascii (char *buf, int c, ...);
++char *convert_to_ascii (char *buf, int c, unsigned long num);
+ int get_cmdline (char *prompt, char *cmdline, int maxlen,
+ 		 int echo_char, int history);
+ int substring (const char *s1, const char *s2);

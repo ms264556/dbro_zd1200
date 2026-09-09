@@ -1,0 +1,145 @@
+diff -Naur grub-0.97.old/stage2/builtins.c grub-0.97/stage2/builtins.c
+--- grub-0.97.old/stage2/builtins.c	2008-05-30 17:52:37.000000000 +0800
++++ grub-0.97/stage2/builtins.c	2008-05-30 18:17:44.000000000 +0800
+@@ -762,6 +762,85 @@
+ 
+ 
+ /* default */
++static unsigned int kretry = '0';
++static char kbuffer[SECTOR_SIZE];
++static int real_root_func (char *arg, int attempt_mount);
++#define KFLAG_FORCE_RETRY     '1'
++#define KFLAG_KERNEL_LOADED   '2'
++#define KFLAG_KERNEL_WDT_INIT '3'
++#define KFLAG_KERNEL_READY    '4'
++#define KFLAG_SYSTEM_WDT_INIT '5'
++#define KFLAG_SYSTEM_OOM      '6'
++//---------^-RETRY-^-------------
++#define KFLAG_BOUNDARY        '7'
++//--------V-NO RETRY-V-----------
++#define KFLAG_SYSTEM_READY    '8'
++#define KFLAG_WDT_REBOOT      '9'
++
++#define MSG_CURRENT_IMG       "Current Image"
++#define MSG_BACKUP_IMG        "Backup Image"
++
++static void
++show_previous_status()
++{
++  char* partid;
++  switch(default_entry){
++      case 0:
++          partid = MSG_CURRENT_IMG;
++      break;
++      case 1:
++          //grub_printf("\a\a\a");
++          partid = MSG_BACKUP_IMG;
++      break;
++      default:
++          partid = "Unknown Image";
++      break;
++  }
++
++  if(!show_menu){
++      grub_printf("=====<< PREVIOUS BOOTUP STATUS >>====================================\n");
++      switch(kretry){
++      case KFLAG_FORCE_RETRY:
++          grub_printf("\tForced retry previous one=>\n");
++          grub_printf("\tRetry previous bootup image (%s) ...\n", partid);
++      break;
++      case KFLAG_KERNEL_LOADED:
++          grub_printf("\tPervious bootup stopped after kernel init =>\n");
++          grub_printf("\tRetry previous bootup image (%s) ...\n", partid);
++      break;
++      case KFLAG_KERNEL_WDT_INIT:
++          grub_printf("\tPrevious bootup stopped after watchdog (kernel) init =>\n");
++          grub_printf("\tRetry previous bootup image (%s) ...\n", partid);
++      break;
++      case KFLAG_KERNEL_READY:
++          grub_printf("\tPrevious bootup stopped after kernel ready =>\n");
++          grub_printf("\tRetry previous bootup partition (%s) ...\n", partid);
++      break;
++      case KFLAG_SYSTEM_WDT_INIT:
++          grub_printf("\tPrevious bootup stopped after watchdog (user) init =>\n");
++          grub_printf("\tRetry previous bootup partition (%s) ...\n", partid);
++      break;
++      case KFLAG_SYSTEM_OOM:
++          grub_printf("\tPrevious system reboot because of out of memory =>\n");
++          grub_printf("\tRetry previous bootup partition (%s) ...\n", partid);
++      break;
++      case KFLAG_SYSTEM_READY:
++          grub_printf("\tPrevious bootup noramlly =>\n");
++          grub_printf("\tBoot up saved partition (%s) ...\n", partid);
++      break;
++      case KFLAG_WDT_REBOOT:
++          grub_printf("\tPrevious system rebooted by watchdog =>\n");
++          grub_printf("\tBoot up saved partition (%s) ...\n", partid);
++      break;
++      default:
++          grub_printf("\tReboot after USB upgrade or unknown status =>\n");
++          grub_printf("\tBoot up saved partition (%s) ...\n", partid);
++      break;
++      }
++      grub_printf("=====================================================================\n");
++  }
++}
++
+ static int
+ default_func (char *arg, int flags)
+ {
+@@ -769,6 +848,25 @@
+   if (grub_strcmp (arg, "saved") == 0)
+     {
+       default_entry = saved_entryno;
++      int i;
++      for(i=1; i<3; i++){
++          char tmp[8];
++          grub_sprintf(tmp, "(hd0,%d)", i);
++          real_root_func(tmp, 1);
++          devread(0, 0, SECTOR_SIZE, kbuffer);
++          kretry |= kbuffer[0];
++      }
++
++      if(kretry < KFLAG_BOUNDARY && default_entry != 0){
++        default_entry -= 1;
++      }
++
++      //
++      //if(default_entry == 1){
++      //   grub_printf("%c",  kretry&0xf);
++      //}
++
++      real_root_func("(hd0,0)", 1);
+       return 0;
+     }
+ #endif /* SUPPORT_DISKLESS */
+@@ -3165,7 +3263,7 @@
+ 	return 1;
+       
+       /* Print the type of the filesystem.  */
+-      print_fsys_type ();
++      //print_fsys_type ();
+     }
+   
+   return 0;
+@@ -3353,6 +3451,20 @@
+       buf_track = -1;
+     }
+ 
++  //clean retry flag
++
++  int i;
++  kbuffer[0] = KFLAG_KERNEL_LOADED;
++  for(i=1;i<3;i++){
++      char tmp[8];
++      grub_sprintf(tmp, "(hd0,%d)", i);
++      real_root_func(tmp, 1);
++      devwrite(0, 1, kbuffer);
++  }
++
++  real_root_func("(hd0,0)", 1);
++  show_previous_status();
++
+  fail:
+   saved_drive = tmp_drive;
+   saved_partition = tmp_partition;

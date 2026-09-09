@@ -24,9 +24,10 @@ WORKDIR /opt/zd1200
 # host-side prepare-vendor-image.sh rides along; it is only used by
 # build-container.sh before the image exists.
 COPY scripts/ /opt/zd1200/
-# Source-built GRUB artifacts (see bootfs-src/README.md); make-synthetic-cf.py
+# GRUB artifacts built by grub097_src/build.sh from upstream GRUB 0.97 + the
+# AUR/local/Ruckus patch sets (see grub097_src/README.md); make-synthetic-cf.py
 # builds the boot area from them via build-bootfs.py.
-COPY bootfs-src/ /opt/zd1200/bootfs-src/
+COPY grub097_src/out/ /opt/zd1200/grub097_src/out/
 # The ordered rootfs patches live in patches/ and run (in lexical filename
 # order) against the qcow2 overlay; apply-rootfs-patches.sh decides whether
 # they are needed (first run / after an upgrade) before launching QEMU.

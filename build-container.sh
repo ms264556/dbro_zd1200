@@ -2,8 +2,9 @@
 #
 # build-container.sh — build and start the ZD1200 Docker container (host-netns,
 # macvtap on the host's physical NIC).  This is the one entry point: it prepares
-# the vendor image (once), creates .env if absent, then builds and starts the
-# container from docker/docker-compose.yml.
+# the vendor image (once), builds the GRUB bootloader artifacts from source
+# (grub097_src/build.sh; a no-op when unchanged), creates .env if absent, then
+# builds and starts the container from docker/docker-compose.yml.
 #
 # Usage:
 #   ./build-container.sh /path/to/zd1200_*.img       # first run: extract + build + start
@@ -63,7 +64,16 @@ else
     echo "== Reusing image/ (delete it to re-extract, or run scripts/prepare-vendor-image.sh) =="
 fi
 
-# --- 2. .env + a unique container MAC ----------------------------------------
+# --- 2. build the GRUB bootloader artifacts ----------------------------------
+# The boot area is built from source (grub097_src/), not from committed binaries:
+# upstream grub-0.97 + the AUR/local/Ruckus patch sets.  The script is a no-op
+# when its signature (patches, config, this script, tarball) is unchanged, so a
+# rebuild only happens when the GRUB sources change.  Needs autoconf, automake,
+# texinfo and 32-bit gcc support on the host (see grub097_src/README.md).
+echo "== Building GRUB 0.97 bootloader artifacts (grub097_src/build.sh) =="
+./grub097_src/build.sh
+
+# --- 3. .env + a unique container MAC ----------------------------------------
 if [ ! -f .env ]; then
     cp docker/.env.example .env
     echo "== Created .env from docker/.env.example =="
@@ -92,7 +102,7 @@ if ! grep -qE '^ZD_CONTAINER_MAC=([0-9a-f]{2}:){5}[0-9a-f]{2}$' .env; then
     echo "== Generated a unique container MAC: $container_mac (guest MAC1 = this) =="
 fi
 
-# --- 3. build / start -------------------------------------------------------
+# --- 4. build / start -------------------------------------------------------
 if [ "$no_up" = 1 ]; then
     echo "== Building the ZD1200 container image (no boot) =="
     "${compose_cmd[@]}" build

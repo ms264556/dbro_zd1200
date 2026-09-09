@@ -1,0 +1,45 @@
+diff -Naur grub-0.97.old/stage2/disk_io.c grub-0.97/stage2/disk_io.c
+--- grub-0.97.old/stage2/disk_io.c	2004-05-24 00:35:24.000000000 +0800
++++ grub-0.97/stage2/disk_io.c	2008-04-08 10:26:07.000000000 +0800
+@@ -572,6 +572,8 @@
+    a BSD label sector, and it must be at least 512 bytes length.
+    When calling this function first, *PARTITION must be initialized to
+    0xFFFFFF. The return value is zero if fails, otherwise non-zero.  */
++#define ZD_PART_SECTOR 3982101
++
+ int
+ next_partition (unsigned long drive, unsigned long dest,
+ 		unsigned long *partition, int *type,
+@@ -655,16 +657,23 @@
+ 	  pc_slice_no = -1;
+ 	}
+ 
+-      /* Read the MBR or the boot sector of the extended partition.  */
+-      if (! rawread (drive, *offset, 0, SECTOR_SIZE, buf))
+-	return 0;
++      /* Read partition table from ZD pt sector .  */
++      if (! rawread (drive, *offset+ZD_PART_SECTOR, 0, SECTOR_SIZE, buf) || ! PC_MBR_CHECK_SIG (buf))
++        {
++          errnum=0;//clean error flag
++          /* Read the MBR or the boot sector of the extended partition.  */
++          if(! rawread (drive, *offset, 0, SECTOR_SIZE, buf))
++            {
++	       return 0;
++            }
+ 
+-      /* Check if it is valid.  */
+-      if (! PC_MBR_CHECK_SIG (buf))
+-	{
+-	  errnum = ERR_BAD_PART_TABLE;
+-	  return 0;
+-	}
++          /* Check if it is valid.  */
++          if (! PC_MBR_CHECK_SIG (buf))
++	    {
++	      errnum = ERR_BAD_PART_TABLE;
++	      return 0;
++	    }
++        }
+ 
+       /* Increase the entry number.  */
+       (*entry)++;

@@ -5,6 +5,8 @@ __pycache__/
 archive/
 rootfs/
 image/
+grub097_src/build/
+grub097_src/dl/
 analysis-*/
 *.log
 *.tgz

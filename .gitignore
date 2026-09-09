@@ -39,3 +39,11 @@ __pycache__/
 # Local agent and test state
 .reasonix/
 reasonix.toml
+
+# grub097_src/ build products (rebuilt by grub097_src/build.sh)
+grub097_src/dl/
+grub097_src/build/
+grub097_src/out/
+
+# boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
+.boot-test/
