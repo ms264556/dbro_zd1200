@@ -30,7 +30,7 @@
 #                  rootfs) and the overlay are rebuilt from the new image, then
 #                  re-patched.  (The lab does not support in-guest firmware
 #                  upgrades, so a base change resets /writable + board data.)
-#   * BOOTFS     — the boot-area inputs (guest-src/grub097_src/out or build-bootfs.py) changed
+#   * BOOTFS     — the boot-area inputs (image/restoreinitramfs.gz or build-bootfs.py) changed
 #                  -> the boot area is baked into the synthetic base, so rebuild
 #                  the base and re-patch.
 #   * PATCH SET  — the patches/ set changed (a patch was added or edited) but the
@@ -67,7 +67,7 @@ PERSISTENT_DISK="${PERSISTENT_DISK:-$STATE_DIR/zd1200-vm.qcow2}"
 WORK="${WORK:-$STATE_DIR/.rootfs-patch-work}"
 IMAGE_DIR="${IMAGE_DIR:-$BASE/image}"
 ROOTFS="${ROOTFS:-$IMAGE_DIR/rootfs.ext2}"
-BOOTFS_SRC_DIR="$BASE/guest-src/grub097_src/out"
+BOOTFS_SRC="${BOOTFS_SRC:-$IMAGE_DIR/restoreinitramfs.gz}"
 BOOTFS_BUILDER="$BASE/build-bootfs.py"
 PATCHES_DIR="${PATCHES_DIR:-$BASE/patches}"
 MARKER="${MARKER:-$STATE_DIR/.patches-applied}"
@@ -76,17 +76,17 @@ SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
 say() { printf '\n== %s\n' "$*"; }
 
 [ -f "$ROOTFS" ] || { echo "apply-rootfs-patches: missing base rootfs: $ROOTFS" >&2; exit 1; }
-[ -d "$BOOTFS_SRC_DIR" ] || { echo "apply-rootfs-patches: missing GRUB artifact dir: $BOOTFS_SRC_DIR (built by the image's grub-build stage — rebuild the image)" >&2; exit 1; }
+[ -f "$BOOTFS_SRC" ] || { echo "apply-rootfs-patches: missing firmware restore initramfs: $BOOTFS_SRC" >&2; exit 1; }
 [ -f "$BOOTFS_BUILDER" ] || { echo "apply-rootfs-patches: missing bootfs builder: $BOOTFS_BUILDER" >&2; exit 1; }
 command -v qemu-img >/dev/null 2>&1 || { echo "apply-rootfs-patches: qemu-img is required" >&2; exit 1; }
 [ -d "$PATCHES_DIR" ] || { echo "apply-rootfs-patches: $PATCHES_DIR missing — put the ordered patches there" >&2; exit 1; }
 
 # --- signature of the current base rootfs + bootfs inputs + patch set ---------
 # The synthetic base disk bakes both the rootfs and the boot area (built from
-# guest-src/grub097_src/out by build-bootfs.py), so a change to either means the base must
-# be rebuilt (and the overlay re-patched).
+# the firmware's GRUB binaries by build-bootfs.py), so a change to either means
+# the base must be rebuilt (and the overlay re-patched).
 rootfs_sig="$(sha256sum "$ROOTFS" | awk '{print $1}')"
-bootfs_sig="$( cd "$BASE" && { find guest-src/grub097_src/out -type f -print | LC_ALL=C sort | xargs sha256sum; sha256sum build-bootfs.py; } | sha256sum | awk '{print $1}')"
+bootfs_sig="$( cd "$BASE" && { sha256sum "$BOOTFS_SRC"; sha256sum build-bootfs.py; sha256sum bootfs/*; } | sha256sum | awk '{print $1}')"
 patch_sig="$( cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}')"
 
 stored_rootfs=""; stored_bootfs=""; stored_patches=""

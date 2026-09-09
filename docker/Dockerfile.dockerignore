@@ -5,9 +5,6 @@ __pycache__/
 archive/
 rootfs/
 image/
-guest-src/*/build/
-guest-src/*/dl/
-guest-src/*/out/
 analysis-*/
 *.log
 *.tgz

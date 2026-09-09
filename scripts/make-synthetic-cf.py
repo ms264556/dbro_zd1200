@@ -11,7 +11,7 @@ Layout mirrors the physical ZD1200 CompactFlash (see write-boarddata.py):
 The whole boot area — MBR (stage1 at the stage1_5 load address) + the embedded
 stage1_5 (self-load count baked in) + the /boot filesystem (stage2 / menu.lst /
 default) — is built in-process by `build-bootfs.py` from the source-built GRUB
-artifacts built by guest-src/grub097_src/build.sh, with the patched kernel placed on
+artifacts the firmware ships in its restore initramfs, with the patched kernel placed on
 /boot as /bzImage.
 make-synthetic-cf.py writes those bytes at sector 0, then lays down hda2/hda3
 (rootfs) and hda4 (/writable) from `image/`.  No per-build repatching.
@@ -45,7 +45,7 @@ if rootfs.stat().st_size > C2 * SECTOR:
 
 
 def build_bootfs() -> bytes:
-    """Build the boot area (MBR + stage1_5 + hda1 fs) from guest-src/grub097_src/out/."""
+    """Build the boot area (MBR + stage1_5 + hda1 fs) from the firmware's restore initramfs."""
     spec = importlib.util.spec_from_file_location("zd_build_bootfs", base / "build-bootfs.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -92,10 +92,10 @@ def seed_writable_config(ext2_path):
 with disk.open("wb") as handle:
     handle.truncate(DISK_SIZE)
 
-# ---- boot area (MBR + embedded stage1_5 + /boot) from guest-src/grub097_src/out/ -----
+# ---- boot area (MBR + embedded stage1_5 + /boot) from the firmware's restore initramfs -----
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
-    # Build the boot area (MBR + embedded stage1_5 + hda1 ext2) from guest-src/grub097_src/out/.
+    # Build the boot area (MBR + embedded stage1_5 + hda1 ext2) from the firmware's restore initramfs.
     kb = build_bootfs()
 
     # kernel onto /boot: the boot area is MBR+gap+hda1 fs, so debugfs the hda1

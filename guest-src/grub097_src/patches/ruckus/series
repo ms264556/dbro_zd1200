@@ -1,5 +1,0 @@
-# Ruckus ZD1200 patches applied on top of the Arch AUR series.
-# grub-partition: read the partition table from the ZD "pt sector" (3982101).
-# grub-recovery:  boot-retry / recovery state machine (retry flags in hd0,1/hd0,2).
-grub-partition.patch
-grub-recovery.patch

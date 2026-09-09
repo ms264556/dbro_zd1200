@@ -40,10 +40,5 @@ __pycache__/
 .reasonix/
 reasonix.toml
 
-# guest-src/ build products (rebuilt by each project's build script)
-guest-src/*/dl/
-guest-src/*/build/
-guest-src/*/out/
-
 # scripts/boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
 .boot-test/

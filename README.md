@@ -6,10 +6,9 @@ rootfs inside the container, and the guest attaches to your LAN through a
 **macvtap on the host's physical NIC**, so it behaves like the real box: it gets
 its own DHCP lease, answers mDNS, and serves the web UI and SSH.
 
-No firmware, vendor binaries or compiled GRUB binaries are committed. The
-vendor-derived artifacts are built into `image/` locally from your firmware
-archive, and the GRUB bootloader is compiled from source **inside the container
-image build** (its `grub-build` stage), so the host needs no compiler.
+No firmware or vendor binaries are committed. Everything is derived locally from
+your firmware archive into `image/` (gitignored) — including the GRUB binaries
+that build the boot area — so the host needs nothing but Docker.
 
 ---
 
@@ -31,8 +30,7 @@ image build** (its `grub-build` stage), so the host needs no compiler.
   several minutes to boot instead of ~1–2.
 - Host tools for the prepare step: `tar`, `gzip`, `python3`, `md5sum`,
   `sha256sum` (coreutils) and `bash`.
-- **No compiler or autotools.** GRUB is compiled inside the image build; the
-  host only needs Docker.
+- **No compiler.** Nothing is built from source; the host only needs Docker.
 
 ### Firmware
 
@@ -59,11 +57,11 @@ Pass the file to the build script, or set `ZD_ARCHIVE`. To pin the payload
 integrity, set `EXPECTED_ARCHIVE_SHA256`; the 10.5.1.0.282 payload is
 `64dfbf4d67cc65cafa0e258e426c664c7387b1219209ec893b9b1e41ab202cb8`.
 
-The GRUB bootloader is *not* taken from the firmware and is *not* committed as a
-binary: the container image build compiles it from the upstream GRUB 0.97 tarball
-plus the AUR, local and Ruckus patches (provenance and patch list in
-`guest-src/grub097_src/README.md`). It no-ops when nothing changed, so only the first build
-and GRUB source changes pay for it.
+The GRUB bootloader is taken from the firmware: its factory-restore initramfs
+ships `stage1`/`stage2`/`e2fs_stage1_5` (already built for the ZD1200's partition
+layout), and `scripts/build-bootfs.py` writes them into the boot area together
+with the `/boot` config from `scripts/bootfs/`. Nothing is compiled and nothing
+is committed.
 
 ### The `image/` directory
 
@@ -197,7 +195,7 @@ container's state volume is never touched.
   the disk on every start. The macvtap, the QEMU NIC and the DHCP sniffer all use
   the value read back, so a MAC changed in the appliance's web UI is honoured on
   the next start.
-- The `/boot` bootloader filesystem is built from `guest-src/grub097_src/out/` by
+- The `/boot` bootloader filesystem is built from the firmware's GRUB binaries by
   `scripts/build-bootfs.py` and written at sector 0 of the synthetic CF.
 - QEMU boots the guest with a macvtap (`mvt0`) on the host's physical NIC.
 - Re-runs are cheap: the coordinator records a signature (`rootfs`/`bootfs`/
@@ -230,8 +228,8 @@ usual knobs:
   i8042 reset, so a reboot from the web UI, CLI or `/sbin/reboot` completes and
   the container stays `Up`. Do not add `-no-reboot`.
 - **No in-guest firmware upgrades.** QEMU boots an external kernel, so a web-UI
-  upgrade would leave a mixed version. Update the archive/`guest-src/` and
-  rebuild instead.
+  upgrade would leave a mixed version. Update the firmware archive and rebuild
+  instead.
 - **No NAT fallback.** The container shares the host's network namespace and the
   guest is a macvtap on the host NIC, so APs reach it directly on the LAN. A
   user-mode NAT setup would hide the appliance from the APs, so there is none —
@@ -257,14 +255,10 @@ docker/              Dockerfile, compose files, .env.example, Dockerfile.dockeri
 scripts/             host prepare step, container entrypoint, guest-image prep, console
                      helper, and boot-test.sh (boot the prepared disk under QEMU)
 patches/             ordered rootfs patches applied before each boot
-guest-src/           source projects compiled in the image build and placed into the
-                     guest disk image — currently grub097_src/ (GRUB 0.97, boot area)
 image/               vendor-derived artifacts built from your firmware (gitignored)
 ```
 
 ## License
 
-MIT — see `LICENSE`. The GRUB bootloader built by `guest-src/grub097_src/` is
-**GPLv2-or-later**; see `guest-src/grub097_src/COPYING` and
-`guest-src/grub097_src/README.md` for the license and the corresponding-source
-offer.
+MIT — see `LICENSE`. The firmware (including the GRUB binaries this repo reuses)
+is Ruckus/CommScope's, and is never committed or redistributed here.

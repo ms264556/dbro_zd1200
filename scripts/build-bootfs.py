@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Build the ZD1200 boot area from the GRUB artifacts built by guest-src/grub097_src/.
+"""Build the ZD1200 boot area from the GRUB binaries the firmware ships.
 
 `make-synthetic-cf.py` calls `build_bootfs()` and writes the returned bytes at
 sector 0 of the synthetic CF, so the boot area is derived on the fly — there is no
-bootfs image file in the repo.  It is built from the GPL-source GRUB binaries that
-`guest-src/grub097_src/build.sh` compiles from upstream GRUB 0.97 + patches, so no vendor
-binaries are redistributed.  The layout it produces is the one
-`make-synthetic-cf.py` expects:
+bootfs image file in the repo.  GRUB's `stage1`/`stage2`/`e2fs_stage1_5` are taken
+straight out of the firmware's factory-restore initramfs
+(`image/restoreinitramfs.gz`, `lib/grub/i386-pc/`), which already carries the
+ZD1200 pt sector; the `/boot` config files come from `scripts/bootfs/`.  The layout
+it produces is the one `make-synthetic-cf.py` expects:
 
     sector 0            MBR  = GRUB stage1 (patched) + partition-table area + 0x55AA
     sectors 1..61       the *installed* e2fs_stage1_5, raw (outside any fs)
     sectors 62..84567   hda1 ext2 filesystem (C1 = 84506 sectors, /boot)
 
-`guest-src/grub097_src/out/lib/grub/i386-pc/` holds the build output (plus the
-`/boot` config files from `guest-src/grub097_src/config/`): GRUB's uninstalled `stage1` /
-`stage1_5` and `stage2`.  Three things have to be done to make it bootable:
+Three things have to be done to make it bootable:
 
 1. **stage1 -> MBR.**  Patch stage1's on-disk fields exactly like GRUB's
    `install` does for a stage1_5 (stage1/stage1.h offsets): load address
@@ -48,7 +47,14 @@ import sys
 import tempfile
 
 BASE = Path(__file__).resolve().parent
-SRC = BASE / "guest-src" / "grub097_src" / "out" / "lib" / "grub" / "i386-pc"
+INITRAMFS = BASE / "image" / "restoreinitramfs.gz"
+CONFIG_DIR = BASE / "bootfs"
+
+# Where the firmware's restore initramfs keeps GRUB, and what we take from it.
+GRUB_INITRAMFS_DIR = "lib/grub/i386-pc"
+CPIO_HEADER = 110
+GRUB_FILES = ("stage1", "stage2", "e2fs_stage1_5")
+CONFIG_FILES = ("menu.lst", "default")
 
 SECTOR = 512
 H1, C1 = 62, 84506          # hda1 /boot: first sector, sector count (make-synthetic-cf.py)
@@ -76,21 +82,17 @@ STAGE2_VER_STR_OFFS = 0x12
 DEVICE_HD0_P0 = 0xFF00FFFF
 
 # Ruckus's grub-partition.patch makes GRUB read the partition table from a fixed
-# "ZD pt sector" instead of the MBR (disk_io.c: next_partition()).  The GPL
-# source hard-codes the platform-0 value, which lies past the end of the
-# ZD1200's 3,931,200-sector CF, so GRUB would fall back to the (empty) MBR
-# partition table and fail to mount hda1 with "Error 17".  The ZD1200
-# (CONFIG_V54_ZD_PLATFORM=1) and write-boarddata.py both use the platform-1
-# value, so patch the compiled-in immediate in the two binaries that parse the
-# partition table.
-ZD_PART_SECTOR_BUILT = 3982101      # platform 0 — what the GPL source builds
+# "ZD pt sector" instead of the MBR (disk_io.c: next_partition()).  The firmware's
+# binaries already carry the ZD1200 value; the platform-0 value only shows up in a
+# from-source build, which patch_zd_part_sector() rewrites.
+ZD_PART_SECTOR_BUILT = 3982101      # platform 0 (from-source builds)
 ZD_PART_SECTOR_ZD1200 = 3927001     # platform 1 — ZD1200 / write-boarddata.py
 
-# GRUB's stage2 finds its config file by path; the source-built stage2 has
+# GRUB's stage2 finds its config file by path; the firmware's stage2 has
 # "/boot/grub/menu.lst" compiled in, and the installed stage1_5 is pointed at
 # /lib/grub/i386-pc/stage2.  Populate both trees so either resolves.
 GRUB_DIRS = ("/lib/grub/i386-pc", "/boot/grub")
-FILES = ("stage1", "stage2", "e2fs_stage1_5", "menu.lst", "default")
+FILES = GRUB_FILES + CONFIG_FILES
 
 # The ZD1200 boot geometry (BOOTFS.md): current = root B, backup = root A, and
 # the guest enumerates the CF as hda (IDE).  The profile ships the ZD3000-era
@@ -117,12 +119,41 @@ def require_tools() -> None:
             fail(f"{tool} not found — e2fsprogs is required")
 
 
+def extract_grub() -> dict:
+    """Pull stage1/stage2/e2fs_stage1_5 out of the firmware's restore initramfs.
+
+    It is an SVR4 (no-CRC) cpio archive under gzip; walk the entries and keep the
+    three we need.
+    """
+    check(INITRAMFS.is_file(),
+          f"missing {INITRAMFS} — run scripts/prepare-vendor-image.sh")
+    wanted = {f"{GRUB_INITRAMFS_DIR}/{n}": n for n in GRUB_FILES}
+    found = {}
+    with gzip.open(INITRAMFS, "rb") as fh:
+        while len(found) < len(GRUB_FILES):
+            hdr = fh.read(CPIO_HEADER)
+            if len(hdr) < CPIO_HEADER or hdr[:6] != b"070701":
+                break
+            fields = [int(hdr[6 + i * 8:6 + (i + 1) * 8], 16) for i in range(13)]
+            namesize, filesize = fields[11], fields[6]
+            name = fh.read(namesize).rstrip(b"\x00").decode()
+            fh.read((-(CPIO_HEADER + namesize)) % 4)
+            data = fh.read(filesize)
+            fh.read((-filesize) % 4)
+            if name == "TRAILER!!!":
+                break
+            if name in wanted:
+                found[wanted[name]] = data
+    for name in GRUB_FILES:
+        check(name in found, f"{INITRAMFS}: {GRUB_INITRAMFS_DIR}/{name} not found")
+    return found
+
+
 def read_sources() -> dict:
-    check(SRC.is_dir(), f"missing {SRC}")
-    out = {}
-    for name in FILES:
-        path = SRC / name
-        check(path.is_file(), f"missing source artifact: {path}")
+    out = extract_grub()
+    for name in CONFIG_FILES:
+        path = CONFIG_DIR / name
+        check(path.is_file(), f"missing config file: {path}")
         out[name] = path.read_bytes()
     return out
 
