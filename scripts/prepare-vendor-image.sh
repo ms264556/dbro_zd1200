@@ -52,7 +52,7 @@ source_dir="$(dirname "$metadata")"
 require_file() {
     [ -f "$source_dir/$1" ] || fail "vendor archive lacks $1"
 }
-for required in bzImage restoreinitramfs.gz rootfs.i386.ext2.director1200.img metadata aidfs/file_list.txt file_list.txt ap-models; do
+for required in bzImage restoreinitramfs.gz restoreinitramfs.ver menu.lst rootfs.i386.ext2.director1200.img metadata aidfs/file_list.txt file_list.txt ap-models; do
     require_file "$required"
 done
 [ -d "$source_dir/firmwares" ] || fail "vendor archive lacks firmwares/"
@@ -75,6 +75,11 @@ output_dir="$work_dir/image"
 mkdir -p "$output_dir"
 cp -f "$source_dir/bzImage" "$output_dir/bzImage"
 cp -f "$source_dir/restoreinitramfs.gz" "$output_dir/restoreinitramfs.gz"
+# The boot menu is the vendor's own template (root=/dev/sda*), used verbatim.
+cp -f "$source_dir/menu.lst" "$output_dir/menu.lst"
+# Bootloader version the vendor upgrade compares against /boot/restoreinitramfs.ver
+# before it rewrites the boot menu (ac_upg.sh:_upg_boot).
+cp -f "$source_dir/restoreinitramfs.ver" "$output_dir/restoreinitramfs.ver"
 # The vendor archive stores the rootfs gzip-compressed.  The dockerized run
 # seeds the synthetic CF partitions from image/rootfs.ext2, and the controller
 # needs a RAW ext2 filesystem (superblock

@@ -1,58 +1,32 @@
 #!/usr/bin/env python3
-"""Patch the ZD1200 2.6.32 kernel for QEMU lab use and rebuild the bzImage.
+"""Patch the ZD1200 2.6.32 kernel for QEMU and rebuild the bzImage.
 
-Why this exists
----------------
-The repo boots the ZoneDirector 1200 under QEMU with a gdb stub patch that
-fixes hardware-specific kernel paths (watchdog, board-data queries,
-halt/restart).  That flow relies on KVM hardware breakpoints (`hbreak`),
-which QEMU's TCG backend does not support.  The patches are plain static
-byte writes at fixed kernel virtual addresses, so the same edits can be
-applied directly to the kernel image before boot.
+The stock kernel drives the watchdog, board-data queries and halt/restart
+through ZD1200 hardware that QEMU does not emulate, so those paths have to be
+patched out before boot.
 
-How patches are located (multi-release support)
------------------------------------------------
-The old version of this script patched fixed virtual addresses, which only
-worked for the single 10.5.1.0.282 build it was written against.  The same
-five functions exist in every ZD1200 release (10.1.2.0.318 through
-10.5.1.0.282) but at different addresses: the kernel is relinked for each
-release, so machine_restart() lives at 0xc1015d90 in 10.1.x/10.2.x/10.3.x
-and at 0xc1015db0 in 10.5.x, and the other four drift too.
+Patches are located by byte signature, not by address: the kernel is relinked
+for every release, so the same function moves.  Each patch carries the entry
+sequence of the function it targets, with `??` masking bytes that vary between
+releases (embedded absolute addresses and relative displacements).  A patch
+must match the kernel ELF exactly once; zero matches (the release lacks the
+function) or more than one (ambiguous) is a hard error.
 
-Instead of addresses, each patch now carries a byte signature of the
-function it targets (its entry sequence plus a few following instructions).
-The instruction stream is identical across releases; only embedded absolute
-addresses (string/global references) and relative displacements change, so
-those bytes are masked with `??` wildcards.  A patch is applied when its
-signature matches the decompressed kernel ELF exactly once; zero matches
-means the release genuinely lacks that function (or it changed beyond
-recognition) and more than one is ambiguous - both are hard errors.
+Board data (serial, MACs) is not patched here: it lives in the board-data
+records on the CompactFlash image (write-boarddata.py), which the kernel's
+v54bsp driver reads at boot.
 
-Board data (serial number, MACs) is NOT patched here: it lives in the
-board-data records on the CompactFlash image, written by write-boarddata.py.
-The kernel's v54bsp driver reads those records at boot (magic "SKCR"),
-populates its rbd struct, and the original board-data query code then
-serves the CF-provided values, so no kernel patch for serial/MACs is needed.
+Vendor bzImage layout:
 
-Vendor bzImage layout (important!)
-----------------------------------
     [setup + video table + head code][gzip member = the kernel ELF][loader code]
-The gzip member does NOT span the rest of the file: a second stage boot
-loader (which decompresses the kernel and relocates it) is linked *after*
-the member, and the head code jumps to a baked offset of that loader.  Any
-splice that replaces the whole tail destroys the loader and the guest
-sleds through zeros.  This script therefore:
 
-  1. locates the gzip member whose payload is the 32-bit kernel ELF
-     (member end is found via the gzip trailer: crc32 + ISIZE of the ELF),
-  2. applies the five signature-based byte patches to the ELF,
-  3. recompresses it (gzip -9, mtime=0) and splices it back in place of
-     exactly that member region, padding with zeros to keep the member
-     length identical, so the loader tail stays at its baked offset.
-
-The boot decompressor reads the payload with a fixed input size; the new
-stream must not exceed the original member length (zero padding after the
-trailer is ignored by inflate).
+The gzip member does not span the rest of the file: a second-stage loader is
+linked after it and the head code jumps to a baked offset inside that loader,
+so the tail must not move.  This script locates the member that decompresses
+to the 32-bit kernel ELF, patches the ELF, recompresses it (gzip -9, mtime=0)
+and splices it back into exactly that region, zero-padding to the original
+member length.  The boot decompressor reads a fixed input size, so the new
+stream must not exceed the original member length (inflate ignores the padding).
 """
 
 import argparse
@@ -63,22 +37,11 @@ import sys
 import zlib
 from pathlib import Path
 
-# Signature-based patches, derived from the original gdb patch flow.  Each entry is:
-#   (function, signature_hex, patch_offset, patch_hex, description,
-#    rel32_exit=0)
-#   - signature_hex: byte pattern found in the ORIGINAL (unpatched) kernel
-#     ELF; "??" masks a byte (typically an absolute address or a relative
-#     displacement that changes between releases).
-#   - patch_offset:  byte offset inside the matched signature at which the
-#     patch bytes are written (0 = at the start of the match).
-#   - patch_hex:     replacement bytes.  When the optional rel32_exit is
-#     non-zero this is just the 0xe9 opcode: the 4 displacement bytes are
-#     computed at runtime from rel32_exit, which is the offset inside the
-#     matched signature of the "e9 ?? ?? ?? ??" exit jump of the code being
-#     skipped; the patched jump re-targets that same exit.  This keeps the
-#     redirect correct even if the skipped block's size changes in a future
-#     release.
-#   - rel32_exit:    see above (0 = patch bytes are taken verbatim).
+# Each patch is (name, signature_hex, patch_offset, patch_hex, description,
+# rel32_exit).  signature_hex is matched against the unpatched kernel ELF with
+# "??" as a wildcard; patch_hex is written at patch_offset inside the match.
+# When rel32_exit is non-zero, patch_hex is only the 0xe9 opcode and the
+# displacement is computed from the exit jump at match+rel32_exit.
 PATCHES = [
     ("kernel_halt",
      "b80200000083ec04e8????????e8????????c70424????????e8????????83c404e9????????",
@@ -161,17 +124,6 @@ def off_to_va(data: bytes, off: int) -> int:
 def find_signature(payload: bytes, sig_hex: str):
     """Return all file offsets in `payload` matching the hex signature, where
     "??" masks a byte."""
-    pattern = bytearray()
-    i = 0
-    while i < len(sig_hex):
-        pair = sig_hex[i:i + 2]
-        if pair == "??":
-            pattern.append(0x00)  # placeholder; replaced below
-            i += 2
-        else:
-            pattern.append(int(pair, 16))
-            i += 2
-    # Convert to a regex: exact bytes escaped, "??" -> dot.
     rx = re.compile(b"".join(
         (b"." if sig_hex[j:j + 2] == "??"
          else re.escape(bytes([int(sig_hex[j:j + 2], 16)])))
@@ -198,9 +150,7 @@ def main():
     print(f"kernel ELF gzip member: file bytes {member_start}..{member_end} "
           f"(stream {member_len} bytes, decompressed {len(payload)} bytes)")
 
-    # Optional cross-check against a pristine vmlinux.  With signature-based
-    # patching this is informational only: a mismatch simply means the input
-    # is a different release than the reference ELF.
+    # Optional cross-check against a pristine vmlinux; informational only.
     vmlinux = Path(args.vmlinux)
     if vmlinux.exists():
         want = vmlinux.read_bytes()
@@ -210,7 +160,6 @@ def main():
             print(f"note: payload differs from {args.vmlinux} "
                   "(different release? continuing with signatures)")
 
-    # Apply the signature-based byte patches.
     elf = bytearray(payload)
     missing = []
     for name, sig_hex, patch_off, patch, desc, rel32_exit in PATCHES:
@@ -226,10 +175,10 @@ def main():
         fo = sig_start + patch_off
         va = off_to_va(bytes(elf), fo)
         if rel32_exit:
-            # Redirect to the exit of the skipped block.  The exit jump lives
-            # inside the matched signature at sig_start+rel32_exit; re-target
-            # the patch site at the same destination.  All of this lies in one
-            # PT_LOAD segment, so file-offset deltas equal VA deltas.
+            # Re-target the jump to the exit of the block being skipped, whose
+            # displacement is read from the exit jump inside the signature.
+            # Both sites are in one PT_LOAD segment, so file offsets and VAs
+            # share a delta.
             exit_rel32 = struct.unpack_from("<i", bytes(elf),
                                             sig_start + rel32_exit + 1)[0]
             target = (sig_start + rel32_exit + 5 + exit_rel32) & 0xffffffff
@@ -254,7 +203,7 @@ def main():
                          f"larger than the original member ({member_len})")
     new_member = new_member + b"\x00" * (member_len - len(new_member))
 
-    # Splice: replace ONLY the member region; keep the loader tail untouched.
+    # Replace only the member region; the loader tail must stay in place.
     out = bz[:member_start] + new_member + bz[member_end:]
     Path(args.out).write_bytes(out)
     print(f"wrote {args.out} ({len(out)} bytes, member region kept at {member_len} bytes)")

@@ -60,8 +60,8 @@ integrity, set `EXPECTED_ARCHIVE_SHA256`; the 10.5.1.0.282 payload is
 The GRUB bootloader is taken from the firmware: its factory-restore initramfs
 ships `stage1`/`stage2`/`e2fs_stage1_5` (already built for the ZD1200's partition
 layout), and `scripts/build-bootfs.py` writes them into the boot area together
-with the `/boot` config from `scripts/bootfs/`. Nothing is compiled and nothing
-is committed.
+with `menu.lst` from the firmware archive and a generated saved-default file.
+Nothing is compiled and nothing is committed.
 
 ### The `image/` directory
 
@@ -164,7 +164,7 @@ Milestones, in order, detected on the guest serial console:
 |---|---|---|
 | `grub` | `Booting 'Normal bootup from system image` | GRUB's stage2 ran and read menu.lst |
 | `kernel` | `[Linux-bzImage,` | GRUB mounted the ext2 partition and loaded `/bzImage` |
-| `init` | `/dev/hda4 on /writable type ext2` | the guest kernel reached user-space init (default) |
+| `init` | `/dev/sda4 on /writable type ext2` | the guest kernel reached user-space init (default) |
 | `controller` | `Initializing ZoneDirector...` | the controller init script is running |
 | `ready` | `System go into READY status.` | the appliance is up (the healthcheck's marker) |
 

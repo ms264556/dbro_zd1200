@@ -77,6 +77,8 @@ say() { printf '\n== %s\n' "$*"; }
 
 [ -f "$ROOTFS" ] || { echo "apply-rootfs-patches: missing base rootfs: $ROOTFS" >&2; exit 1; }
 [ -f "$BOOTFS_SRC" ] || { echo "apply-rootfs-patches: missing firmware restore initramfs: $BOOTFS_SRC" >&2; exit 1; }
+[ -f "$IMAGE_DIR/restoreinitramfs.ver" ] || { echo "apply-rootfs-patches: missing $IMAGE_DIR/restoreinitramfs.ver — run scripts/prepare-vendor-image.sh" >&2; exit 1; }
+[ -f "$IMAGE_DIR/menu.lst" ] || { echo "apply-rootfs-patches: missing $IMAGE_DIR/menu.lst — run scripts/prepare-vendor-image.sh" >&2; exit 1; }
 [ -f "$BOOTFS_BUILDER" ] || { echo "apply-rootfs-patches: missing bootfs builder: $BOOTFS_BUILDER" >&2; exit 1; }
 command -v qemu-img >/dev/null 2>&1 || { echo "apply-rootfs-patches: qemu-img is required" >&2; exit 1; }
 [ -d "$PATCHES_DIR" ] || { echo "apply-rootfs-patches: $PATCHES_DIR missing — put the ordered patches there" >&2; exit 1; }
@@ -86,7 +88,7 @@ command -v qemu-img >/dev/null 2>&1 || { echo "apply-rootfs-patches: qemu-img is
 # the firmware's GRUB binaries by build-bootfs.py), so a change to either means
 # the base must be rebuilt (and the overlay re-patched).
 rootfs_sig="$(sha256sum "$ROOTFS" | awk '{print $1}')"
-bootfs_sig="$( cd "$BASE" && { sha256sum "$BOOTFS_SRC"; sha256sum build-bootfs.py; sha256sum bootfs/*; } | sha256sum | awk '{print $1}')"
+bootfs_sig="$( cd "$BASE" && { sha256sum "$BOOTFS_SRC"; sha256sum "$IMAGE_DIR/restoreinitramfs.ver"; sha256sum "$IMAGE_DIR/menu.lst"; sha256sum build-bootfs.py; } | sha256sum | awk '{print $1}')"
 patch_sig="$( cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}')"
 
 stored_rootfs=""; stored_bootfs=""; stored_patches=""

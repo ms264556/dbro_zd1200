@@ -53,7 +53,7 @@ levels=(grub kernel init controller ready)
 patterns=(
   "Booting 'Normal bootup from system image"
   "[Linux-bzImage,"
-  "/dev/hda4 on /writable type ext2"
+  "/dev/sda4 on /writable type ext2"
   "Initializing ZoneDirector..."
   "System go into READY status."
 )
@@ -188,7 +188,9 @@ setsid qemu-system-i386 \
   -cpu pentium3 \
   -m "${MEMORY_MB:-2048}" \
   -smp 1 \
-  -drive "file=$overlay,format=qcow2,if=ide,index=0,media=disk,cache=writeback" \
+  -device ich9-ahci,id=ahci \
+  -drive "file=$overlay,format=qcow2,if=none,id=disk0,cache=writeback" \
+  -device "ide-hd,drive=disk0,bus=ahci.0" \
   -snapshot \
   "${net_args[@]}" \
   -device ipmi-bmc-sim,id=bmc0 \

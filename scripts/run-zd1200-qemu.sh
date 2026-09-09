@@ -9,7 +9,7 @@ work_dir="$(cd "$(dirname "$0")" && pwd)"
 kernel="${KERNEL:-$work_dir/image/bzImage}"
 rootfs="$work_dir/image/rootfs.ext2"
 # No initramfs by default: like the physical appliance, the kernel mounts
-# root=/dev/hda2 directly and runs the stock /sbin/init.  Set INITRD to a
+# root=/dev/sda2 directly and runs the stock /sbin/init.  Set INITRD to a
 # path (or "none", which is ignored) to boot an initramfs instead.
 initrd="${INITRD-}"
 if [ "$initrd" = "none" ]; then initrd=""; fi
@@ -226,6 +226,11 @@ else
     console_args=( -nographic )
 fi
 
+# The CF is on QEMU's AHCI controller, not the PIIX IDE controller, so the guest
+# enumerates it as /dev/sda (the vendor kernel's libata/ahci/sd drivers are built
+# in).  This matters: the firmware upgrade's own menu.lst template uses
+# root=/dev/sda2|sda3, so the disk naming has to match for a menu rewrite to
+# stay bootable.
 exec qemu-system-i386 \
     -name zd1200-10.5.1-lab \
     "${accel_args[@]}" \
@@ -234,7 +239,9 @@ exec qemu-system-i386 \
     -m "${MEMORY_MB:-2048}" \
     -smp 1 \
     "${initrd_args[@]}" \
-    -drive "file=$disk_image,format=$disk_format,if=ide,index=0,media=disk,cache=${DISK_CACHE:-writeback}" \
+    -device ich9-ahci,id=ahci \
+    -drive "file=$disk_image,format=$disk_format,if=none,id=disk0,cache=${DISK_CACHE:-writeback}" \
+    -device "ide-hd,drive=disk0,bus=ahci.0" \
     "${snapshot_args[@]}" \
     "${net_args[@]}" \
     "${nic_args[@]}" \

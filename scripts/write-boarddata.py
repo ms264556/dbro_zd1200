@@ -8,7 +8,7 @@ board data (serial number, MACs, model, ...) from a CompactFlash card, not
 from NOR/MTD flash: `ar531x_get_board_config()` in nar5520_bsp.c issues
 raw 512-byte sector reads via `nar5520_cf_read_write()` on the block device
 named by `boarddata_dev_path` (resolved from the kernel `root=` argument,
-e.g. /dev/hda in the QEMU lab).
+e.g. /dev/sda in the QEMU lab).
 
 The two records live at fixed positions on that disk:
 
@@ -58,7 +58,7 @@ SECTOR = 512
 RKS_BD_OFFSET = 0x8000             # DATA_PART_SIZE(0x1000) * 8
 
 # The v54bsp driver's CF reader (nar5520_cf_read_write) first tries to open
-# the board-data device by path (e.g. /dev/hda).  When that fails at boot (no
+# the board-data device by path (e.g. /dev/sda).  When that fails at boot (no
 # device node yet in a no-initramfs boot), it falls back to the raw block
 # device and requires a valid partition-table magic -- 0x55AA in bytes
 # 510..511 of ZD_PART_SECTOR -- before it will read the board-data records.
@@ -73,10 +73,10 @@ ZD_PART_SECTOR_P0 = 3982101         # CONFIG_V54_ZD_PLATFORM == 0
 # boot indicator is neither, so a raw 0x01 (as on the real CF) would make the
 # kernel report "unknown partition table".
 CF_PARTITIONS = [
-    (0x00, 62, 84506),        # boot flag, start sector, count (hda1 /boot)
-    (0x80, 84568, 415152),    # hda2 (root A)
-    (0x00, 499720, 415152),   # hda3 (root B)
-    (0x00, 914872, 3006008),  # hda4 (data / writable)
+    (0x00, 62, 84506),        # boot flag, start sector, count (sda1 /boot)
+    (0x80, 84568, 415152),    # sda2 (root A)
+    (0x00, 499720, 415152),   # sda3 (root B)
+    (0x00, 914872, 3006008),  # sda4 (data / writable)
 ]
 
 RKS_STRUCT_SIZE = 0xD0             # sizeof(struct rks_boarddata), rev 4
