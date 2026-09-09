@@ -32,6 +32,7 @@ Buffer.from(ap.replaceAll(':',''),'hex').copy(binary,apMacOffset);
 binary.fill(5,sampleOffset,sampleOffset+10); binary.fill(1,stateOffset,stateOffset+10);
 snrs.forEach((snr,i)=>binary[snrOffset+5+i]=snr+1);
 binary.fill(2,air5Offset,air5Offset+5); // 1% airtime must remain visible.
+binary.fill(31,meshOffset,meshOffset+5); // 30 dB AP uplink SNR.
 const xml = body => `<?xml version="1.0" encoding="utf-8"?><!DOCTYPE ajax-response><ajax-response><response><apstamgr-stat>${body}</apstamgr-stat></response></ajax-response>`;
 let fresh = false, indexRequests = 0;
 const server=http.createServer((req,res)=>{
@@ -83,6 +84,7 @@ const server=http.createServer((req,res)=>{
    assert.ok(indexRequests>=2, 'changing snapshot index must be fetched again');
    assert.match(await frame.locator('.expanded').innerText(),/This AP · RuckusAP/);
    assert.match(await frame.locator('.expanded').innerText(),/historical snapshots unavailable/);
+   assert.ok((await frame.locator('.history-row > .lanes > .cell').evaluateAll(nodes=>nodes.map(node=>node.title))).some(title=>/uplink SNR 30 dB/.test(title)));
    const report=page.frames().find(f=>f.url().includes('zd1200-network-monitor.html'));
    const geometry=await report.evaluate(()=>{
     const rect=s=>{const r=document.querySelector(s).getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom}};
