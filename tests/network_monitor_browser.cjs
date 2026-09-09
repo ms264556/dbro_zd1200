@@ -105,7 +105,14 @@ const server=http.createServer((req,res)=>{
    const apply=await frame.locator('#settings-apply').boundingBox();const frameBox=await page.locator('#zd1200-ping-monitor-frame').boundingBox();
    assert.ok(apply.y+apply.height<=frameBox.y+frameBox.height);
    await frame.getByRole('button',{name:'Display and monitoring settings',exact:true}).click();
-   await frame.getByRole('button',{name:'Devices',exact:true}).click();
+   await frame.locator('#view-client').click();
+   assert.equal(await frame.locator('#view-client').innerText(),'Devices · All');
+   await frame.locator('#view-client').click();
+   assert.equal(await frame.locator('#view-client').innerText(),'Devices · 5 GHz');
+   await frame.locator('#view-client').click();
+   assert.equal(await frame.locator('#view-client').innerText(),'Devices · 2.4 GHz');
+   await frame.locator('#view-client').click();
+   assert.equal(await frame.locator('#view-client').innerText(),'Devices · All');
    await frame.locator('.row-label').first().click();
    await frame.getByText('Attached AP · RuckusAP',{exact:true}).waitFor();
    assert.match(await frame.locator('.row-label').innerText(),/192.168.222.102/);
