@@ -14,8 +14,8 @@
 
 #define DB "/writable/zd1200-ping-monitor/pings.db"
 #define DAILY_DIR "/writable/zd1200-ping-monitor/daily"
-#define HEADER_SIZE 576U
-#define FORMAT_VERSION 1U
+#define HEADER_SIZE 640U
+#define FORMAT_VERSION 2U
 #define CODE_COUNT 254U
 #define TIMEOUT_MS 2000U
 
@@ -147,27 +147,78 @@ static int load_targets(sqlite3 *db,uint32_t start,uint32_t end,struct target_li
     sqlite3_finalize(query);return rc==SQLITE_DONE?SQLITE_OK:rc;
 }
 
+static int load_ap_targets(sqlite3 *db,uint32_t start,uint32_t end,struct target_list *targets) {
+    sqlite3_stmt *query=NULL;int append,rc=sqlite3_prepare_v2(db,
+        "SELECT DISTINCT t.id,t.ap_id FROM target t JOIN ping_result p ON p.target_id=t.id "
+        "WHERE t.kind='ap' AND p.observed_at>=? AND p.observed_at<? ORDER BY t.ap_id COLLATE NOCASE",
+        -1,&query,NULL);
+    if(rc==SQLITE_OK)sqlite3_bind_int64(query,1,start);
+    if(rc==SQLITE_OK)sqlite3_bind_int64(query,2,end);
+    if(rc==SQLITE_OK)while((rc=sqlite3_step(query))==SQLITE_ROW) {
+        append=target_append(targets,sqlite3_column_int64(query,0),(const char *)sqlite3_column_text(query,1));
+        if(append<0)continue;
+        if(!append){rc=SQLITE_NOMEM;break;}
+    }
+    sqlite3_finalize(query);return rc==SQLITE_DONE?SQLITE_OK:rc;
+}
+
+static unsigned encode_snr(int value) {
+    if(value<0)value=0;if(value>100)value=100;return (unsigned)value+1U;
+}
+
+static unsigned encode_percent_tenths(int value) {
+    if(value<0)value=0;if(value>1000)value=1000;return (unsigned)((value+5)/10)+1U;
+}
+
+static int is_five_ghz(int radio_id,const char *radio_type) {
+    if(radio_type&&(strstr(radio_type,"11a")||strstr(radio_type,"ac")||strstr(radio_type,"5G")))return 1;
+    return radio_id==1;
+}
+
 static int export_day(uint32_t start) {
-    sqlite3 *db=NULL;sqlite3_stmt *query=NULL;struct round_list rounds={0};struct target_list targets={0};
-    uint16_t codebook[CODE_COUNT];unsigned char *row=NULL,zero[64]={0};uint32_t end=start+86400U;
-    uint32_t timestamps_offset=HEADER_SIZE,macs_offset,samples_offset;size_t i;int rc=sqlite3_open_v2(DB,&db,SQLITE_OPEN_READONLY,NULL);
+    sqlite3 *db=NULL;sqlite3_stmt *query=NULL;struct round_list rounds={0};struct target_list targets={0},aps={0};
+    uint16_t codebook[CODE_COUNT];unsigned char *row=NULL,zero[128]={0};uint32_t end=start+86400U;
+    uint32_t timestamps_offset=HEADER_SIZE,macs_offset,samples_offset,snr_offset,state_offset;
+    uint32_t ap_macs_offset,air24_offset,air5_offset,mesh_snr_offset,file_end;uint64_t layout;
+    size_t i;int rc=sqlite3_open_v2(DB,&db,SQLITE_OPEN_READONLY,NULL);
     if(rc==SQLITE_OK)rc=load_rounds(db,start,end,&rounds);
     if(rc==SQLITE_OK)rc=load_targets(db,start,end,&targets);
-    if(rounds.count>UINT32_MAX||targets.count>UINT32_MAX)rc=SQLITE_TOOBIG;
-    macs_offset=timestamps_offset+(uint32_t)rounds.count*4U;
-    samples_offset=(macs_offset+(uint32_t)targets.count*6U+3U)&~3U;make_codebook(codebook);
+    if(rc==SQLITE_OK)rc=load_ap_targets(db,start,end,&aps);
+    /* Every on-disk offset is 32-bit. Calculate in 64-bit first so a damaged
+     * or unexpectedly huge database cannot wrap one section over another. */
+    layout=HEADER_SIZE+(uint64_t)rounds.count*4U;
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;macs_offset=(uint32_t)layout;
+    layout=(layout+(uint64_t)targets.count*6U+3U)&~UINT64_C(3);
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;samples_offset=(uint32_t)layout;make_codebook(codebook);
+    layout+=(uint64_t)targets.count*rounds.count;
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;snr_offset=(uint32_t)layout;
+    layout+=(uint64_t)targets.count*rounds.count;
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;state_offset=(uint32_t)layout;
+    layout=(layout+(uint64_t)targets.count*rounds.count+3U)&~UINT64_C(3);
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;ap_macs_offset=(uint32_t)layout;
+    layout=(layout+(uint64_t)aps.count*6U+3U)&~UINT64_C(3);
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;air24_offset=(uint32_t)layout;
+    layout+=(uint64_t)aps.count*rounds.count;
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;air5_offset=(uint32_t)layout;
+    layout+=(uint64_t)aps.count*rounds.count;
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;mesh_snr_offset=(uint32_t)layout;
+    layout+=(uint64_t)aps.count*rounds.count;
+    if(layout>UINT32_MAX)rc=SQLITE_TOOBIG;file_end=(uint32_t)layout;
     if(rc==SQLITE_OK&&(!write_bytes("ZDPMDAY\0",8)||!write_u16(FORMAT_VERSION)||!write_u16(HEADER_SIZE)
-        ||!write_u32(1)||!write_u32(start)||!write_u32(end)||!write_u32((uint32_t)rounds.count)
+        ||!write_u32(31)||!write_u32(start)||!write_u32(end)||!write_u32((uint32_t)rounds.count)
         ||!write_u32((uint32_t)targets.count)||!write_u16(TIMEOUT_MS)||!write_u16(CODE_COUNT)
         ||!write_u32(timestamps_offset)||!write_u32(macs_offset)||!write_u32(samples_offset)
-        ||!write_u32(rounds.count?rounds.items[rounds.count-1]:start)||!write_bytes(zero,12)))rc=SQLITE_IOERR_WRITE;
+        ||!write_u32(rounds.count?rounds.items[rounds.count-1]:start)||!write_u32(snr_offset)
+        ||!write_u32(state_offset)||!write_u32((uint32_t)aps.count)||!write_u32(ap_macs_offset)
+        ||!write_u32(air24_offset)||!write_u32(air5_offset)||!write_u32(mesh_snr_offset)
+        ||!write_u32(file_end)||!write_bytes(zero,48)))rc=SQLITE_IOERR_WRITE;
     for(i=0;rc==SQLITE_OK&&i<CODE_COUNT;i++)if(!write_u16(codebook[i]))rc=SQLITE_IOERR_WRITE;
-    if(rc==SQLITE_OK&&!write_bytes(zero,4))rc=SQLITE_IOERR_WRITE;
     for(i=0;rc==SQLITE_OK&&i<rounds.count;i++)if(!write_u32(rounds.items[i]))rc=SQLITE_IOERR_WRITE;
     for(i=0;rc==SQLITE_OK&&i<targets.count;i++)if(!write_bytes(targets.items[i].mac,6))rc=SQLITE_IOERR_WRITE;
     for(i=macs_offset+(uint32_t)targets.count*6U;rc==SQLITE_OK&&i<samples_offset;i++)if(putchar(0)==EOF)rc=SQLITE_IOERR_WRITE;
-    row=calloc(rounds.count?rounds.count:1,1);if(!row&&rc==SQLITE_OK)rc=SQLITE_NOMEM;
-    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"SELECT observed_at,rtt_ms,responded,state FROM ping_result WHERE target_id=? AND observed_at>=? AND observed_at<? ORDER BY observed_at,id",-1,&query,NULL);
+    row=calloc(rounds.count?rounds.count:1,1);
+    if(!row&&rc==SQLITE_OK)rc=SQLITE_NOMEM;
+    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"SELECT observed_at,rtt_ms,responded,state,snr_db FROM ping_result WHERE target_id=? AND observed_at>=? AND observed_at<? ORDER BY observed_at,id",-1,&query,NULL);
     for(i=0;rc==SQLITE_OK&&i<targets.count;i++) {
         memset(row,0,rounds.count);sqlite3_bind_int64(query,1,targets.items[i].id);sqlite3_bind_int64(query,2,start);sqlite3_bind_int64(query,3,end);
         while((rc=sqlite3_step(query))==SQLITE_ROW) {
@@ -180,14 +231,59 @@ static int export_day(uint32_t start) {
         if(rc==SQLITE_OK&&!write_bytes(row,rounds.count))rc=SQLITE_IOERR_WRITE;
         sqlite3_reset(query);sqlite3_clear_bindings(query);
     }
-    sqlite3_finalize(query);free(row);free(rounds.items);free(targets.items);sqlite3_close(db);
+    /* SNR is stored as 0=no observation, 1..101=0..100 dB. */
+    for(i=0;rc==SQLITE_OK&&i<targets.count;i++) {
+        memset(row,0,rounds.count);sqlite3_bind_int64(query,1,targets.items[i].id);sqlite3_bind_int64(query,2,start);sqlite3_bind_int64(query,3,end);
+        while((rc=sqlite3_step(query))==SQLITE_ROW) { size_t position;
+            if(find_round(&rounds,(uint32_t)sqlite3_column_int64(query,0),&position)&&sqlite3_column_type(query,4)!=SQLITE_NULL)
+                row[position]=(unsigned char)encode_snr(sqlite3_column_int(query,4));
+        }
+        if(rc==SQLITE_DONE)rc=SQLITE_OK;if(rc==SQLITE_OK&&!write_bytes(row,rounds.count))rc=SQLITE_IOERR_WRITE;
+        sqlite3_reset(query);sqlite3_clear_bindings(query);
+    }
+    /* State is 0=collector/no target data, 1=attempted, 2=not associated. */
+    for(i=0;rc==SQLITE_OK&&i<targets.count;i++) {
+        memset(row,0,rounds.count);sqlite3_bind_int64(query,1,targets.items[i].id);sqlite3_bind_int64(query,2,start);sqlite3_bind_int64(query,3,end);
+        while((rc=sqlite3_step(query))==SQLITE_ROW) { size_t position;const char *state=(const char *)sqlite3_column_text(query,3);
+            if(find_round(&rounds,(uint32_t)sqlite3_column_int64(query,0),&position))row[position]=(unsigned char)(state&&!strcmp(state,"not_associated")?2:state&&strcmp(state,"unknown")?1:0);
+        }
+        if(rc==SQLITE_DONE)rc=SQLITE_OK;if(rc==SQLITE_OK&&!write_bytes(row,rounds.count))rc=SQLITE_IOERR_WRITE;
+        sqlite3_reset(query);sqlite3_clear_bindings(query);
+    }
+    for(i=state_offset+(uint32_t)(targets.count*rounds.count);rc==SQLITE_OK&&i<ap_macs_offset;i++)if(putchar(0)==EOF)rc=SQLITE_IOERR_WRITE;
+    for(i=0;rc==SQLITE_OK&&i<aps.count;i++)if(!write_bytes(aps.items[i].mac,6))rc=SQLITE_IOERR_WRITE;
+    for(i=ap_macs_offset+(uint32_t)aps.count*6U;rc==SQLITE_OK&&i<air24_offset;i++)if(putchar(0)==EOF)rc=SQLITE_IOERR_WRITE;
+    sqlite3_finalize(query);query=NULL;
+    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"SELECT observed_at,radio_id,radio_type,airtime_total_tenths FROM ap_radio_sample WHERE ap_mac=? AND observed_at>=? AND observed_at<? ORDER BY observed_at",-1,&query,NULL);
+    /* Write one target-major matrix for each band. */
+    for(int band=0;rc==SQLITE_OK&&band<2;band++)for(i=0;rc==SQLITE_OK&&i<aps.count;i++) {
+        memset(row,0,rounds.count);sqlite3_bind_text(query,1,aps.items[i].mac_text,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(query,2,start);sqlite3_bind_int64(query,3,end);
+        while((rc=sqlite3_step(query))==SQLITE_ROW) { size_t position;const char *type=(const char *)sqlite3_column_text(query,2);
+            if(is_five_ghz(sqlite3_column_int(query,1),type)==band&&find_round(&rounds,(uint32_t)sqlite3_column_int64(query,0),&position)&&sqlite3_column_type(query,3)!=SQLITE_NULL)
+                row[position]=(unsigned char)encode_percent_tenths(sqlite3_column_int(query,3));
+        }
+        if(rc==SQLITE_DONE)rc=SQLITE_OK;if(rc==SQLITE_OK&&!write_bytes(row,rounds.count))rc=SQLITE_IOERR_WRITE;
+        sqlite3_reset(query);sqlite3_clear_bindings(query);
+    }
+    sqlite3_finalize(query);query=NULL;
+    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"SELECT observed_at,snr_db FROM mesh_link_sample WHERE ap_mac=? AND direction='uplink' AND observed_at>=? AND observed_at<? ORDER BY observed_at",-1,&query,NULL);
+    for(i=0;rc==SQLITE_OK&&i<aps.count;i++) {
+        memset(row,0,rounds.count);sqlite3_bind_text(query,1,aps.items[i].mac_text,-1,SQLITE_TRANSIENT);sqlite3_bind_int64(query,2,start);sqlite3_bind_int64(query,3,end);
+        while((rc=sqlite3_step(query))==SQLITE_ROW) { size_t position;
+            if(find_round(&rounds,(uint32_t)sqlite3_column_int64(query,0),&position)&&sqlite3_column_type(query,1)!=SQLITE_NULL)
+                row[position]=(unsigned char)encode_snr(sqlite3_column_int(query,1));
+        }
+        if(rc==SQLITE_DONE)rc=SQLITE_OK;if(rc==SQLITE_OK&&!write_bytes(row,rounds.count))rc=SQLITE_IOERR_WRITE;
+        sqlite3_reset(query);sqlite3_clear_bindings(query);
+    }
+    sqlite3_finalize(query);free(row);free(rounds.items);free(targets.items);free(aps.items);sqlite3_close(db);
     if(rc!=SQLITE_OK)fprintf(stderr,"daily export failed (rc=%d): %s\n",rc,sqlite3_errstr(rc));return rc==SQLITE_OK?0:1;
 }
 
 static int targets_json(void) {
     sqlite3 *db=NULL;sqlite3_stmt *query=NULL;int first=1,rc=sqlite3_open_v2(DB,&db,SQLITE_OPEN_READONLY,NULL);
     if(rc!=SQLITE_OK){puts("{\"status\":\"waiting\",\"targets\":[]}");sqlite3_close(db);return 0;}
-    rc=sqlite3_prepare_v2(db,"SELECT kind,ip,client_mac,ap_id,name,enabled FROM target ORDER BY lower(CASE WHEN kind='client' THEN client_mac ELSE ap_id END)",-1,&query,NULL);
+    rc=sqlite3_prepare_v2(db,"SELECT kind,ip,client_mac,ap_id,name,enabled,current_ap,current_ssid,current_radio FROM target ORDER BY lower(CASE WHEN kind='client' THEN client_mac ELSE ap_id END)",-1,&query,NULL);
     if(rc!=SQLITE_OK){sqlite3_close(db);return 1;}
     printf("{\"status\":\"ok\",\"format_version\":%u,\"generated_at\":%lld,\"targets\":[",FORMAT_VERSION,(long long)time(NULL));
     while((rc=sqlite3_step(query))==SQLITE_ROW) {
@@ -196,7 +292,8 @@ static int targets_json(void) {
         if(!parse_mac(identity,mac,canonical))continue;
         if(!first)putchar(',');first=0;fputs("{\"mac\":",stdout);json(canonical);fputs(",\"kind\":",stdout);json(kind);
         fputs(",\"ip\":",stdout);json((const char *)sqlite3_column_text(query,1));fputs(",\"ap_id\":",stdout);json((const char *)sqlite3_column_text(query,3));
-        fputs(",\"name\":",stdout);json((const char *)sqlite3_column_text(query,4));printf(",\"enabled\":%s}",sqlite3_column_int(query,5)?"true":"false");
+        fputs(",\"name\":",stdout);json((const char *)sqlite3_column_text(query,4));printf(",\"enabled\":%s",sqlite3_column_int(query,5)?"true":"false");
+        fputs(",\"upstream_ap\":",stdout);json((const char *)sqlite3_column_text(query,6));fputs(",\"ssid\":",stdout);json((const char *)sqlite3_column_text(query,7));fputs(",\"radio\":",stdout);json((const char *)sqlite3_column_text(query,8));putchar('}');
     }
     puts("]}");sqlite3_finalize(query);sqlite3_close(db);return rc==SQLITE_DONE?0:1;
 }
@@ -204,7 +301,7 @@ static int targets_json(void) {
 static int daily_manifest(void) {
     DIR *directory=opendir(DAILY_DIR);struct dirent *entry;int first=1;char path[512];struct stat info;
     struct period_file periods[64];size_t count=0,i,j;
-    printf("{\"status\":\"ok\",\"format_version\":1,\"generated_at\":%lld,\"periods\":[",(long long)time(NULL));
+    printf("{\"status\":\"ok\",\"format_version\":%u,\"generated_at\":%lld,\"periods\":[",FORMAT_VERSION,(long long)time(NULL));
     if(directory)while(count<64&&(entry=readdir(directory))!=NULL) {
         unsigned long start;char tail;const char *name=entry->d_name;
         if(sscanf(name,"ping-%lu.bin.gz%c",&start,&tail)!=1||start>UINT32_MAX)continue;

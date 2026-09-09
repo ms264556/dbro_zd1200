@@ -1,7 +1,7 @@
 #!/bin/sh
 # Bridge ZD's persistent setpref journal into a small root-owned settings file.
 # The browser remains the only writer of the native preference. This helper
-# accepts only the five validated attributes from that exact preference node.
+# accepts only the three validated attributes from that exact preference node.
 set -eu
 
 bb=/usr/local/sbin/busybox
@@ -16,26 +16,19 @@ attribute() {
 }
 
 emit_if_valid() {
-    ping_enabled=$1
-    ping_interval=$2
-    snapshot_enabled=$3
-    snapshot_interval=$4
-    updated=$5
+    monitoring_enabled=$1
+    monitoring_interval=$2
+    updated=$3
     valid=1
-    case "$ping_enabled" in 0|1) ;; *) valid=0;; esac
-    case "$snapshot_enabled" in 0|1) ;; *) valid=0;; esac
+    case "$monitoring_enabled" in 0|1) ;; *) valid=0;; esac
     case "$updated" in ''|*[!0-9]*) valid=0;; esac
-    for interval in "$ping_interval" "$snapshot_interval"; do
-        case "$interval" in ''|*[!0-9]*) valid=0;; esac
-        [ "$valid" = 1 ] && [ "$interval" -ge 30 ] \
-            && [ "$interval" -le 3600 ] || valid=0
-    done
+    case "$monitoring_interval" in ''|*[!0-9]*) valid=0;; esac
+    [ "$valid" = 1 ] && [ "$monitoring_interval" -ge 30 ] \
+        && [ "$monitoring_interval" -le 3600 ] || valid=0
     [ "$valid" = 1 ] || return 1
     printf 'HAS_NATIVE_SETTINGS=1\n'
-    printf 'PING_ENABLED=%s\n' "$ping_enabled"
-    printf 'PING_INTERVAL_SECONDS=%s\n' "$ping_interval"
-    printf 'SNAPSHOT_ENABLED=%s\n' "$snapshot_enabled"
-    printf 'SNAPSHOT_INTERVAL_SECONDS=%s\n' "$snapshot_interval"
+    printf 'MONITORING_ENABLED=%s\n' "$monitoring_enabled"
+    printf 'MONITOR_INTERVAL_SECONDS=%s\n' "$monitoring_interval"
     printf 'PREFERENCE_UPDATED_AT=%s\n' "$updated"
 }
 
@@ -48,12 +41,28 @@ if [ -r "$journal" ]; then
     element=$(printf '%s\n' "$record" \
         | "$bb" sed -n 's/.*\(<zd1200-ping-monitor [^>]*\/>\).*/\1/p')
     if [ -n "$element" ]; then
+        enabled=$(attribute "$element" enabled)
+        if [ -z "$enabled" ]; then
+            # One-time compatibility for a controller that saved the earlier
+            # two-toggle prototype. The next Apply writes the compact form.
+            old_ping=$(attribute "$element" ping-enabled)
+            old_snapshot=$(attribute "$element" snapshot-enabled)
+            case "$old_ping:$old_snapshot" in
+                0:0) enabled=0;;
+                0:1|1:0|1:1) enabled=1;;
+            esac
+        fi
         candidate=$(emit_if_valid \
-            "$(attribute "$element" ping-enabled)" \
-            "$(attribute "$element" ping-interval)" \
-            "$(attribute "$element" snapshot-enabled)" \
-            "$(attribute "$element" snapshot-interval)" \
+            "$enabled" \
+            "$(attribute "$element" interval)" \
             "$(attribute "$element" updated-at)" || true)
+        if [ -z "$candidate" ]; then
+            # Accept the last prototype's ping interval once; the browser
+            # writes the single-interval form on its next Apply.
+            candidate=$(emit_if_valid "$enabled" \
+                "$(attribute "$element" ping-interval)" \
+                "$(attribute "$element" updated-at)" || true)
+        fi
         if [ -n "$candidate" ]; then
             temporary=$cache.tmp.$$
             printf '%s\n' "$candidate" > "$temporary"
@@ -64,10 +73,7 @@ if [ -r "$journal" ]; then
 fi
 
 [ -r "$cache" ] || exit 0
-ping_enabled=$(sed -n 's/^PING_ENABLED=//p' "$cache" | head -n 1)
-ping_interval=$(sed -n 's/^PING_INTERVAL_SECONDS=//p' "$cache" | head -n 1)
-snapshot_enabled=$(sed -n 's/^SNAPSHOT_ENABLED=//p' "$cache" | head -n 1)
-snapshot_interval=$(sed -n 's/^SNAPSHOT_INTERVAL_SECONDS=//p' "$cache" | head -n 1)
+monitoring_enabled=$(sed -n 's/^MONITORING_ENABLED=//p' "$cache" | head -n 1)
+monitoring_interval=$(sed -n 's/^MONITOR_INTERVAL_SECONDS=//p' "$cache" | head -n 1)
 updated=$(sed -n 's/^PREFERENCE_UPDATED_AT=//p' "$cache" | head -n 1)
-emit_if_valid "$ping_enabled" "$ping_interval" \
-    "$snapshot_enabled" "$snapshot_interval" "$updated"
+emit_if_valid "$monitoring_enabled" "$monitoring_interval" "$updated"

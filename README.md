@@ -247,7 +247,7 @@ docker compose up -d --build
 | `ZD_ENABLE_ROOT_CLI=1` | Enables a local root shell through the Ruckus CLI hidden command `!v54!` and through the series of commands `enable; debug; script; exec .root.sh`. It does not add a network listener. |
 | `ZD_ROOT_SSH_PUBLIC_KEY` | Enables public-key-only root SSH on TCP 2222 for 10.5.1.0.282. RSA and ECDSA keys are accepted; Ed25519 is not. |
 | `ZD_SUPPORT_ENTITLEMENT_END` | Creates a finite support-entitlement record ending on the supplied `YYYY-MM-DD` date. |
-| `ZD_PING_INTERVAL_SECONDS` and `ZD_SNAPSHOT_INTERVAL_SECONDS` | Set the initial 30–3600 second intervals. Both collectors remain disabled until enabled from the Ping Monitor page. |
+| `ZD_PING_INTERVAL_SECONDS` | Legacy-compatible initial 30–3600 second collection interval. The page stores one shared interval for pings and snapshots; monitoring remains disabled until it is enabled there. |
 | `ZD_VIRTUAL_BUILD_ID` | Optional override for the seven-character revision shown after the ZoneDirector version. Git checkouts detect this automatically; Portainer deployments may leave it unset (they show `virtual 0000000`). |
 
 The regular admin console appends `virtual <revision>` to the stock
@@ -257,15 +257,16 @@ build that running virtual controller. If the project was copied without its
 `.git` metadata, set `ZD_VIRTUAL_BUILD_ID` to the source commit and
 `ZD_GIT_DIR=/dev/null` before running Compose.
 
-### Ping Monitor
+### Network Monitor
 
-After the setup wizard and first restart, **Ping Monitor** appears as the last
-item under **Troubleshooting**. It records individual ICMP observations and
-retains raw ZoneDirector AP, client, and mesh snapshots for comparison.
+After the setup wizard and first restart, **Network Monitor** appears as the
+last item under **Troubleshooting**. It records individual ICMP observations
+and retains raw ZoneDirector AP, client, and mesh snapshots for comparison.
 
-Both ping polling and configuration snapshots are disabled on a fresh
-controller. Enable either collector and choose its interval on the Ping
-Monitor page. The settings are stored through ZoneDirector's normal
+Ping polling and configuration snapshots are disabled together on a fresh
+controller. Enable monitoring and choose the shared 30–3600 second collection
+interval on the Network Monitor page. The settings are stored through
+ZoneDirector's normal
 authenticated preference mechanism. Snapshot collection uses the controller's
 root-local vendor statistics socket, so no additional ZoneDirector role, user,
 or password is required.
@@ -277,34 +278,48 @@ in one SQLite transaction, and sends raw ICMP requests in bounded groups of 512.
 This avoids both a process per ping and a one-second serial delay per failed
 target. Ten one-second timeout windows cover 5,000 targets, and the scheduler
 accounts for collection time so a 30-second setting remains a start-to-start
-interval. Retained AP, client, and mesh snapshots are gzip-compressed; the one
-current client XML used by the ping round remains uncompressed and is replaced
-atomically.
+interval. The collector obtains all current clients in one stock bulk request
+and all AP LEVEL=2 telemetry in a second bulk request. Each ping observation
+retains the client's contemporaneous SNR, received signal level, and noise
+floor. Per-radio AP samples retain channel, client count, noise/SNR, and the
+four airtime values (total, busy, RX, and TX) in the vendor's original tenths
+of a percentage point. Mesh uplink/downlink SNR is retained separately. These
+two live XML responses are replaced atomically and are not historical data;
+only their compact extracted fields are retained in SQLite.
+
+Event ingestion has been investigated, but it is deliberately not scheduled or
+shown in this prototype. AP, client, and mesh configuration snapshots are
+independent of the compact live telemetry. Actual PSK material is removed
+before a snapshot reaches retained storage; device, serial, and DPSK identifiers
+are preserved for diagnosis.
 
 Snapshot availability is published separately as a small manifest and one
 timestamp-only index per UTC day. The page loads the current and previous day
 initially and fetches older daily indexes only when a longer chart range is
-selected. The page displays the retained capture count and date span, while
-individual available captures remain visible as ticks on the chart. The
-larger AP, client, and mesh XML bodies remain compressed on disk and are fetched
-only after two snapshots have been selected for comparison.
+selected. Active-day XML captures are individually compressed. After UTC
+rollover they are reframed and compressed together into one immutable daily
+gzip bundle, allowing repeated XML structure to compress across captures. The
+larger bodies are fetched only when selected history moments need configuration
+evidence.
 
 Browser-facing ping history is published as gzip-compressed UTC daily chunks.
 Completed days are immutable and cacheable; only the current day is regenerated
 after a ping round. Each observation uses one byte and daily files share one
 timestamp axis across their MAC-sorted targets. The server publishes identity
-metadata but no derived ping counts, percentiles, latest-result summary, or
-timeline rollups. A browser worker derives every displayed ping metric directly
-from the daily raw chunks and discards each decoded day after scanning it.
+metadata but no derived ping counts, averages, maxima, loss rates, or timeline
+rollups. A browser worker derives every displayed metric directly from the
+daily raw chunks and discards each decoded day after scanning it. Version 2
+daily files add raw client SNR, association state, per-band AP airtime, and
+mesh-uplink SNR alongside ping outcomes.
 When upgrading an existing installation, retained full-precision SQLite history
 is backfilled into immutable daily chunks once, so switching formats does not
 hide earlier observations.
-The target table supports instant name/MAC and network filters, sorting in both
-directions on every column, and 10/25/50-row pagination. Wide tables scroll
-horizontally while keeping the device-name column visible. Configuration diffs
-default to changed XML branches, can instead show changed lines or all XML,
-and keep the before/after panes vertically synchronized when displayed side by
-side.
+The rows-by-time history supports instant name/MAC and network filtering,
+sortable summaries, 10/25/50-row pagination, AP topology context, and selectable
+A/B moments. It displays mean and maximum latency, loss, SNR, association state,
+and selected-band AP airtime from raw observations. The page can package the
+selected ping evidence and scoped complete XML snapshots into a downloadable
+manual-analysis prompt; nothing is sent off the controller by that action.
 
 Potential follow-up work for deployments that retain millions of observations
 includes an operator-configurable database size/retention limit. The storage

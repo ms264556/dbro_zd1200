@@ -36,7 +36,7 @@ if [ "$mode" = backfill ]; then
             # A header-only day contains no observations and need not be
             # advertised or downloaded by the browser.
             size=$(wc -c < "$raw" | tr -d ' ')
-            if [ "$size" -gt 576 ]; then
+            if [ "$size" -gt 640 ]; then
                 "$bb" gzip -6 -c "$raw" > "$compressed"
                 "$bb" gzip -t "$compressed"
                 chmod 644 "$compressed"

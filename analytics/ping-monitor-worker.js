@@ -1,7 +1,6 @@
 'use strict';
 
 const MAGIC=[0x5a,0x44,0x50,0x4d,0x44,0x41,0x59,0x00];
-const FORMAT_VERSION=1;
 
 function macAt(bytes,offset){
  const hex=[];for(let i=0;i<6;i++)hex.push(bytes[offset+i].toString(16).padStart(2,'0'));
@@ -10,22 +9,32 @@ function macAt(bytes,offset){
 
 function parseDay(buffer){
  const bytes=new Uint8Array(buffer),view=new DataView(buffer);
- if(bytes.length<576||!MAGIC.every((value,index)=>bytes[index]===value))throw new Error('Invalid Ping Monitor daily file magic.');
+ if(bytes.length<576||!MAGIC.every((value,index)=>bytes[index]===value))throw new Error('Invalid Performance History daily file magic.');
  const version=view.getUint16(8,true),headerSize=view.getUint16(10,true),flags=view.getUint32(12,true);
  const start=view.getUint32(16,true),end=view.getUint32(20,true),roundCount=view.getUint32(24,true),targetCount=view.getUint32(28,true);
  const timeout=view.getUint16(32,true),codeCount=view.getUint16(34,true),timestampsOffset=view.getUint32(36,true);
  const macsOffset=view.getUint32(40,true),samplesOffset=view.getUint32(44,true),generation=view.getUint32(48,true);
- if(version!==FORMAT_VERSION||headerSize!==576||flags!==1||codeCount!==254||end-start!==86400)throw new Error('Unsupported Ping Monitor daily format.');
- if(timestampsOffset!==headerSize||macsOffset!==timestampsOffset+roundCount*4||samplesOffset<macsOffset+targetCount*6||samplesOffset>bytes.length)throw new Error('Invalid Ping Monitor daily offsets.');
- if(targetCount&&roundCount>(bytes.length-samplesOffset)/targetCount)throw new Error('Truncated Ping Monitor daily samples.');
- if(samplesOffset+targetCount*roundCount!==bytes.length)throw new Error('Unexpected Ping Monitor daily file length.');
- const codebook=new Uint16Array(codeCount);let previous=0;
- for(let i=0;i<codeCount;i++){let value=view.getUint16(64+i*2,true);if(value<=previous||value>timeout)throw new Error('Invalid Ping Monitor latency codebook.');codebook[i]=value;previous=value}
+ if(![1,2].includes(version)||headerSize!==(version===1?576:640)||codeCount!==254||end-start!==86400)throw new Error('Unsupported Performance History daily format.');
+ if(version===1&&flags!==1)throw new Error('Unsupported Performance History daily flags.');
+ const matrixSize=targetCount*roundCount;
+ let snrOffset=0,stateOffset=0,apCount=0,apMacsOffset=0,air24Offset=0,air5Offset=0,meshSnrOffset=0,fileEnd=samplesOffset+matrixSize;
+ if(version===2){
+  if(flags!==31)throw new Error('Unsupported Performance History telemetry flags.');
+  snrOffset=view.getUint32(52,true);stateOffset=view.getUint32(56,true);apCount=view.getUint32(60,true);
+  apMacsOffset=view.getUint32(64,true);air24Offset=view.getUint32(68,true);air5Offset=view.getUint32(72,true);
+  meshSnrOffset=view.getUint32(76,true);fileEnd=view.getUint32(80,true);
+  if(snrOffset!==samplesOffset+matrixSize||stateOffset!==snrOffset+matrixSize||apMacsOffset<stateOffset+matrixSize||air24Offset<apMacsOffset+apCount*6||air5Offset!==air24Offset+apCount*roundCount||meshSnrOffset!==air5Offset+apCount*roundCount||fileEnd!==meshSnrOffset+apCount*roundCount)throw new Error('Invalid Performance History telemetry offsets.');
+ }
+ if(timestampsOffset!==headerSize||macsOffset!==timestampsOffset+roundCount*4||samplesOffset<macsOffset+targetCount*6||fileEnd!==bytes.length)throw new Error('Invalid Performance History daily offsets.');
+ const codebookOffset=version===1?64:132,codebook=new Uint16Array(codeCount);let previous=0;
+ for(let i=0;i<codeCount;i++){let value=view.getUint16(codebookOffset+i*2,true);if(value<=previous||value>timeout)throw new Error('Invalid Performance History latency codebook.');codebook[i]=value;previous=value}
  const timestamps=new Uint32Array(roundCount);previous=0;
- for(let i=0;i<roundCount;i++){let value=view.getUint32(timestampsOffset+i*4,true);if((i&&value<=previous)||value<start||value>=end)throw new Error('Invalid Ping Monitor round timestamps.');timestamps[i]=value;previous=value}
+ for(let i=0;i<roundCount;i++){let value=view.getUint32(timestampsOffset+i*4,true);if((i&&value<=previous)||value<start||value>=end)throw new Error('Invalid Performance History round timestamps.');timestamps[i]=value;previous=value}
  const macs=new Array(targetCount);let previousMac='';
- for(let i=0;i<targetCount;i++){let value=macAt(bytes,macsOffset+i*6);if(previousMac&&value<=previousMac)throw new Error('Invalid Ping Monitor target order.');macs[i]=value;previousMac=value}
- return{bytes,codebook,start,end,generation,roundCount,targetCount,timestamps,macs,samplesOffset};
+ for(let i=0;i<targetCount;i++){let value=macAt(bytes,macsOffset+i*6);if(previousMac&&value<=previousMac)throw new Error('Invalid Performance History target order.');macs[i]=value;previousMac=value}
+ const apMacs=new Array(apCount);previousMac='';
+ for(let i=0;i<apCount;i++){let value=macAt(bytes,apMacsOffset+i*6);if(previousMac&&value<=previousMac)throw new Error('Invalid Performance History AP order.');apMacs[i]=value;previousMac=value}
+ return{version,bytes,codebook,start,end,generation,roundCount,targetCount,timestamps,macs,samplesOffset,snrOffset,stateOffset,apCount,apMacs,air24Offset,air5Offset,meshSnrOffset};
 }
 
 async function fetchDay(file,cacheKey){
@@ -33,82 +42,47 @@ async function fetchDay(file,cacheKey){
  const response=await fetch(`zd1200-ping-monitor-daily/${file.file}${suffix}`,{cache:file.immutable?'force-cache':'no-store'});
  if(!response.ok)throw new Error(`Unable to load ${file.file}: HTTP ${response.status}`);
  const compressed=await response.arrayBuffer();
- if(typeof DecompressionStream==='undefined')throw new Error('This browser cannot decompress Ping Monitor history.');
+ if(typeof DecompressionStream==='undefined')throw new Error('This browser cannot decompress Performance History data.');
  const stream=new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
  return parseDay(await new Response(stream).arrayBuffer());
 }
 
-function percentile(histograms,bucket,width,total,rank){
- if(!total)return null;let wanted=Math.ceil(total*rank),seen=0,offset=bucket*width;
- for(let value=1;value<width;value++){seen+=histograms[offset+value];if(seen>=wanted)return value}
- return null;
-}
-
-async function aggregate(job){
- const targetIndex=new Map(job.targetMacs.map((mac,index)=>[mac,index]));
- const selected=new Set(job.selectedMacs),targetCount=job.targetMacs.length;
- const buckets=Math.ceil((job.rangeEnd-job.rangeStart)/job.bucketSeconds),histogramWidth=job.timeoutMs+1;
- const attempts=new Uint32Array(buckets),replies=new Uint32Array(buckets),contributors=new Uint32Array(buckets);
- const contributorMarks=new Uint32Array(buckets*targetCount),histograms=new Uint32Array(buckets*histogramWidth);
- const summaryAttempts=new Uint32Array(targetCount),summaryReplies=new Uint32Array(targetCount);
- const latestTimestamp=new Uint32Array(targetCount),latestCode=new Uint8Array(targetCount),latestLatency=new Uint16Array(targetCount);
- let next=0,completed=0;
- async function run(){
-  while(next<job.files.length){
-   const file=job.files[next++],day=await fetchDay(file,job.generation);
-   for(let target=0;target<day.targetCount;target++){
-    const mac=day.macs[target],metadataIndex=targetIndex.get(mac),timelineSelected=selected.has(mac),sampleBase=day.samplesOffset+target*day.roundCount;
-    if(metadataIndex===undefined&&!timelineSelected)continue;
-    for(let round=0;round<day.roundCount;round++){
-     const timestamp=day.timestamps[round],code=day.bytes[sampleBase+round];if(code===0)continue;
-     if(metadataIndex!==undefined&&timestamp>=job.summaryStart&&timestamp<job.summaryEnd){
-      summaryAttempts[metadataIndex]++;if(code!==255)summaryReplies[metadataIndex]++;
-      if(timestamp>=latestTimestamp[metadataIndex]){latestTimestamp[metadataIndex]=timestamp;latestCode[metadataIndex]=code;latestLatency[metadataIndex]=code===255?0:day.codebook[code-1]}
-     }
-     if(!timelineSelected||timestamp<job.rangeStart||timestamp>=job.rangeEnd)continue;
-     const bucket=Math.floor((timestamp-job.rangeStart)/job.bucketSeconds);attempts[bucket]++;
-     const mark=bucket*targetCount+(metadataIndex===undefined?0:metadataIndex);
-     if(metadataIndex!==undefined&&!contributorMarks[mark]){contributorMarks[mark]=1;contributors[bucket]++}
-     if(code!==255){const latency=day.codebook[code-1];replies[bucket]++;histograms[bucket*histogramWidth+latency]++}
-    }
-   }
-   completed++;postMessage({type:'progress',id:job.id,completed,total:job.files.length});
-  }
- }
- await Promise.all(Array.from({length:Math.min(3,job.files.length)},run));
- const points=new Array(buckets);
- for(let bucket=0;bucket<buckets;bucket++)points[bucket]={attempts:attempts[bucket],replies:replies[bucket],contributors:contributors[bucket],p50:percentile(histograms,bucket,histogramWidth,replies[bucket],.5),p99:percentile(histograms,bucket,histogramWidth,replies[bucket],.99)};
- return{type:'result',id:job.id,points,summary:{attempts:Array.from(summaryAttempts),replies:Array.from(summaryReplies),latestTimestamp:Array.from(latestTimestamp),latestCode:Array.from(latestCode),latestLatency:Array.from(latestLatency)}};
-}
-
-async function sparklines(job){
- const targetPosition=new Map(job.selectedMacs.map((mac,index)=>[mac,index])),targetCount=job.selectedMacs.length;
- const buckets=24,width=job.timeoutMs+1,attempts=new Uint32Array(targetCount*buckets),failures=new Uint32Array(targetCount*buckets),histograms=new Uint32Array(targetCount*buckets*width);
- let next=0;
- async function run(){
-  while(next<job.files.length){
-   const file=job.files[next++],day=await fetchDay(file,job.generation);
-   for(let target=0;target<day.targetCount;target++){
-    const position=targetPosition.get(day.macs[target]);if(position===undefined)continue;
-    const sampleBase=day.samplesOffset+target*day.roundCount;
-    for(let round=0;round<day.roundCount;round++){
-     const timestamp=day.timestamps[round],code=day.bytes[sampleBase+round];if(!code||timestamp<job.start||timestamp>=job.end)continue;
-     const bucket=Math.floor((timestamp-job.start)/3600),offset=position*buckets+bucket;attempts[offset]++;
-     if(code===255)failures[offset]++;else histograms[offset*width+day.codebook[code-1]]++;
-    }
+async function history(job){
+ const targetIndex=new Map(job.targetMacs.map((mac,index)=>[mac,index])),targetCount=job.targetMacs.length;
+ const buckets=Math.ceil((job.rangeEnd-job.rangeStart)/job.bucketSeconds),cells=targetCount*buckets;
+ const attempts=new Uint32Array(cells),replies=new Uint32Array(cells),latencySum=new Uint32Array(cells),latencyMax=new Uint16Array(cells);
+ const snrSum=new Uint32Array(cells),snrCount=new Uint16Array(cells),snrMin=new Uint8Array(cells);snrMin.fill(255);
+ const associated=new Uint16Array(cells),associatedAt=new Uint32Array(cells),known=new Uint16Array(cells),airtimeSum=new Uint32Array(cells),airtimeCount=new Uint16Array(cells);
+ const meshSnrMin=new Uint8Array(cells);meshSnrMin.fill(255);
+ let completed=0;
+ for(const file of job.files){
+  const day=await fetchDay(file,job.generation);
+  for(let source=0;source<day.targetCount;source++){
+   const target=targetIndex.get(day.macs[source]);if(target===undefined)continue;
+   const base=day.samplesOffset+source*day.roundCount,snrBase=day.snrOffset+source*day.roundCount,stateBase=day.stateOffset+source*day.roundCount;
+   for(let round=0;round<day.roundCount;round++){
+    const timestamp=day.timestamps[round];if(timestamp<job.rangeStart||timestamp>=job.rangeEnd)continue;
+    const bucket=Math.floor((timestamp-job.rangeStart)/job.bucketSeconds),cell=target*buckets+bucket,code=day.bytes[base+round];
+    const state=day.version===1?(code?1:0):day.bytes[stateBase+round];if(state){known[cell]++;if(state===1){associated[cell]++;associatedAt[cell]=timestamp}}
+    if(code){attempts[cell]++;if(code!==255){const latency=day.codebook[code-1];replies[cell]++;latencySum[cell]+=latency;if(latency>latencyMax[cell])latencyMax[cell]=latency}}
+    if(day.version===2){const snrCode=day.bytes[snrBase+round];if(snrCode){const snr=snrCode-1;snrSum[cell]+=snr;snrCount[cell]++;if(snr<snrMin[cell])snrMin[cell]=snr}}
    }
   }
+  if(day.version===2)for(let source=0;source<day.apCount;source++){
+   const target=targetIndex.get(day.apMacs[source]);if(target===undefined)continue;
+   const airBase=(job.band==='g'?day.air24Offset:day.air5Offset)+source*day.roundCount,meshBase=day.meshSnrOffset+source*day.roundCount;
+   for(let round=0;round<day.roundCount;round++){
+    const timestamp=day.timestamps[round];if(timestamp<job.rangeStart||timestamp>=job.rangeEnd)continue;
+    const bucket=Math.floor((timestamp-job.rangeStart)/job.bucketSeconds),cell=target*buckets+bucket,air=day.bytes[airBase+round],mesh=day.bytes[meshBase+round];
+    if(air){airtimeSum[cell]+=air-1;airtimeCount[cell]++}if(mesh&&mesh-1<meshSnrMin[cell])meshSnrMin[cell]=mesh-1;
+   }
+  }
+  completed++;postMessage({type:'progress',id:job.id,completed,total:job.files.length});
  }
- await Promise.all(Array.from({length:Math.min(2,job.files.length)},run));
- const values=job.selectedMacs.map((mac,target)=>({mac,points:Array.from({length:buckets},(_,bucket)=>{
-  const offset=target*buckets+bucket,total=attempts[offset],failure=failures[offset],replies=total-failure;
-  return[total,failure,percentile(histograms,offset,width,replies,.5),percentile(histograms,offset,width,replies,.99)];
- })}));
- return{type:'sparklines',id:job.id,start:job.start,values};
+ return{type:'history',id:job.id,buckets,attempts,replies,latencySum,latencyMax,snrSum,snrCount,snrMin,associated,associatedAt,known,airtimeSum,airtimeCount,meshSnrMin};
 }
 
 self.onmessage=event=>{
- const job=event.data;if(!job)return;
- const work=job.type==='aggregate'?aggregate(job):job.type==='sparklines'?sparklines(job):null;if(!work)return;
- work.then(result=>postMessage(result)).catch(error=>postMessage({type:'error',id:job.id,message:error.message}));
+ const job=event.data;if(!job||job.type!=='history')return;
+ history(job).then(result=>postMessage(result)).catch(error=>postMessage({type:'error',id:job.id,message:error.message}));
 };

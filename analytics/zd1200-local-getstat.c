@@ -22,6 +22,15 @@ static const char *selector_for(const char *kind)
         /* Keep this above the 5,000-target collection goal. getstatd emits
          * one response file, which the monitor deliberately parses once. */
         return "<ajax-request><client LEVEL=\"1\"/><pieceStat start=\"0\" number=\"6000\" pid=\"1\" requestId=\"zd1200.snapshot\"/></ajax-request>";
+    if (strcmp(kind, "client-live") == 0)
+        /* This is the same bulk view used by the stock client list.  Unlike a
+         * per-client request it returns association, SNR and radio context for
+         * every connected client in one getstatd transaction. */
+        return "<ajax-request><client/></ajax-request>";
+    if (strcmp(kind, "ap-detail") == 0)
+        /* LEVEL=2 contains both radios' airtime/noise figures and mesh links
+         * for every AP.  A bulk request avoids 150 request/response cycles. */
+        return "<ajax-request><ap LEVEL=\"2\"/></ajax-request>";
     if (strcmp(kind, "mesh") == 0)
         return "<ajax-request><meshview/></ajax-request>";
     return NULL;
@@ -69,14 +78,33 @@ int main(int argc, char **argv)
 {
     struct sockaddr_un address;
     const char *selector;
+    char event_selector[384];
     char request_path[] = "/tmp/zd1200-getstat-request.XXXXXX";
     char reply[256];
     struct timeval timeout = { 20, 0 };
     ssize_t length;
     int request, sock;
 
-    if (argc != 3 || !(selector = selector_for(argv[1]))) {
-        fprintf(stderr, "usage: %s ap|client|mesh OUTPUT\n", argv[0]);
+    selector = argc >= 2 ? selector_for(argv[1]) : NULL;
+    if (argc == 4 && strcmp(argv[1], "event") == 0) {
+        char *end = NULL;
+        long start = strtol(argv[2], &end, 10);
+        if (!argv[2][0] || (end && *end) || start < 0) selector = NULL;
+        else {
+            snprintf(event_selector, sizeof event_selector,
+                /* Match the exact global-event selector emitted by the stock
+                 * CLI/UI code. Some vendor handlers key their paging context
+                 * by updater/requestId rather than treating it as cosmetic. */
+                "<ajax-request action=\"getstat\" updater=\"allevent\" comp=\"eventd\">"
+                "<xevent sortBy=\"time\" sortDirection=\"-1\"/>"
+                "<pieceStat start=\"%ld\" number=\"300\" pid=\"1\" requestId=\"allevent\"/>"
+                "</ajax-request>", start);
+            selector = event_selector;
+        }
+    }
+    if (!selector || (argc != 3 && !(argc == 4 && strcmp(argv[1], "event") == 0))) {
+        fprintf(stderr, "usage: %s ap|client|client-live|ap-detail|mesh OUTPUT\n"
+                        "       %s event START OUTPUT\n", argv[0], argv[0]);
         return 2;
     }
     if (unlink(RESPONSE_PATH) < 0 && errno != ENOENT) {
@@ -119,7 +147,7 @@ int main(int argc, char **argv)
     }
     reply[length] = '\0';
     if (!strstr(reply, "stat_file=/tmp/getstat_response") ||
-        copy_response(argv[2]) != 0) {
+        copy_response(argv[argc - 1]) != 0) {
         fprintf(stderr, "getstatd response unavailable: %s\n", reply);
         return 1;
     }

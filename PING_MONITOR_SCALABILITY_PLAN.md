@@ -1,16 +1,44 @@
-# Ping Monitor scalability and UX plan
+# Network Monitor scalability and UX plan
 
 ## Objective
 
-Make Ping Monitor comfortable at 5,000 simultaneously monitored targets,
+Make Network Monitor comfortable at 5,000 simultaneously monitored targets,
 including approximately 150 APs and 4,850 clients. A 30-second polling round
-must finish in less than 20 seconds with a two-second response deadline, and a
+must finish in less than 20 seconds with the current one-second response deadline, and a
 30-second network-configuration snapshot interval must remain usable.
 
 The browser must remain responsive while it filters, sorts, paginates, and
-calculates exact aggregate availability, p50, and p99 values from the selected
-targets. The design must work without a separate service outside the virtual
-ZoneDirector.
+calculates loss, mean latency, and maximum latency from raw observations. The
+design must work without a separate service outside the virtual ZoneDirector.
+
+## Current implementation direction (September 2026)
+
+This section supersedes older UX and percentile proposals retained later in
+this document as benchmark and design history.
+
+- The UI is a rows-by-time **Network Monitor** view, with separate AP and
+  device views, 10/25/50-row pagination, instant filtering, and sortable
+  window summaries.
+- Blue history bars show mean latency and a dark cap shows maximum latency;
+  red conveys partial or complete loss. No p50 or p99 is calculated.
+- Version 2 daily chunks remain raw and target-major. In addition to one-byte
+  ping outcomes they carry client SNR, association state, selected-band AP
+  airtime, and mesh-uplink SNR. The browser worker derives all display values.
+- Daily chunks are gzip level 6. Completed UTC days are immutable; initial
+  load normally needs only the current and preceding day.
+- Full AP, client, and mesh snapshots remain complete rather than deltas. A
+  small manifest and daily timestamp indexes provide lazy discovery. Active-day
+  captures are individual gzip files; after rollover their raw XML records are
+  compressed together into one immutable daily gzip bundle so repeated content
+  benefits from a shared compression window.
+- One opt-in switch and one 30–3600 second interval control both pings and all
+  snapshot/telemetry capture, keeping time-series evidence aligned.
+- A/B moment selection packages raw ping evidence and scoped XML into a manual
+  analysis prompt. Live MCS probing, automatic AI requests, stored AI answers,
+  and Eventd display/collection are deferred.
+- Actual PSK material is removed before retained snapshots are compressed.
+  Serial numbers and DPSK identifiers are retained because they identify
+  configuration state without containing the key itself.
 
 ## Decisions already made
 
@@ -24,31 +52,29 @@ ZoneDirector.
   100 ms through the two-second response deadline.
 - Keep APs and clients in the same target table and aggregate them together
   unless the operator filters them.
-- Calculate exact percentile ranks from the retained codes; do not use sampled
-  or approximate aggregation algorithms. The documented logarithmic encoding
-  error above 100 ms is the only intended loss of latency precision.
-- Changing a filter returns the timeline to aggregate mode.
-- The aggregate timeline heading identifies its scope, for example
-  `Performance timeline — 1,842 devices`.
+- Decode retained codes to milliseconds and calculate arithmetic mean and
+  maximum latency directly from the raw selected observations.
+- Changing a filter immediately changes the visible rows and their summaries.
 - Do not publish pre-aggregated timeline rollups. Every individual and filtered
   aggregate timeline, including the unfiltered 30-day view, is derived in the
   browser from the retained one-byte observations.
 - Publish browser history as gzip-compressed daily chunks. Completed UTC days
   are immutable; the current UTC day is regenerated and atomically replaced.
 - Publish no pre-aggregated ping metrics at all in the first implementation.
-  The browser derives table counts, latest-request status, availability, p50,
-  and p99 directly from the daily raw observation chunks. Reconsider this only
+  The browser derives attempts, replies, loss, mean, maximum, association, SNR,
+  and airtime directly from the daily raw observation chunks. Reconsider this only
   after measuring the implemented path on representative devices.
 - Initial page load covers only the rolling 24-hour table and timeline window,
   which normally requires the current and previous UTC-day chunks. Older daily
   chunks are loaded lazily only when the operator selects the 7-day or 30-day
   range. Completed immutable chunks remain eligible for the browser HTTP cache.
 - The table defaults to 25 rows per page, with 10, 25, and 50 row options.
-- Manual multi-selection is not part of the initial work.
+- Manual row selection is not part of summaries. A/B moment selection is
+  supported specifically for exporting comparison evidence.
 - The latest latency column describes the latest request's outcome. It must not
   silently show an older successful response after a newer timeout.
 - The network diff defaults to `Changed branches` mode.
-- A canonical six-byte device MAC address is Ping Monitor's primary key. The
+- A canonical six-byte device MAC address is Network Monitor's primary key. The
   browser format does not expose or depend on a SQLite row ID.
 - Do not use D3, DuckDB-Wasm, Arrow, or Parquet for storage or aggregation.
   Selected D3 modules may be reconsidered later if chart interactions become
@@ -376,7 +402,7 @@ two timestamps for a comparison.
   explicit level 6 and measure it with realistic daily files. If it
   does not, use the smallest maintainable compressor already available in the
   build rather than silently accepting an unknown level.
-- **Workers:** Verify external Web Workers run from the Ping Monitor page in
+- **Workers:** Verify external Web Workers run from the Network Monitor page in
   both its legacy-page shell and the regular admin-console navigation path.
   Check MIME type and any content-security restrictions.
 - **Typed-array transfer:** Verify transferable `ArrayBuffer` behavior and

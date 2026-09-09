@@ -34,7 +34,11 @@
 #define MAX_BUCKET_SAMPLES 800
 
 struct target { char *id, *name, *ip; struct target *next; };
-struct client { char *mac, *ip, *name; };
+struct client {
+    char *mac, *ip, *name, *ap, *ssid, *radio;
+    int snr_db, signal_dbm, noise_floor_dbm;
+    int has_snr, has_signal, has_noise;
+};
 struct client_view { struct client *items; size_t count, capacity; int valid; };
 struct measurement {
     sqlite3_int64 id;
@@ -42,6 +46,8 @@ struct measurement {
     const char *state;
     long long sent_ms;
     int rtt_ms, responded, pingable;
+    int snr_db, signal_dbm, noise_floor_dbm;
+    int has_snr, has_signal, has_noise;
 };
 struct echo_packet {
     struct icmphdr header;
@@ -83,6 +89,7 @@ static int schema(sqlite3 *db) {
         "CREATE TABLE IF NOT EXISTS target("
         "id INTEGER PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN('ap','client')),"
         "ip TEXT NOT NULL,client_mac TEXT UNIQUE,ap_id TEXT UNIQUE,name TEXT NOT NULL,"
+        "current_ap TEXT,current_ssid TEXT,current_radio TEXT,"
         "enabled INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL"
         ");"
         "CREATE TABLE IF NOT EXISTS ping_result("
@@ -90,9 +97,28 @@ static int schema(sqlite3 *db) {
         "rtt_ms INTEGER NOT NULL CHECK(rtt_ms>=0 AND rtt_ms<=1000),"
         "responded INTEGER NOT NULL CHECK(responded IN(0,1)),"
         "state TEXT NOT NULL DEFAULT 'timeout' CHECK(state IN('ok','timeout','not_associated','unknown')),"
+        "snr_db INTEGER,signal_dbm INTEGER,noise_floor_dbm INTEGER,"
         "FOREIGN KEY(target_id) REFERENCES target(id));"
         "CREATE INDEX IF NOT EXISTS ping_result_target_time "
-        "ON ping_result(target_id,observed_at);") != SQLITE_OK) return SQLITE_ERROR;
+        "ON ping_result(target_id,observed_at);"
+        "CREATE TABLE IF NOT EXISTS ap_radio_sample("
+        "observed_at INTEGER NOT NULL,ap_mac TEXT NOT NULL,radio_id INTEGER NOT NULL,"
+        "radio_type TEXT,channel INTEGER,channelization INTEGER,clients INTEGER,"
+        "noise_floor_dbm INTEGER,avg_snr_db INTEGER,"
+        "airtime_total_tenths INTEGER,airtime_busy_tenths INTEGER,"
+        "airtime_rx_tenths INTEGER,airtime_tx_tenths INTEGER,"
+        "PRIMARY KEY(observed_at,ap_mac,radio_id));"
+        "CREATE INDEX IF NOT EXISTS ap_radio_sample_ap_time ON ap_radio_sample(ap_mac,observed_at);"
+        "CREATE TABLE IF NOT EXISTS mesh_link_sample("
+        "observed_at INTEGER NOT NULL,ap_mac TEXT NOT NULL,peer_mac TEXT NOT NULL,"
+        "direction TEXT NOT NULL,radio_type TEXT,snr_db INTEGER,"
+        "PRIMARY KEY(observed_at,ap_mac,peer_mac,direction));"
+        "CREATE INDEX IF NOT EXISTS mesh_link_sample_ap_time ON mesh_link_sample(ap_mac,observed_at);"
+        "CREATE TABLE IF NOT EXISTS zd_event("
+        "event_time INTEGER NOT NULL,event_hash TEXT NOT NULL,severity INTEGER,category TEXT,"
+        "message_id TEXT,ap_mac TEXT,ap_name TEXT,client_mac TEXT,wlan TEXT,reason TEXT,details TEXT,"
+        "PRIMARY KEY(event_time,event_hash));"
+        "CREATE INDEX IF NOT EXISTS zd_event_time ON zd_event(event_time);") != SQLITE_OK) return SQLITE_ERROR;
 
     /* The first prototype used UNIQUE(kind,ip).  That is wrong for mobile
      * clients: a DHCP address can move to a different MAC.  Rebuild only that
@@ -127,6 +153,12 @@ static int schema(sqlite3 *db) {
     /* Development builds before the raw-sample design did not have a state
      * field. Attempting this on a current database is harmlessly ignored. */
     sql(db, "ALTER TABLE ping_result ADD COLUMN state TEXT NOT NULL DEFAULT 'timeout'");
+    sql(db, "ALTER TABLE ping_result ADD COLUMN snr_db INTEGER");
+    sql(db, "ALTER TABLE ping_result ADD COLUMN signal_dbm INTEGER");
+    sql(db, "ALTER TABLE ping_result ADD COLUMN noise_floor_dbm INTEGER");
+    sql(db, "ALTER TABLE target ADD COLUMN current_ap TEXT");
+    sql(db, "ALTER TABLE target ADD COLUMN current_ssid TEXT");
+    sql(db, "ALTER TABLE target ADD COLUMN current_radio TEXT");
     return SQLITE_OK;
 }
 
@@ -200,6 +232,7 @@ static void free_client_view(struct client_view *view) {
     size_t i;
     for (i=0;i<view->count;i++) {
         free(view->items[i].mac); free(view->items[i].ip); free(view->items[i].name);
+        free(view->items[i].ap); free(view->items[i].ssid); free(view->items[i].radio);
     }
     free(view->items); memset(view,0,sizeof(*view));
 }
@@ -219,11 +252,13 @@ static struct client_view parse_client_view(const char *path) {
     if(!text||fread(text,1,(size_t)size,f)!=(size_t)size){free(text);fclose(f);return view;}
     fclose(f);text[size]=0;tag=text;
     while((tag=strstr(tag,"<client "))!=NULL){
-        char *end=strchr(tag,'>'),*mac,*ip,*name;struct client *grown;
+        char *end=strchr(tag,'>'),*mac,*ip,*name,*ap,*ssid,*radio,*snr,*signal,*noise;struct client *grown;
         if(!end)break;
         mac=attr(tag,end,"mac");ip=attr(tag,end,"ip");name=attr(tag,end,"hostname");
         if(!name||!*name){free(name);name=attr(tag,end,"user");}
         if(!name||!*name){free(name);name=copy_text(mac);}
+        ap=attr(tag,end,"ap");ssid=attr(tag,end,"ssid");radio=attr(tag,end,"radio-type");
+        snr=attr(tag,end,"rssi");signal=attr(tag,end,"received-signal-strength");noise=attr(tag,end,"noise-floor");
         if(mac&&valid_mac(mac)){
             if(view.count==view.capacity){
                 size_t capacity=view.capacity?view.capacity*2:128;
@@ -231,10 +266,16 @@ static struct client_view parse_client_view(const char *path) {
                 if(!grown){free(mac);free(ip);free(name);free(text);free_client_view(&view);return view;}
                 view.items=grown;view.capacity=capacity;
             }
+            memset(&view.items[view.count],0,sizeof(view.items[view.count]));
             view.items[view.count].mac=mac;view.items[view.count].ip=ip;
-            view.items[view.count].name=name;view.count++;mac=ip=name=NULL;
+            view.items[view.count].name=name;view.items[view.count].ap=ap;
+            view.items[view.count].ssid=ssid;view.items[view.count].radio=radio;
+            if(snr&&*snr){view.items[view.count].snr_db=atoi(snr);view.items[view.count].has_snr=1;}
+            if(signal&&*signal){view.items[view.count].signal_dbm=atoi(signal);view.items[view.count].has_signal=1;}
+            if(noise&&*noise){view.items[view.count].noise_floor_dbm=atoi(noise);view.items[view.count].has_noise=1;}
+            view.count++;mac=ip=name=ap=ssid=radio=NULL;
         }
-        free(mac);free(ip);free(name);tag=end+1;
+        free(mac);free(ip);free(name);free(ap);free(ssid);free(radio);free(snr);free(signal);free(noise);tag=end+1;
     }
     free(text);qsort(view.items,view.count,sizeof(*view.items),client_compare);view.valid=1;return view;
 }
@@ -247,12 +288,20 @@ static int client_present(const struct client_view *view,const char *mac) {
     return 0;
 }
 
+static const struct client *find_client(const struct client_view *view,const char *mac) {
+    size_t low=0,high=view->count;
+    if(!mac)return NULL;
+    while(low<high){size_t middle=low+(high-low)/2;int order=strcasecmp(mac,view->items[middle].mac);
+        if(order==0)return &view->items[middle];if(order<0)high=middle;else low=middle+1;}
+    return NULL;
+}
+
 /* Refresh all discovered clients with two prepared statements in the caller's
  * transaction. This replaces thousands of database opens and commits. */
 static int sync_clients(sqlite3 *db,const struct client_view *view,time_t now) {
     sqlite3_stmt *insert=NULL,*update=NULL;size_t i;int rc=SQLITE_OK;
     rc=sqlite3_prepare_v2(db,"INSERT OR IGNORE INTO target(kind,ip,client_mac,ap_id,name,enabled,created_at) VALUES('client',?,?,NULL,?,1,?)",-1,&insert,NULL);
-    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"UPDATE target SET ip=?,name=?,enabled=1 WHERE kind='client' AND client_mac=?",-1,&update,NULL);
+    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"UPDATE target SET ip=?,name=?,current_ap=?,current_ssid=?,current_radio=?,enabled=1 WHERE kind='client' AND client_mac=?",-1,&update,NULL);
     for(i=0;rc==SQLITE_OK&&i<view->count;i++){
         struct in_addr address;const struct client *client=&view->items[i];
         if(!client->ip||!client->name||inet_pton(AF_INET,client->ip,&address)!=1)continue;
@@ -261,10 +310,130 @@ static int sync_clients(sqlite3 *db,const struct client_view *view,time_t now) {
         rc=sqlite3_step(insert)==SQLITE_DONE?sqlite3_reset(insert):SQLITE_ERROR;sqlite3_clear_bindings(insert);
         if(rc!=SQLITE_OK)break;
         sqlite3_bind_text(update,1,client->ip,-1,SQLITE_TRANSIENT);sqlite3_bind_text(update,2,client->name,-1,SQLITE_TRANSIENT);
-        sqlite3_bind_text(update,3,client->mac,-1,SQLITE_TRANSIENT);
+        if(client->ap)sqlite3_bind_text(update,3,client->ap,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(update,3);
+        if(client->ssid)sqlite3_bind_text(update,4,client->ssid,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(update,4);
+        if(client->radio)sqlite3_bind_text(update,5,client->radio,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(update,5);
+        sqlite3_bind_text(update,6,client->mac,-1,SQLITE_TRANSIENT);
         rc=sqlite3_step(update)==SQLITE_DONE?sqlite3_reset(update):SQLITE_ERROR;sqlite3_clear_bindings(update);
     }
     sqlite3_finalize(insert);sqlite3_finalize(update);return rc;
+}
+
+static int bind_optional_int(sqlite3_stmt *statement,int index,const char *value) {
+    if(value&&*value)return sqlite3_bind_int(statement,index,atoi(value));
+    return sqlite3_bind_null(statement,index);
+}
+
+/* Retain only the compact AP radio and mesh-link values needed for time-series
+ * reporting.  The very large LEVEL=2 XML response is deliberately transient. */
+static int ingest_ap_detail(sqlite3 *db,const char *path,time_t observed_at) {
+    FILE *f;long size;char *text=NULL,*ap_tag;sqlite3_stmt *radio_put=NULL,*mesh_put=NULL;int rc=SQLITE_OK;
+    if(!path||!(f=fopen(path,"r")))return SQLITE_OK;
+    if(fseek(f,0,SEEK_END)||(size=ftell(f))<0||fseek(f,0,SEEK_SET)){fclose(f);return SQLITE_IOERR;}
+    text=malloc((size_t)size+1);if(!text||fread(text,1,(size_t)size,f)!=(size_t)size){free(text);fclose(f);return SQLITE_NOMEM;}
+    fclose(f);text[size]=0;
+    rc=sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO ap_radio_sample(observed_at,ap_mac,radio_id,radio_type,channel,channelization,clients,noise_floor_dbm,avg_snr_db,airtime_total_tenths,airtime_busy_tenths,airtime_rx_tenths,airtime_tx_tenths) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",-1,&radio_put,NULL);
+    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO mesh_link_sample(observed_at,ap_mac,peer_mac,direction,radio_type,snr_db) VALUES(?,?,?,?,?,?)",-1,&mesh_put,NULL);
+    ap_tag=text;
+    while(rc==SQLITE_OK&&(ap_tag=strstr(ap_tag,"<ap "))!=NULL){
+        char *ap_head_end=strchr(ap_tag,'>'),*ap_end,*ap_mac,*cursor;
+        if(!ap_head_end||!(ap_end=strstr(ap_head_end,"</ap>")))break;
+        ap_mac=attr(ap_tag,ap_head_end,"mac");
+        if(ap_mac&&valid_mac(ap_mac)){
+            cursor=ap_head_end+1;
+            while(rc==SQLITE_OK&&(cursor=strstr(cursor,"<radio "))!=NULL&&cursor<ap_end){
+                char *end=strchr(cursor,'>'),*id,*type,*channel,*width,*clients,*noise,*average,*total,*busy,*rx,*tx;
+                if(!end||end>ap_end)break;
+                id=attr(cursor,end,"radio-id");type=attr(cursor,end,"radio-type");channel=attr(cursor,end,"channel");
+                width=attr(cursor,end,"channelization");clients=attr(cursor,end,"assoc-stas");noise=attr(cursor,end,"noisefloor");
+                average=attr(cursor,end,"avg-rssi");total=attr(cursor,end,"airtime-total");busy=attr(cursor,end,"airtime-busy");
+                rx=attr(cursor,end,"airtime-rx");tx=attr(cursor,end,"airtime-tx");
+                sqlite3_bind_int64(radio_put,1,observed_at);sqlite3_bind_text(radio_put,2,ap_mac,-1,SQLITE_TRANSIENT);
+                bind_optional_int(radio_put,3,id);if(type)sqlite3_bind_text(radio_put,4,type,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(radio_put,4);
+                bind_optional_int(radio_put,5,channel);bind_optional_int(radio_put,6,width);bind_optional_int(radio_put,7,clients);
+                bind_optional_int(radio_put,8,noise);bind_optional_int(radio_put,9,average);bind_optional_int(radio_put,10,total);
+                bind_optional_int(radio_put,11,busy);bind_optional_int(radio_put,12,rx);bind_optional_int(radio_put,13,tx);
+                rc=sqlite3_step(radio_put)==SQLITE_DONE?sqlite3_reset(radio_put):SQLITE_ERROR;sqlite3_clear_bindings(radio_put);
+                free(id);free(type);free(channel);free(width);free(clients);free(noise);free(average);free(total);free(busy);free(rx);free(tx);cursor=end+1;
+            }
+            cursor=ap_head_end+1;
+            while(rc==SQLITE_OK&&cursor<ap_end){
+                char *up=strstr(cursor,"<uplink-ap "),*down=strstr(cursor,"<downlink-ap "),*tag=NULL,*end,*peer,*type,*snr;const char *direction;
+                if(up&&up<ap_end&&(!down||up<down)){tag=up;direction="uplink";}else if(down&&down<ap_end){tag=down;direction="downlink";}else break;
+                end=strchr(tag,'>');if(!end||end>ap_end)break;peer=attr(tag,end,"ap");type=attr(tag,end,"radio-type");snr=attr(tag,end,"rssi");
+                if(peer&&valid_mac(peer)){sqlite3_bind_int64(mesh_put,1,observed_at);sqlite3_bind_text(mesh_put,2,ap_mac,-1,SQLITE_TRANSIENT);
+                    sqlite3_bind_text(mesh_put,3,peer,-1,SQLITE_TRANSIENT);sqlite3_bind_text(mesh_put,4,direction,-1,SQLITE_STATIC);
+                    if(type)sqlite3_bind_text(mesh_put,5,type,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(mesh_put,5);bind_optional_int(mesh_put,6,snr);
+                    rc=sqlite3_step(mesh_put)==SQLITE_DONE?sqlite3_reset(mesh_put):SQLITE_ERROR;sqlite3_clear_bindings(mesh_put);}
+                free(peer);free(type);free(snr);cursor=end+1;
+            }
+        }
+        free(ap_mac);ap_tag=ap_end+5;
+    }
+    sqlite3_finalize(radio_put);sqlite3_finalize(mesh_put);free(text);return rc;
+}
+
+static uint64_t event_hash(const char *start,const char *end) {
+    uint64_t hash=UINT64_C(1469598103934665603);const unsigned char *p=(const unsigned char *)start;
+    while((const char *)p<end){hash^=*p++;hash*=UINT64_C(1099511628211);}return hash;
+}
+
+static int ingest_events(const char *path) {
+    FILE *f;long size;char *text=NULL,*tag;sqlite3 *db=NULL;sqlite3_stmt *put=NULL;int rc,count=0,inserted=0;sqlite3_int64 oldest=0,newest=0;
+    if(!path||!(f=fopen(path,"r")))return 1;
+    if(fseek(f,0,SEEK_END)||(size=ftell(f))<0||fseek(f,0,SEEK_SET)){fclose(f);return 1;}
+    text=malloc((size_t)size+1);if(!text||fread(text,1,(size_t)size,f)!=(size_t)size){free(text);fclose(f);return 1;}fclose(f);text[size]=0;
+    rc=sqlite3_open(DB,&db);if(rc==SQLITE_OK)rc=schema(db);if(rc==SQLITE_OK)rc=sql(db,"BEGIN IMMEDIATE");
+    if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"INSERT OR IGNORE INTO zd_event(event_time,event_hash,severity,category,message_id,ap_mac,ap_name,client_mac,wlan,reason,details) VALUES(?,?,?,?,?,?,?,?,?,?,?)",-1,&put,NULL);
+    tag=text;
+    while(rc==SQLITE_OK&&(tag=strstr(tag,"<xevent "))!=NULL){
+        char *end=strchr(tag,'>'),*when,*severity,*category,*message,*ap,*ap_name,*mac,*wlan,*reason,*details;char hash_text[17];
+        if(!end)break;when=attr(tag,end,"time");severity=attr(tag,end,"severity");category=attr(tag,end,"c");message=attr(tag,end,"msg");
+        ap=attr(tag,end,"ap");ap_name=attr(tag,end,"ap-name");mac=attr(tag,end,"mac");wlan=attr(tag,end,"wlan");reason=attr(tag,end,"reason");details=attr(tag,end,"lmsg");
+        snprintf(hash_text,sizeof hash_text,"%016llx",(unsigned long long)event_hash(tag,end+1));
+        if(!when||!*when){free(when);free(severity);free(category);free(message);free(ap);free(ap_name);free(mac);free(wlan);free(reason);free(details);tag=end+1;continue;}
+        {sqlite3_int64 event_time=(sqlite3_int64)strtoll(when,NULL,10);if(!oldest||event_time<oldest)oldest=event_time;if(event_time>newest)newest=event_time;}
+        bind_optional_int(put,1,when);sqlite3_bind_text(put,2,hash_text,-1,SQLITE_TRANSIENT);bind_optional_int(put,3,severity);
+        if(category)sqlite3_bind_text(put,4,category,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,4);
+        if(message)sqlite3_bind_text(put,5,message,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,5);
+        if(ap&&valid_mac(ap))sqlite3_bind_text(put,6,ap,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,6);
+        if(ap_name&&*ap_name)sqlite3_bind_text(put,7,ap_name,-1,SQLITE_TRANSIENT);else if(ap&&!valid_mac(ap))sqlite3_bind_text(put,7,ap,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,7);
+        if(mac)sqlite3_bind_text(put,8,mac,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,8);
+        if(wlan)sqlite3_bind_text(put,9,wlan,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,9);
+        if(reason)sqlite3_bind_text(put,10,reason,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,10);
+        if(details)sqlite3_bind_text(put,11,details,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(put,11);
+        if(sqlite3_step(put)==SQLITE_DONE){inserted+=sqlite3_changes(db);rc=sqlite3_reset(put);count++;}else rc=SQLITE_ERROR;sqlite3_clear_bindings(put);
+        free(when);free(severity);free(category);free(message);free(ap);free(ap_name);free(mac);free(wlan);free(reason);free(details);tag=end+1;
+    }
+    sqlite3_finalize(put);if(rc==SQLITE_OK){char prune[160];snprintf(prune,sizeof prune,"DELETE FROM zd_event WHERE event_time<%lld",(long long)(time(NULL)-RETENTION_SECONDS));rc=sql(db,prune);}
+    if(rc==SQLITE_OK)rc=sql(db,"COMMIT");else if(db&&!sqlite3_get_autocommit(db))sql(db,"ROLLBACK");
+    if(rc==SQLITE_OK)printf("COUNT=%d\nINSERTED=%d\nOLDEST=%lld\nNEWEST=%lld\n",count,inserted,(long long)oldest,(long long)newest);
+    free(text);sqlite3_close(db);return rc==SQLITE_OK?0:1;
+}
+
+static int event_watermark(void) {
+    sqlite3 *db=NULL;sqlite3_stmt *statement=NULL;sqlite3_int64 value=0;int rc=sqlite3_open(DB,&db);
+    if(rc==SQLITE_OK)rc=schema(db);if(rc==SQLITE_OK)rc=sqlite3_prepare_v2(db,"SELECT coalesce(max(event_time),0) FROM zd_event",-1,&statement,NULL);
+    if(rc==SQLITE_OK&&sqlite3_step(statement)==SQLITE_ROW)value=sqlite3_column_int64(statement,0);else if(rc==SQLITE_OK)rc=SQLITE_ERROR;
+    sqlite3_finalize(statement);sqlite3_close(db);if(rc==SQLITE_OK)printf("%lld\n",(long long)value);return rc==SQLITE_OK?0:1;
+}
+
+static sqlite3_int64 scalar(sqlite3 *db,const char *query,sqlite3_int64 argument,int use_argument) {
+    sqlite3_stmt *statement=NULL;sqlite3_int64 value=0;
+    if(sqlite3_prepare_v2(db,query,-1,&statement,NULL)==SQLITE_OK){if(use_argument)sqlite3_bind_int64(statement,1,argument);if(sqlite3_step(statement)==SQLITE_ROW)value=sqlite3_column_int64(statement,0);}
+    sqlite3_finalize(statement);return value;
+}
+
+static int telemetry_status_json(void) {
+    sqlite3 *db=NULL;sqlite3_int64 observed=0,signals=0,radios=0,links=0,events=0;int rc=sqlite3_open_v2(DB,&db,SQLITE_OPEN_READONLY,NULL);
+    if(rc!=SQLITE_OK){puts("{\"status\":\"waiting\"}");sqlite3_close(db);return 0;}
+    observed=scalar(db,"SELECT coalesce(max(observed_at),0) FROM ping_result",0,0);
+    signals=scalar(db,"SELECT count(*) FROM ping_result WHERE observed_at=? AND snr_db IS NOT NULL",observed,1);
+    radios=scalar(db,"SELECT count(*) FROM ap_radio_sample WHERE observed_at=?",observed,1);
+    links=scalar(db,"SELECT count(*) FROM mesh_link_sample WHERE observed_at=?",observed,1);
+    events=scalar(db,"SELECT count(*) FROM zd_event",0,0);
+    printf("{\"status\":\"ok\",\"observed_at\":%lld,\"clients_with_snr\":%lld,\"ap_radios\":%lld,\"mesh_links\":%lld,\"retained_events\":%lld}\n",(long long)observed,(long long)signals,(long long)radios,(long long)links,(long long)events);
+    sqlite3_close(db);return 0;
 }
 
 static long long milliseconds(void) {
@@ -346,12 +515,15 @@ static int load_measurements(sqlite3 *db,const struct client_view *clients,struc
         else if(kind&&strcmp(kind,"client")==0&&!client_present(clients,mac))item->state="not_associated";
         else if(ip&&inet_pton(AF_INET,ip,&item->address)==1){item->state="timeout";item->pingable=1;}
         else item->state="unknown";
+        if(kind&&strcmp(kind,"client")==0){const struct client *client=find_client(clients,mac);if(client){
+            item->snr_db=client->snr_db;item->signal_dbm=client->signal_dbm;item->noise_floor_dbm=client->noise_floor_dbm;
+            item->has_snr=client->has_snr;item->has_signal=client->has_signal;item->has_noise=client->has_noise;}}
         }
     }
     sqlite3_finalize(query);if(rc!=SQLITE_DONE){free(items);return rc;}*result=items;*result_count=count;return SQLITE_OK;
 }
 
-static int tick(const char *client_xml) {
+static int tick(const char *client_xml,const char *ap_detail_xml) {
     sqlite3 *db=NULL;sqlite3_stmt *put=NULL;struct target *aps=read_aps();struct client_view clients=parse_client_view(client_xml);
     struct measurement *items=NULL;size_t count=0,i;time_t now=time(NULL);const char *stage="open database";int rc=sqlite3_open(DB,&db);
     if(rc==SQLITE_OK){stage="initialize schema";rc=schema(db);}
@@ -364,15 +536,19 @@ static int tick(const char *client_xml) {
     if(rc==SQLITE_OK){stage="load targets";rc=load_measurements(db,&clients,&items,&count);}
     if(rc==SQLITE_OK){stage="send ICMP probes";if(parallel_ping(items,count)!=0)rc=SQLITE_IOERR;}
     if(rc==SQLITE_OK){stage="begin result write";rc=sql(db,"BEGIN IMMEDIATE");}
-    if(rc==SQLITE_OK){stage="prepare result write";rc=sqlite3_prepare_v2(db,"INSERT INTO ping_result(observed_at,target_id,rtt_ms,responded,state) VALUES(?,?,?,?,?)",-1,&put,NULL);}
+    if(rc==SQLITE_OK){stage="prepare result write";rc=sqlite3_prepare_v2(db,"INSERT INTO ping_result(observed_at,target_id,rtt_ms,responded,state,snr_db,signal_dbm,noise_floor_dbm) VALUES(?,?,?,?,?,?,?,?)",-1,&put,NULL);}
     if(rc==SQLITE_OK)stage="write results";
     for(i=0;rc==SQLITE_OK&&i<count;i++){
         sqlite3_bind_int64(put,1,now);sqlite3_bind_int64(put,2,items[i].id);sqlite3_bind_int(put,3,items[i].rtt_ms);
         sqlite3_bind_int(put,4,items[i].responded);sqlite3_bind_text(put,5,items[i].state,-1,SQLITE_STATIC);
+        if(items[i].has_snr)sqlite3_bind_int(put,6,items[i].snr_db);else sqlite3_bind_null(put,6);
+        if(items[i].has_signal)sqlite3_bind_int(put,7,items[i].signal_dbm);else sqlite3_bind_null(put,7);
+        if(items[i].has_noise)sqlite3_bind_int(put,8,items[i].noise_floor_dbm);else sqlite3_bind_null(put,8);
         rc=sqlite3_step(put)==SQLITE_DONE?sqlite3_reset(put):SQLITE_ERROR;sqlite3_clear_bindings(put);
     }
     sqlite3_finalize(put);
-    if(rc==SQLITE_OK){char prune[160];stage="prune results";snprintf(prune,sizeof(prune),"DELETE FROM ping_result WHERE observed_at<%lld",(long long)(now-RETENTION_SECONDS));rc=sql(db,prune);}
+    if(rc==SQLITE_OK){stage="store AP telemetry";rc=ingest_ap_detail(db,ap_detail_xml,now);}
+    if(rc==SQLITE_OK){char prune[512];stage="prune results";snprintf(prune,sizeof(prune),"DELETE FROM ping_result WHERE observed_at<%lld;DELETE FROM ap_radio_sample WHERE observed_at<%lld;DELETE FROM mesh_link_sample WHERE observed_at<%lld",(long long)(now-RETENTION_SECONDS),(long long)(now-RETENTION_SECONDS),(long long)(now-RETENTION_SECONDS));rc=sql(db,prune);}
     if(rc==SQLITE_OK){stage="commit results";rc=sql(db,"COMMIT");}else if(db&&!sqlite3_get_autocommit(db))sql(db,"ROLLBACK");
     if(rc!=SQLITE_OK)fprintf(stderr,"ping round (%s, rc=%d): %s\n",stage,rc,db?sqlite3_errmsg(db):"database unavailable");
     free(items);free_client_view(&clients);sqlite3_close(db);return rc==SQLITE_OK?0:1;
@@ -469,13 +645,17 @@ static int snapshot_times(void) {
 }
 static int prune_snapshots(void) { DIR*d=opendir(SNAPSHOT_DIR);struct dirent*e;long cut=(long)time(NULL)-RETENTION_SECONDS;if(!d)return 0;while((e=readdir(d))){char *dash=strchr(e->d_name,'-');long t=strtol(e->d_name,NULL,10);if(dash&&t>0&&t<cut){char p[512];snprintf(p,sizeof(p),"%s/%s",SNAPSHOT_DIR,e->d_name);unlink(p);}}closedir(d);return 0; }
 int main(int argc,char**argv){
-    if(argc==2&&strcmp(argv[1],"tick")==0)return tick(NULL);
-    if(argc==3&&strcmp(argv[1],"tick")==0)return tick(argv[2]);
+    if(argc==2&&strcmp(argv[1],"tick")==0)return tick(NULL,NULL);
+    if(argc==3&&strcmp(argv[1],"tick")==0)return tick(argv[2],NULL);
+    if(argc==4&&strcmp(argv[1],"tick")==0)return tick(argv[2],argv[3]);
+    if(argc==3&&strcmp(argv[1],"ingest-events")==0)return ingest_events(argv[2]);
+    if(argc==2&&strcmp(argv[1],"event-watermark")==0)return event_watermark();
+    if(argc==2&&strcmp(argv[1],"telemetry-status-json")==0)return telemetry_status_json();
     if(argc==4&&strcmp(argv[1],"add-client")==0)return add_client(argv[2],argv[3],"Client");
     if(argc==5&&strcmp(argv[1],"add-client")==0)return add_client(argv[2],argv[3],argv[4]);
     if(argc==4&&strcmp(argv[1],"set-enabled")==0)return set_enabled(argv[2],argv[3]);
     if(argc==2&&strcmp(argv[1],"pings-json")==0)return pings_json();
     if(argc==2&&strcmp(argv[1],"snapshot-times")==0)return snapshot_times();
     if(argc==2&&strcmp(argv[1],"prune-snapshots")==0)return prune_snapshots();
-    fprintf(stderr,"Usage: %s {tick [client.xml]|add-client MAC IP NAME|set-enabled ID 0|1|pings-json|snapshot-times|prune-snapshots}\n",argv[0]);return 2;
+    fprintf(stderr,"Usage: %s {tick [client.xml [ap-detail.xml]]|ingest-events events.xml|add-client MAC IP NAME|set-enabled ID 0|1|pings-json|snapshot-times|prune-snapshots}\n",argv[0]);return 2;
 }
