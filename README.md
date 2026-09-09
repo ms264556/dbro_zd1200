@@ -224,12 +224,16 @@ usual knobs:
   appliance's web UI takes effect on the next start. Re-seeding it (new
   `ZD_CONTAINER_MAC`, or pinning `ZD_BOARDDATA_FROM_MAC=0` with
   `ZD_SERIAL`/`ZD_MAC1`) needs a fresh state volume (see *Factory reset*).
-- **The guest reboots in place.** Its patched `machine_restart()` issues a QEMU
-  i8042 reset, so a reboot from the web UI, CLI or `/sbin/reboot` completes and
-  the container stays `Up`. Do not add `-no-reboot`.
-- **No in-guest firmware upgrades.** QEMU boots an external kernel, so a web-UI
-  upgrade would leave a mixed version. Update the firmware archive and rebuild
-  instead.
+- **The guest reboots by relaunching QEMU.** `run-zd1200-qemu.sh` runs QEMU once
+  per guest boot under `scripts/qemu-run.py`, which passes `-no-reboot` and maps
+  the QMP `guest-reset` event to exit 10: the loop re-applies the patches and
+  relaunches QEMU. A guest poweroff maps to exit 0 and stops the container
+  (compose `restart: on-failure`, so a clean exit is not restarted).
+- **In-guest firmware upgrades work.** A web-UI upgrade writes the new image to
+  the spare root partition and reboots; the loop detects it (the `duplicate`
+  marker on `/writable`), folds the upgraded partition into the base, re-applies
+  the kernel + rootfs patches, and boots it. A fresh state volume still starts
+  from whatever firmware you prepared into `image/`.
 - **No NAT fallback.** The container shares the host's network namespace and the
   guest is a macvtap on the host NIC, so APs reach it directly on the LAN. A
   user-mode NAT setup would hide the appliance from the APs, so there is none —

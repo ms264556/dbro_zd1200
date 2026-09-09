@@ -140,12 +140,11 @@ if [ "${SNAPSHOT:-1}" = "1" ]; then
     snapshot_args+=( -snapshot )
 fi
 
-# Reboot: the guest reboots IN PLACE on `reboot`.  Its (patched)
-# machine_restart() requests a QEMU i8042 system reset, which QEMU honours by
-# resetting and re-running the kernel - so NO -no-reboot is used here (and a
-# guest reboot does not tear down the container).  The firmware-upgrade
-# workflow that needs QEMU to exit on each guest reboot supplies its own
-# -no-reboot in a separate harness; this container never passes it.
+# Reboot/upgrade loop: QEMU runs once per guest boot under qemu-run.py, which
+# passes -no-reboot and reports a guest reset as exit 10 and a guest poweroff as
+# exit 0.  Before each launch apply-rootfs-patches.sh re-applies the kernel and
+# rootfs patches when the guest upgraded (or the base/patch set changed); it
+# no-ops otherwise.  A poweroff ends the loop and the container.
 
 pacing_args=()
 if [ "${PACE_GUEST:-0}" = "auto" ]; then
@@ -231,21 +230,34 @@ fi
 # in).  This matters: the firmware upgrade's own menu.lst template uses
 # root=/dev/sda2|sda3, so the disk naming has to match for a menu rewrite to
 # stay bootable.
-exec qemu-system-i386 \
-    -name zd1200-10.5.1-lab \
-    "${accel_args[@]}" \
-    -machine pc \
-    -cpu "${CPU_MODEL:-pentium3}" \
-    -m "${MEMORY_MB:-2048}" \
-    -smp 1 \
-    "${initrd_args[@]}" \
-    -device ich9-ahci,id=ahci \
-    -drive "file=$disk_image,format=$disk_format,if=none,id=disk0,cache=${DISK_CACHE:-writeback}" \
-    -device "ide-hd,drive=disk0,bus=ahci.0" \
-    "${snapshot_args[@]}" \
-    "${net_args[@]}" \
-    "${nic_args[@]}" \
-    "${ipmi_args[@]}" \
-    "${console_args[@]}" \
-    "${pacing_args[@]}" \
+qemu_args=(
+    -name zd1200-10.5.1-lab
+    "${accel_args[@]}"
+    -machine pc
+    -cpu "${CPU_MODEL:-pentium3}"
+    -m "${MEMORY_MB:-2048}"
+    -smp 1
+    "${initrd_args[@]}"
+    -device ich9-ahci,id=ahci
+    -drive "file=$disk_image,format=$disk_format,if=none,id=disk0,cache=${DISK_CACHE:-writeback}"
+    -device "ide-hd,drive=disk0,bus=ahci.0"
+    "${snapshot_args[@]}"
+    "${net_args[@]}"
+    "${nic_args[@]}"
+    "${ipmi_args[@]}"
+    "${console_args[@]}"
+    "${pacing_args[@]}"
     "${debug_args[@]}"
+)
+
+while :; do
+    if [ "${ZD_REPREP:-1}" = "1" ] && [ -x "$work_dir/apply-rootfs-patches.sh" ]; then
+        "$work_dir/apply-rootfs-patches.sh" || exit 1
+    fi
+    python3 "$work_dir/qemu-run.py" "${qemu_args[@]}"
+    rc=$?
+    if [ "$rc" -ne 10 ]; then
+        exit "$rc"
+    fi
+    echo "guest requested a reboot; relaunching QEMU" >&2
+done

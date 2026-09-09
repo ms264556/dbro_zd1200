@@ -75,6 +75,13 @@ SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
 
 say() { printf '\n== %s\n' "$*"; }
 
+# Partition geometry (mirrors make-synthetic-cf.py).
+SECTOR=512
+HDA1_START=62;     HDA1_SECTORS=84506
+HDA2_START=84568;  HDA2_SECTORS=415152
+HDA3_START=499720; HDA3_SECTORS=415152
+HDA4_START=914872; HDA4_SECTORS=3006008
+
 [ -f "$ROOTFS" ] || { echo "apply-rootfs-patches: missing base rootfs: $ROOTFS" >&2; exit 1; }
 [ -f "$BOOTFS_SRC" ] || { echo "apply-rootfs-patches: missing firmware restore initramfs: $BOOTFS_SRC" >&2; exit 1; }
 [ -f "$IMAGE_DIR/restoreinitramfs.ver" ] || { echo "apply-rootfs-patches: missing $IMAGE_DIR/restoreinitramfs.ver — run scripts/prepare-vendor-image.sh" >&2; exit 1; }
@@ -124,6 +131,92 @@ elif [ "$stored_patches" != "$patch_sig" ]; then
     reason="patch set changed"; rebuild_synthetic=0; patch_needed=1
 fi
 
+# --- detect a completed in-guest upgrade in the existing overlay -------------
+# ac_upg.sh records the partition it wrote in /writable/etc/airespider-images/
+# duplicate; that file survives until the next boot's flag_reset validates and
+# clones it.  Seeing it here means the overlay holds the upgraded rootfs: fold
+# the upgrade into the base (boot area, /writable and the newly active root
+# partition), then recreate the overlay and re-patch it below.
+folded=0
+if [ -f "$PERSISTENT_DISK" ]; then
+    mkdir -p "$WORK"
+    # Cheap gate before the full flatten: an in-guest upgrade writes the whole
+    # new rootfs (~150 MB) into the spare root partition, while the patch
+    # pipeline writes only a few small files there.  qemu-img map reads just the
+    # qcow2 metadata, so this is fast; only a large allocation triggers the
+    # ~1.9 GB flatten+scan below.
+    upgrade_alloc="$(python3 - "$PERSISTENT_DISK" "$SECTOR" \
+        "$HDA2_START" "$HDA2_SECTORS" "$HDA3_START" "$HDA3_SECTORS" <<'PY'
+import json, subprocess, sys
+disk = sys.argv[1]
+sector, s2, c2, s3, c3 = (int(x) for x in sys.argv[2:])
+ranges = [(s2 * sector, (s2 + c2) * sector), (s3 * sector, (s3 + c3) * sector)]
+try:
+    out = subprocess.run(["qemu-img", "map", "--output=json", "-f", "qcow2", disk],
+                         capture_output=True, text=True, check=True).stdout
+except Exception as exc:
+    print(f"upgrade gate: qemu-img map failed: {exc}", file=sys.stderr)
+    print(-1)
+    raise SystemExit
+total = 0
+for r in json.loads(out):
+    if r.get("depth", 0) != 0 or not r.get("data", False):
+        continue
+    start, end = r["start"], r["start"] + r["length"]
+    for lo, hi in ranges:
+        total += max(0, min(end, hi) - max(start, lo))
+print(total)
+PY
+)"
+    if [ "${upgrade_alloc:--1}" -ge 0 ] && [ "${upgrade_alloc:-0}" -le $((64 * 1024 * 1024)) ]; then
+        say "No in-guest upgrade signature in the overlay (root-partition allocation ${upgrade_alloc} bytes); skipping the scan"
+    else
+    say "Checking the existing overlay for an in-guest upgrade (root-partition allocation ${upgrade_alloc} bytes)"
+    qemu-img convert -f qcow2 -O raw "$PERSISTENT_DISK" "$WORK/upgrade.flat.raw"
+    dd if="$WORK/upgrade.flat.raw" of="$WORK/upgrade.writable.img" bs=$SECTOR \
+        skip="$HDA4_START" count="$HDA4_SECTORS" status=none
+    upgrade_part="$(debugfs -R "cat /etc/airespider-images/duplicate" \
+        "$WORK/upgrade.writable.img" 2>/dev/null | tr -d ' \n')"
+    case "$upgrade_part" in
+        *2) up_start=$HDA2_START; up_count=$HDA2_SECTORS ;;
+        *3) up_start=$HDA3_START; up_count=$HDA3_SECTORS ;;
+        *)  up_start="" ;;
+    esac
+    if [ -n "$up_start" ]; then
+        say "In-guest upgrade detected ($upgrade_part) — folding it into the base"
+        for spec in "boot:$HDA1_START:$HDA1_SECTORS" \
+                    "writable:$HDA4_START:$HDA4_SECTORS" \
+                    "root:$up_start:$up_count"; do
+            start="${spec#*:}"; start="${start%%:*}"
+            count="${spec##*:}"
+            dd if="$WORK/upgrade.flat.raw" of="$SYNTHETIC_DISK" bs=$SECTOR \
+                skip="$start" count="$count" seek="$start" conv=notrunc status=none
+        done
+        # The folded partition carries the vendor kernel; re-apply the QEMU
+        # kernel patches to its /bzImage.
+        dd if="$SYNTHETIC_DISK" of="$WORK/upgrade.root.img" bs=$SECTOR \
+            skip="$up_start" count="$up_count" status=none
+        debugfs -R "dump /bzImage $WORK/upgrade.bzImage" "$WORK/upgrade.root.img" 2>/dev/null || true
+        if [ -s "$WORK/upgrade.bzImage" ] \
+            && python3 "$BASE/patch-kernel.py" --in "$WORK/upgrade.bzImage" \
+               --out "$WORK/upgrade.bzImage.patched" >"$WORK/patch-kernel.log" 2>&1; then
+            debugfs -w -R "rm /bzImage" "$WORK/upgrade.root.img" 2>/dev/null || true
+            debugfs -w -R "write $WORK/upgrade.bzImage.patched /bzImage" "$WORK/upgrade.root.img" 2>/dev/null || true
+            dd if="$WORK/upgrade.root.img" of="$SYNTHETIC_DISK" bs=$SECTOR \
+                seek="$up_start" count="$up_count" conv=notrunc status=none
+        else
+            say "warning: could not re-patch the upgraded kernel; see $WORK/patch-kernel.log"
+        fi
+        rm -f "$WORK/upgrade.root.img" "$WORK/upgrade.bzImage" "$WORK/upgrade.bzImage.patched"
+        rebuild_synthetic=0
+        patch_needed=1
+        reason="in-guest upgrade folded into the base"
+        folded=1
+    fi
+    rm -f "$WORK/upgrade.flat.raw" "$WORK/upgrade.writable.img"
+    fi
+fi
+
 if [ "$rebuild_synthetic" = 1 ]; then
     say "Rebuilding synthetic base disk — $reason"
     rm -f "$SYNTHETIC_DISK"
@@ -136,9 +229,8 @@ fi
 # after, so re-patching only ever modifies the rootfs (hda2/hda3).  /writable is
 # (re)initialised only when the base is built (first run / base rebuild).
 #   hda4 geometry mirrors make-synthetic-cf.py.
-HDA4_START=914872; HDA4_SECTORS=3006008; SECTOR=512
 preserved_hda4=""
-if [ "$patch_needed" = 1 ] && [ "$rebuild_synthetic" = 0 ] && [ -f "$PERSISTENT_DISK" ]; then
+if [ "$patch_needed" = 1 ] && [ "$rebuild_synthetic" = 0 ] && [ "$folded" != 1 ] && [ -f "$PERSISTENT_DISK" ]; then
     mkdir -p "$WORK"
     say "Preserving /writable (hda4) from the current overlay (re-patch will not reset it)"
     qemu-img convert -f qcow2 -O raw "$PERSISTENT_DISK" "$WORK/hda4.flat.raw"

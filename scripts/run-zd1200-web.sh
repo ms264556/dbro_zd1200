@@ -157,6 +157,15 @@ setsid env KERNEL="$patched_kernel" \
     INITRD="" \
     DISK_IMAGE="$persistent_disk" DISK_FORMAT=qcow2 DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
     ACCEL="$vm_accel" \
+    STATE_DIR="$state_dir" \
+    SYNTHETIC_DISK="$synthetic_disk" \
+    PERSISTENT_DISK="$persistent_disk" \
+    WORK="$state_dir/.rootfs-patch-work" \
+    ZD_SERIAL="$zd_serial" \
+    ZD_MAC1="$zd_mac1" \
+    ZD_MODEL="${ZD_MODEL:-ZD1200}" \
+    ZD_CUSTOMER="${ZD_CUSTOMER:-ruckus}" \
+    ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
     HTTP_PORT="$http_port" \
     HTTPS_PORT="$https_port" \
     NETWORK_MODE="$network_mode" \
@@ -356,5 +365,11 @@ while kill -0 "$qemu_pid" 2>/dev/null; do
     fi
 done
 
-echo "QEMU exited." >&2
+qemu_rc=0
+wait "$qemu_pid" 2>/dev/null || qemu_rc=$?
+if [ "$qemu_rc" -eq 0 ]; then
+    echo "Guest powered off; stopping the container."
+    exit 0
+fi
+echo "QEMU exited (status $qemu_rc)." >&2
 exit 1

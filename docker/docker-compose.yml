@@ -5,7 +5,11 @@ services:
       dockerfile: docker/Dockerfile
     image: local/zd1200-qemu
     container_name: ${ZD_CONTAINER_NAME:-zd1200}
-    restart: unless-stopped
+    # on-failure, not unless-stopped: a guest poweroff exits the entrypoint 0
+    # and must leave the container stopped, while a QEMU crash or entrypoint
+    # error (non-zero exit) still restarts it.  Trade-off: on-failure does not
+    # auto-start the container after a host reboot.
+    restart: on-failure
     init: true
 
     devices:
