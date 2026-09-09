@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build the ZD1200 boot area from the GRUB artifacts built by grub097_src/.
+"""Build the ZD1200 boot area from the GRUB artifacts built by guest-src/grub097_src/.
 
 `make-synthetic-cf.py` calls `build_bootfs()` and writes the returned bytes at
 sector 0 of the synthetic CF, so the boot area is derived on the fly — there is no
 bootfs image file in the repo.  It is built from the GPL-source GRUB binaries that
-`grub097_src/build.sh` compiles from upstream GRUB 0.97 + patches, so no vendor
+`guest-src/grub097_src/build.sh` compiles from upstream GRUB 0.97 + patches, so no vendor
 binaries are redistributed.  The layout it produces is the one
 `make-synthetic-cf.py` expects:
 
@@ -12,8 +12,8 @@ binaries are redistributed.  The layout it produces is the one
     sectors 1..61       the *installed* e2fs_stage1_5, raw (outside any fs)
     sectors 62..84567   hda1 ext2 filesystem (C1 = 84506 sectors, /boot)
 
-`grub097_src/out/lib/grub/i386-pc/` holds the build output (plus the `/boot`
-config files from `grub097_src/config/`): GRUB's uninstalled `stage1` /
+`guest-src/grub097_src/out/lib/grub/i386-pc/` holds the build output (plus the
+`/boot` config files from `guest-src/grub097_src/config/`): GRUB's uninstalled `stage1` /
 `stage1_5` and `stage2`.  Three things have to be done to make it bootable:
 
 1. **stage1 -> MBR.**  Patch stage1's on-disk fields exactly like GRUB's
@@ -48,7 +48,7 @@ import sys
 import tempfile
 
 BASE = Path(__file__).resolve().parent
-SRC = BASE / "grub097_src" / "out" / "lib" / "grub" / "i386-pc"
+SRC = BASE / "guest-src" / "grub097_src" / "out" / "lib" / "grub" / "i386-pc"
 
 SECTOR = 512
 H1, C1 = 62, 84506          # hda1 /boot: first sector, sector count (make-synthetic-cf.py)

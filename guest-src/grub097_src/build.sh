@@ -1,28 +1,12 @@
 #!/usr/bin/env bash
 #
-# Build GNU GRUB 0.97 (i386-pc stage1/stage2/stage1_5) on a modern x86_64 host.
-#
-# Three layers go on top of the pristine grub-0.97 tarball, in this order:
-#
-#   1. the build/boot-relevant subset of the Arch AUR `grub-legacy` patch
-#      series (patches/aur/), which is what makes 0.97 compile with a current
-#      gcc/autotools/binutils;
-#   2. one local fix (patches/local/): grub_printf/grub_sprintf used to walk the
-#      varargs with `int *dataptr = (int *) &format', which gcc >= 4.x breaks at
-#      -O1/-O2/-Os (the menu/config load then fails and GRUB drops to its
-#      command line); the patch uses the compiler's builtin varargs;
-#   3. the two Ruckus ZD1200 patches this repository needs
-#      (patches/ruckus/): grub-partition (ZD partition-table sector) and
-#      grub-recovery (the boot-retry/recovery state machine);
-#   4. the ZD1200 build options from the Ruckus buildroot profile, narrowed to
-#      ext2 only (reiserfs, FAT and every other filesystem disabled).
-#
-# The result is staged into out/lib/grub/i386-pc/ together with the /boot config
-# files from config/; that directory is what scripts/build-bootfs.py consumes
-# (build-container.sh runs this script before every image build).
+# Build GRUB 0.97 (i386-pc stage1/stage2/stage1_5) for the ZD1200 boot area and
+# stage it in out/lib/grub/i386-pc/ for scripts/build-bootfs.py.
 #
 # Usage: ./build.sh [--clean] [--force] [--jobs N]
+#   --clean   drop build/ and out/
 #   --force   rebuild even when the signature says the artifacts are current
+#   --jobs N  run make with N jobs
 #
 set -euo pipefail
 
@@ -32,22 +16,16 @@ BUILD_DIR="$BASE/build"
 OUT_DIR="$BASE/out"
 SRC_DIR="$BUILD_DIR/grub-0.97"
 OUT_GRUB="$OUT_DIR/lib/grub/i386-pc"
-# The /boot config files are not compiled; they live in config/ and are copied
-# into out/ so the directory is a complete, self-contained GRUB tree.
 CONFIG_SRC="$BASE/config"
 
 SRC_URL="https://alpha.gnu.org/gnu/grub/grub-0.97.tar.gz"
-# Same tarball Ruckus shipped in buildroot/dl/ and the AUR PKGBUILD fetches.
 SRC_SHA256="4e1d15d12dbd3e9208111d6b806ad5a9857ca8850c47877d36575b904559260b"
 
-# Ruckus patch level: BR2_PACKAGE_GRUB_BUILD="1.39" in profiles/zd1200/br2.config.
-# The Ruckus buildroot build seds it into configure's VERSION, which is what
-# puts "0.97.1.39" in the built stage1_5/stage2.  Do the same via AC_INIT.
+# Ruckus patch level: BR2_PACKAGE_GRUB_BUILD="1.39".
 GRUB_VERSION="0.97"
 GRUB_BUILD="1.39"
 
-# GRUB_FLAG from buildroot/package/grub/grub.mk, resolved for this repository:
-# ext2fs in; everything else (including reiserfs and FAT) out.
+# Ruckus GRUB_FLAG from buildroot/package/grub/grub.mk: ext2fs only.
 CONFIGURE_FLAGS=(
   --prefix=/usr
   --libdir=/usr/lib
@@ -75,7 +53,7 @@ die() { printf 'grub097: error: %s\n' "$*" >&2; exit 1; }
 log() { printf 'grub097: %s\n' "$*"; }
 
 usage() {
-  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -95,9 +73,7 @@ while [ $# -gt 0 ]; do
 done
 
 # --- up-to-date check --------------------------------------------------------
-# The signature covers everything that can change the output: this script, the
-# pinned tarball, every patch, and the /boot config files.  build-container.sh
-# calls this script on every run, so an unchanged tree is a no-op.
+# Signature covers this script, the tarball, every patch and the /boot config.
 signature() {
   {
     sha256sum "$BASE/build.sh"
@@ -134,15 +110,12 @@ need_tool patch
 need_tool objcopy
 need_tool tar
 need_tool sha256sum
-need_tool autoreconf "install autoconf + automake"
-need_tool makeinfo "install texinfo (docs build)"
 need_tool python3 "needed for the post-build self-check"
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   die "neither curl nor wget is available to download $SRC_URL"
 fi
 
-# configure prepends -m32 on x86_64 hosts, so 32-bit headers/libs are required
-# for the host-side tools (gcc-multilib + libc6-dev-i386 on Debian/Ubuntu).
+# configure adds -m32 on x86_64, so 32-bit headers/libs are required.
 if [ "$(uname -m)" = x86_64 ]; then
   printf 'int main(void){return 0;}\n' > "$BUILD_DIR/.m32.c"
   if ! gcc -m32 "$BUILD_DIR/.m32.c" -o "$BUILD_DIR/.m32" >/dev/null 2>&1; then
@@ -199,33 +172,32 @@ if find "$SRC_DIR" -name '*.rej' -o -name '*.orig' | grep -q .; then
 fi
 
 # ------------------------------------------------------------------- configure
-# Ruckus appends ".$(GRUB_BUILD)" to the version string.
-sed -i "s/^AC_INIT(\[GRUB\], \[$GRUB_VERSION\]/AC_INIT([GRUB], [$GRUB_VERSION.$GRUB_BUILD]/" \
-  "$SRC_DIR/configure.ac"
-grep -q "AC_INIT(\[GRUB\], \[$GRUB_VERSION\.$GRUB_BUILD\]" "$SRC_DIR/configure.ac" \
-  || die "could not set GRUB version to $GRUB_VERSION.$GRUB_BUILD"
-
-log "autoreconf -fiv"
-(cd "$SRC_DIR" && autoreconf -fiv >"$BUILD_DIR/autoreconf.log" 2>&1) \
-  || { tail -30 "$BUILD_DIR/autoreconf.log" >&2; die "autoreconf failed"; }
+grep -q "PACKAGE_VERSION='$GRUB_VERSION.$GRUB_BUILD'" "$SRC_DIR/configure" \
+  || die "configure is not $GRUB_VERSION.$GRUB_BUILD (is patches/local/0002 applied?)"
 
 log "configure (${CONFIGURE_FLAGS[*]})"
-# CFLAGS/LDFLAGS are cleared as in the AUR PKGBUILD: the patches (no-pie,
-# no-reorder-functions, no-combine-stack-adjustments, objcopy-absolute) put the
-# freestanding flags where they belong, and distro hardening flags break stage1/2.
-(cd "$SRC_DIR" && CFLAGS= LDFLAGS= ./configure "${CONFIGURE_FLAGS[@]}" \
-   >"$BUILD_DIR/configure.log" 2>&1) \
+# -no-pie: stage1/2 link at fixed addresses. --build-id=none: a build id makes
+# objcopy emit huge binaries.
+(cd "$SRC_DIR" && CFLAGS= LDFLAGS="-no-pie -Wl,--build-id=none" \
+   ./configure "${CONFIGURE_FLAGS[@]}" >"$BUILD_DIR/configure.log" 2>&1) \
   || { tail -30 "$BUILD_DIR/configure.log" >&2; die "configure failed"; }
 
-log "make -j$JOBS"
-(cd "$SRC_DIR" && make -j"$JOBS" >"$BUILD_DIR/make.log" 2>&1) \
-  || { tail -40 "$BUILD_DIR/make.log" >&2; die "make failed"; }
+# ------------------------------------------------------------------------ make
+run_make() {
+  local sub="$1"; shift
+  log "make -C $sub${*:+ $*}"
+  (cd "$SRC_DIR" && make -C "$sub" -j"$JOBS" "$@" >"$BUILD_DIR/make-$sub.log" 2>&1) \
+    || { tail -40 "$BUILD_DIR/make-$sub.log" >&2; die "make in $sub failed"; }
+}
+# Only what the boot area needs; stage2 links ../netboot/libdrivers.a.
+run_make netboot
+run_make stage2 stage2 e2fs_stage1_5
+run_make stage1 stage1
 
 # --------------------------------------------------------------------- staging
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_GRUB"
 
-# Everything the boot area needs: stage1, stage2 and the ext2 stage1_5.
 for f in stage1/stage1 \
          stage2/stage2 \
          stage2/e2fs_stage1_5; do
@@ -233,7 +205,6 @@ for f in stage1/stage1 \
   install -m 644 "$SRC_DIR/$f" "$OUT_GRUB/$(basename "$f")"
 done
 
-# Config files are not compiled; copy them from config/ so out/ is complete.
 for f in menu.lst default; do
   if [ -f "$CONFIG_SRC/$f" ]; then
     install -m 644 "$CONFIG_SRC/$f" "$OUT_GRUB/$f"

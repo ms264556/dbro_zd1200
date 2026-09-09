@@ -8,8 +8,8 @@ its own DHCP lease, answers mDNS, and serves the web UI and SSH.
 
 No firmware, vendor binaries or compiled GRUB binaries are committed. The
 vendor-derived artifacts are built into `image/` locally from your firmware
-archive, and the GRUB bootloader is compiled from source into `grub097_src/out/`
-by `build-container.sh`.
+archive, and the GRUB bootloader is compiled from source **inside the container
+image build** (its `grub-build` stage), so the host needs no compiler.
 
 ---
 
@@ -31,17 +31,8 @@ by `build-container.sh`.
   several minutes to boot instead of ~1–2.
 - Host tools for the prepare step: `tar`, `gzip`, `python3`, `md5sum`,
   `sha256sum` (coreutils) and `bash`.
-- Host tools to build the GRUB bootloader (once, and whenever `grub097_src/`
-  changes): `gcc` with 32-bit support, `make`, `patch`, `autoconf`, `automake`,
-  `texinfo` and `binutils`. On Debian/Ubuntu:
-
-  ```sh
-  sudo apt-get install -y build-essential autoconf automake texinfo \
-                          gcc-multilib libc6-dev-i386
-  ```
-
-  `grub097_src/build.sh` checks for all of these and names the missing package
-  (see `grub097_src/README.md`).
+- **No compiler or autotools.** GRUB is compiled inside the image build; the
+  host only needs Docker.
 
 ### Firmware
 
@@ -69,11 +60,10 @@ integrity, set `EXPECTED_ARCHIVE_SHA256`; the 10.5.1.0.282 payload is
 `64dfbf4d67cc65cafa0e258e426c664c7387b1219209ec893b9b1e41ab202cb8`.
 
 The GRUB bootloader is *not* taken from the firmware and is *not* committed as a
-binary: `build-container.sh` runs `grub097_src/build.sh`, which compiles it from
-the upstream GRUB 0.97 tarball plus the Arch AUR patches, one local fix and the
-two Ruckus patches this repo needs (provenance, patch list and host requirements
-are in `grub097_src/README.md`). The script no-ops when nothing changed, so only
-the first run (and GRUB source changes) pay for the build.
+binary: the container image build compiles it from the upstream GRUB 0.97 tarball
+plus the AUR, local and Ruckus patches (provenance and patch list in
+`guest-src/grub097_src/README.md`). It no-ops when nothing changed, so only the first build
+and GRUB source changes pay for it.
 
 ### The `image/` directory
 
@@ -158,16 +148,16 @@ firmware uses for watchdog and power handling.
 
 ## Boot test without the container
 
-`boot-test.sh` boots the prepared disk under a **direct QEMU** (KVM, a software
+`scripts/boot-test.sh` boots the prepared disk under a **direct QEMU** (KVM, a software
 IPMI BMC, user-mode networking — no macvtap, no LAN traffic) and watches the
 guest serial console until it reaches a milestone. It is the quick way to check
 a bootloader/rootfs change without disturbing the running container or the LAN.
 
 ```sh
-./boot-test.sh                                   # build + prepare + boot; pass when init runs
-./boot-test.sh --firmware ~/images/zd1200_*.img  # first run: also prepare image/
-./boot-test.sh --expect ready --timeout 300      # wait for the controller's READY marker
-./boot-test.sh --reuse --no-build                # re-boot the disks already prepared
+./scripts/boot-test.sh                          # build + prepare + boot; pass when init runs
+./scripts/boot-test.sh --firmware ~/images/zd1200_*.img  # first run: also prepare image/
+./scripts/boot-test.sh --expect ready --timeout 300      # wait for the controller's READY marker
+./scripts/boot-test.sh --reuse --no-build                # re-boot the disks already prepared
 ```
 
 Milestones, in order, detected on the guest serial console:
@@ -207,7 +197,7 @@ container's state volume is never touched.
   the disk on every start. The macvtap, the QEMU NIC and the DHCP sniffer all use
   the value read back, so a MAC changed in the appliance's web UI is honoured on
   the next start.
-- The `/boot` bootloader filesystem is built from `grub097_src/out/` by
+- The `/boot` bootloader filesystem is built from `guest-src/grub097_src/out/` by
   `scripts/build-bootfs.py` and written at sector 0 of the synthetic CF.
 - QEMU boots the guest with a macvtap (`mvt0`) on the host's physical NIC.
 - Re-runs are cheap: the coordinator records a signature (`rootfs`/`bootfs`/
@@ -240,7 +230,7 @@ usual knobs:
   i8042 reset, so a reboot from the web UI, CLI or `/sbin/reboot` completes and
   the container stays `Up`. Do not add `-no-reboot`.
 - **No in-guest firmware upgrades.** QEMU boots an external kernel, so a web-UI
-  upgrade would leave a mixed version. Update the archive/`grub097_src/` and
+  upgrade would leave a mixed version. Update the archive/`guest-src/` and
   rebuild instead.
 - **No NAT fallback.** The container shares the host's network namespace and the
   guest is a macvtap on the host NIC, so APs reach it directly on the LAN. A
@@ -263,16 +253,18 @@ Removes the container **and** the `zd1200-state` volume, so the next
 
 ```
 build-container.sh   the one entry point
-boot-test.sh         boot the prepared disk under QEMU and monitor the serial console
 docker/              Dockerfile, compose files, .env.example, Dockerfile.dockerignore
-scripts/             host prepare step + container entrypoint, guest-image prep, console helper
+scripts/             host prepare step, container entrypoint, guest-image prep, console
+                     helper, and boot-test.sh (boot the prepared disk under QEMU)
 patches/             ordered rootfs patches applied before each boot
-grub097_src/         GRUB 0.97 built from source (upstream + AUR/local/Ruckus patches)
+guest-src/           source projects compiled in the image build and placed into the
+                     guest disk image — currently grub097_src/ (GRUB 0.97, boot area)
 image/               vendor-derived artifacts built from your firmware (gitignored)
 ```
 
 ## License
 
-MIT — see `LICENSE`. The GRUB bootloader built by `grub097_src/` is
-**GPLv2-or-later**; see `grub097_src/COPYING` and `grub097_src/README.md` for the
-license and the corresponding-source offer.
+MIT — see `LICENSE`. The GRUB bootloader built by `guest-src/grub097_src/` is
+**GPLv2-or-later**; see `guest-src/grub097_src/COPYING` and
+`guest-src/grub097_src/README.md` for the license and the corresponding-source
+offer.

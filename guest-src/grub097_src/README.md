@@ -1,43 +1,48 @@
-# `grub097_src/` — build GRUB 0.97 for the ZD1200 boot area on a modern host
+# `guest-src/grub097_src/` — build GRUB 0.97 for the ZD1200 boot area
 
 This is where the ZD1200's GRUB 0.97 bootloader is built. No GRUB binary is
-committed to the repository: `build-container.sh` runs `build.sh`, which
-compiles the i386-pc artifacts from the pristine upstream `grub-0.97` tarball
-on a **current x86_64 host**, using:
+committed: the container image build (`docker/Dockerfile`, `grub-build` stage)
+runs `build.sh` in a throwaway builder, which applies these patches to the
+pristine upstream `grub-0.97` tarball:
 
 1. the **build/boot-relevant subset** of the Arch AUR `grub-legacy` patch series
-   — the parts that make 0.97 compile with a modern gcc / autotools / binutils;
-2. one local fix (see below) for GRUB's broken varargs stack walking;
+   — the parts that make 0.97 compile with a modern gcc / binutils;
+2. two local fixes (see below): GRUB's broken varargs stack walking, and the
+   AUR's autotools changes ported into the tarball's generated files;
 3. the two Ruckus ZD1200 patches this repository needs:
    `grub-partition` (partition table read from the ZD "pt sector") and
    `grub-recovery` (the boot-retry / recovery state machine);
 4. ext2 only — reiserfs, FAT and every other filesystem are compiled out.
 
 ```sh
-./grub097_src/build.sh            # ~20 s; fetch, patch, build, stage, self-check
-./grub097_src/build.sh --force    # rebuild even if the signature is unchanged
-./grub097_src/build.sh --clean    # drop build/ and out/
-./grub097_src/build.sh --jobs 4
+./guest-src/grub097_src/build.sh            # ~20 s; fetch, patch, build, stage, self-check
+./guest-src/grub097_src/build.sh --force    # rebuild even if the signature is unchanged
+./guest-src/grub097_src/build.sh --clean    # drop build/ and out/
+./guest-src/grub097_src/build.sh --jobs 4
+```
 
 `build.sh` is idempotent: it hashes itself, the pinned tarball, every patch and
-the `/boot` config files, and no-ops when `out/` already matches. `build-container.sh`
-calls it on every run, so repeat runs cost nothing.
-```
+the `/boot` config files, and no-ops when `out/` already matches. The container
+image build calls it once per image build, so repeat runs cost nothing (and the
+Docker layer is cached).
 
 ## Requirements
 
-A normal C toolchain plus the autotools (the AUR recipe runs `autoreconf -fiv`),
-`patch`, `objcopy`, `sha256sum`, `curl` or `wget`, and `texinfo` (the docs
-`make` step calls `makeinfo`). On x86_64, GRUB's configure adds `-m32`, so 32-bit
-headers and libraries are needed too:
+The container build needs **no host toolchain at all** — `build.sh` runs in the
+image's `grub-build` stage, which installs its own `gcc`/`make`/`patch`/`binutils`
+and discards them. Running `build.sh` directly on the host (development only)
+needs `gcc` with 32-bit support, `make`, `patch`, `binutils`, `python3` and
+`curl`; on Debian/Ubuntu:
 
 ```sh
-sudo apt-get install -y build-essential autoconf automake texinfo \
-                        gcc-multilib libc6-dev-i386
+sudo apt-get install -y gcc make patch binutils gcc-multilib libc6-dev-i386 \
+                        curl
 ```
 
 `build.sh` checks for all of these (and for a working `gcc -m32`) before it
-starts, and names the missing package instead of failing halfway.
+starts, and names the missing package instead of failing halfway. No autotools
+or texinfo are needed.
+
 
 ## What it produces
 
@@ -75,7 +80,9 @@ config/default              the saved-default state file GRUB writes (not compil
 patches/aur/series           ordered AUR patch list (subset, PKGBUILD order)
 patches/aur/*.patch          the 9 AUR patches that are used
 patches/local/series         ordered local-fix list
-patches/local/*.patch        the local varargs fix (see below)
+patches/local/0001-*.patch   the local varargs fix (see below)
+patches/local/0002-*.patch   the AUR changes ported into the tarball's generated
+                             configure/Makefile.in, so no autotools are needed
 patches/ruckus/series        ordered Ruckus patch list
 patches/ruckus/*.patch       grub-partition.patch, grub-recovery.patch
 COPYING                      GPLv2 (GRUB's license)
@@ -139,9 +146,18 @@ The patch replaces the stack walking with the compiler's builtin varargs
 (`__builtin_va_list`/`__builtin_va_start`/`__builtin_va_arg`/`__builtin_va_end`
 — `stdarg.h` is unavailable because GRUB builds with `-nostdinc`) and makes
 `convert_to_ascii`'s value an explicit `unsigned long` parameter; every caller
-already passed it. Verified by `boot-test.sh`: before the patch the guest
+already passed it. Verified by `scripts/boot-test.sh`: before the patch the guest
 stopped at the GRUB prompt with an empty serial console, after it the guest
 reaches `init` and the controller's READY marker.
+
+## Local fix: `patches/local/0002-modern-toolchain-in-generated-files.patch`
+
+Ports the AUR `configure.ac`/`Makefile.am` changes into the tarball's
+pre-generated `configure`/`Makefile.in` (version string, objcopy probes and
+rules, `STAGE1_CFLAGS`/`STAGE2_CFLAGS`/`GRUB_CFLAGS`), so no autotools are
+needed. `build.sh` passes `LDFLAGS="-no-pie -Wl,--build-id=none"`, which is what
+those AUR checks used to append. The artifacts are byte-identical to a build that
+regenerates the autotools output.
 
 ## Provenance
 
@@ -168,7 +184,7 @@ For reference, the two builds differ as follows:
 |---|---|---|
 | toolchain | Ruckus cross i386 (2008-era gcc/binutils) | host gcc 15.2.0 + binutils, `-m32` |
 | Ruckus patches | all 6 (`any-ipmi`, `e1000`, `partition`, `recovery`, `10-ledcontrol`, `20-led-zd5000`) | the 2 this repo needs (`partition`, `recovery`) |
-| modern-host patches | none | the 9-patch AUR subset + the local varargs fix |
+| modern-host patches | none | the 9-patch AUR subset + 2 local fixes (varargs, generated-file flags) |
 | filesystems | ext2 + reiserfs | ext2 only |
 | version string | `0.97.1.39` | `0.97.1.39` (preserved via `AC_INIT`) |
 | `stage1` | `77c1024a…` | `77c1024a…` (identical) |
@@ -185,23 +201,24 @@ the platform-0 value **3982101**. `scripts/build-bootfs.py` keeps rewriting that
 immediate to the ZD1200's **3927001** (`ZD_PART_SECTOR_ZD1200`) when it builds
 the boot area.
 
-The host-side `grub` shell that `make` also builds segfaults when it enters the
-simulated stage2 on this host (Ubuntu 26.04, gcc 15, glibc 2.43) — the same
-happens with the full unpruned AUR series, so it is not caused by the pruning.
-Nothing in the container uses that shell; only `stage1`, `stage2` and
-`e2fs_stage1_5` are written to the boot area.
+The host-side `grub` shell segfaults when it enters the simulated stage2 on a
+modern host (Ubuntu 26.04, gcc 15, glibc 2.43) — the same happens with the full
+unpruned AUR series, so it is not caused by the pruning. `build.sh` therefore no
+longer builds it (or `util/`) at all; nothing in the container uses those tools,
+and only `stage1`, `stage2` and `e2fs_stage1_5` are written to the boot area.
 
 ## How it is used
 
-`build-container.sh` runs `build.sh`, then the Dockerfile copies
-`grub097_src/out/` into the image at `/opt/zd1200/grub097_src/out/`, where
-`scripts/build-bootfs.py` reads it (and `scripts/apply-rootfs-patches.sh`
+The container image build runs `build.sh` in its `grub-build` stage and copies
+the resulting `guest-src/grub097_src/out/` into the image at
+`/opt/zd1200/guest-src/grub097_src/out/`,
+where `scripts/build-bootfs.py` reads it (and `scripts/apply-rootfs-patches.sh`
 includes it in the boot-area signature, so a GRUB change rebuilds the synthetic
-CF). Verified end-to-end with `boot-test.sh`:
+CF). Verified end-to-end with `scripts/boot-test.sh`:
 
 ```
 ./build-container.sh --no-up     # builds GRUB (if changed) + the container image
-./boot-test.sh --expect ready    # PASS: grub 2s, kernel 2s, init 7s, ready 30s
+./scripts/boot-test.sh --expect ready    # PASS: grub 2s, kernel 2s, init 7s, ready 30s
 ```
 
 ## License / GPL compliance

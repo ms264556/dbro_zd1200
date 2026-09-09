@@ -40,10 +40,10 @@ __pycache__/
 .reasonix/
 reasonix.toml
 
-# grub097_src/ build products (rebuilt by grub097_src/build.sh)
-grub097_src/dl/
-grub097_src/build/
-grub097_src/out/
+# guest-src/ build products (rebuilt by each project's build script)
+guest-src/*/dl/
+guest-src/*/build/
+guest-src/*/out/
 
-# boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
+# scripts/boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
 .boot-test/

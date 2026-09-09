@@ -16,7 +16,7 @@
 #   4. watch the log for the milestones grub -> kernel -> init -> controller ->
 #      ready and stop at the requested one.
 #
-# Usage: ./boot-test.sh [options]
+# Usage: ./scripts/boot-test.sh [options]
 #   --firmware PATH   ZD1200 firmware .img (passed to build-container.sh; only
 #                     needed when image/ has not been prepared yet)
 #   --expect LEVEL    grub | kernel | init | controller | ready  (default: init)
@@ -33,8 +33,8 @@
 # <state-dir>/serial.log.
 set -euo pipefail
 
-cd "$(dirname "$0")"
-repo="$PWD"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
 
 expect="init"
 timeout_s=420

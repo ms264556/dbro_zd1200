@@ -1,3 +1,5 @@
 # Local fixes that are not in the Arch AUR series or the Ruckus tree.
 # Applied after patches/aur/ and before patches/ruckus/.
 0001-fix-varargs-hacks.patch
+# AUR configure.ac/Makefile.am changes, ported into the generated configure/Makefile.in.
+0002-modern-toolchain-in-generated-files.patch
