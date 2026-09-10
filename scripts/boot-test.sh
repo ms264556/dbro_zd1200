@@ -177,6 +177,10 @@ fi
 # --- 3. boot it under QEMU ---------------------------------------------------
 log="$state_dir/serial.log"
 qemu_err="$state_dir/qemu.stderr.log"
+# SeaBIOS writes its early debug output to the QEMU debug console port 0x402.
+# Nothing claims that port by default, so those writes are discarded; capture
+# them next to the serial log so firmware-level bring-up failures are visible.
+debugcon_log="$state_dir/debugcon.log"
 : > "$log"
 
 case "$accel" in
@@ -225,6 +229,8 @@ setsid qemu-system-i386 \
   "${net_args[@]}" \
   -device ipmi-bmc-sim,id=bmc0 \
   -device isa-ipmi-kcs,id=isa0,bmc=bmc0 \
+  -chardev "file,id=dbgcon0,path=$debugcon_log" \
+  -device isa-debugcon,iobase=0x402,chardev=dbgcon0 \
   -display none \
   "${serial_args[@]}" \
   >"$qemu_err" 2>&1 </dev/null &

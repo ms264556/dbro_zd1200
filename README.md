@@ -140,7 +140,9 @@ docker exec -it zd1200 python3 /opt/zd1200/attach-console.py
 ```
 
 QEMU also exposes an IPMI BMC (`ipmi-bmc-sim` + `isa-ipmi-kcs`), which the
-firmware uses for watchdog and power handling.
+firmware uses for watchdog and power handling, and a debug console
+(`isa-debugcon`) on port 0x402, where the firmware's pre-console output
+(SeaBIOS) is captured to `/tmp/zd1200-debugcon.log` instead of being dropped.
 
 ---
 
@@ -173,8 +175,9 @@ Milestones, in order, detected on the guest serial console:
 Exit status 0 means the requested milestone was reached; 1 means it was not
 (timeout, QEMU exited, or a fatal guest error such as `Error 17: Cannot mount
 selected partition` / `Kernel panic`). The serial log is kept at
-`.boot-test/serial.log` (gitignored), and each milestone is printed with its
-elapsed time.
+`.boot-test/serial.log` (gitignored), the firmware's pre-console debug output
+at `.boot-test/debugcon.log`, and each milestone is printed with its elapsed
+time.
 
 `--reboot` goes further: once the milestone is reached it drives the guest
 serial console (declining the setup wizard and logging in) and runs `reboot`,

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Patch the ZD1200 2.6.32 kernel for QEMU and rebuild the bzImage.
 
-The stock kernel drives the watchdog, board-data queries and halt through
-ZD1200 hardware that QEMU does not emulate, so those paths have to be patched
-out before boot.
+The stock kernel talks to the appliance's board hardware: a Super-I/O/BMC
+register window at I/O ports 0x2e/0x2f (configuration mode is entered by writing
+0x87 twice, the chip identifies itself as 0xa0 in register 0x20, and the driver
+programs GPIO and device registers behind that), plus board-specific
+reset/watchdog registers.  QEMU's '-machine pc' claims none of it - every read
+of port 0x2f returns 0xff - so the driver concludes the board controller is
+missing and takes the arms it reserves for a broken appliance: halt the box,
+pulse the hardware reset line, skip setting up a hardware interface.  Those arms
+have to be patched out before boot; each patch below is one of them.
 
 Patches are located by byte signature, not by address: the kernel is relinked
 for every release, so the same function moves.  Each patch carries the entry
@@ -42,23 +48,65 @@ from pathlib import Path
 # "??" as a wildcard; patch_hex is written at patch_offset inside the match.
 # When rel32_exit is non-zero, patch_hex is only the 0xe9 opcode and the
 # displacement is computed from the exit jump at match+rel32_exit.
+#
+# The signatures describe the *stock* bytes, so they match a vendor kernel only:
+# re-running this against an already patched bzImage reports every site as NOT
+# FOUND.  (To locate a site in a patched image, mask the bytes patch_hex
+# overwrites, as the board_data_retry comment notes.)
+#
+# The comment above each entry says what the target does and when it runs, since
+# that is what decides whether the patch is still needed after a firmware bump.
 PATCHES = [
+    # kernel_halt() is the vendor's "halt the appliance" routine, exported under
+    # that name: it stores a halt state, walks the reboot-notifier list and
+    # prints "<0>System halted." before tail-calling the platform halt hook.
+    # Most of its call sites are the failure arm of the board chip probe -
+    #     out 0x2e,0x87 twice / out 0x2e,0x20 / in 0x2f / cmp al,0xa0 / call kernel_halt
+    # plus a couple in .init.text - so under QEMU, where that probe always reads
+    # 0xff, the guest would halt during early init.  (It dies of "BUG: scheduling
+    # while atomic" first: the halt path schedules while the driver still holds
+    # its board lock.)  Overwriting the entry (mov eax,2 -> ret) makes a failed
+    # probe fall through to the driver's "chip absent" continuation instead.
     ("kernel_halt",
      "b80200000083ec04e8????????e8????????c70424????????e8????????83c404e9????????",
      0, bytes.fromhex("c3"),
-     "kernel_halt(): no appliance power controller", 0),
+     "kernel_halt(): a failed board-chip probe must not halt the guest", 0),
+    # rks_pkt_trace_init() is the init-time hook that creates the Ruckus "tif0"
+    # packet-trace/fastpath interface; it logs "<3>%s failed to create tif0." or
+    # "<3>%s create tif0 successfully."  Returning 0 straight away leaves the
+    # interface uncreated, which is what the emulated box wants.
     ("rks_pkt_trace_init",
      "83ec08e8????????85c0741fc7442404????????c70424????????e8????????e8????????31c083c408c3",
      0, bytes.fromhex("31c0c3"),
-     "rks_pkt_trace_init(): skip tif0 path", 0),
+     "rks_pkt_trace_init(): do not create the tif0 interface", 0),
+    # The COB7402 board's physical reset/watchdog routine.  It reads the board
+    # state and, for states 1 and 3, drives the board's device window - a runtime
+    # I/O base: +0x2a gets 0x40 with a poll of bit 6, +0x38 gets a reset pulse
+    # with the port-0x61 handshake.  It has no direct callers (the BSP reaches it
+    # through a pointer), and none of that window exists under QEMU, so make it a
+    # no-op that returns 0 and let QEMU supervise reset/termination.
     ("cob7402_reset_watchdog",
      "5383ec08e8????????83f801741283f803",
      0, bytes.fromhex("31c0c3"),
-     "COB7402 reset/watchdog function -> no-op", 0),
+     "COB7402 board reset/watchdog routine -> no-op", 0),
+    # The "u-watchdog timeout" block inside nar5520_wdt_thread().  The thread
+    # runs the block whenever a per-loop `jle` finds the driver's u-watchdog
+    # counter (a plain .data counter, re-armed to 0x7a by the driver's own kick
+    # entry points) expired: on a real appliance that means nothing kicked it in
+    # time and the board data is about to be refreshed to the CF card.  Under
+    # QEMU nothing kicks it, so the counter sits at or below zero for the whole
+    # run and, unpatched, every loop iteration prints "warning: u-watchdog
+    # timeout, system may reboot", calls through the driver's function-pointer
+    # hook with 1, and calls the CF-card board-data helper for device "9" -
+    # roughly 22 log entries a second, and all of it invisible on the console
+    # because GRUB boots with "quiet" and the message is a bare printk (level 4).
+    # patch_offset 9 is the block's first instruction (mov dword [esp],<warning
+    # string>); rewriting it as a jmp to the target of the block's own exit jump
+    # (hence rel32_exit) skips the warning and both calls.
     ("board_data_retry",
      "31c083c4185b5e5fc3c70424????????e8????????b801000000e8????????b8????????e8????????e9????????",
      9, bytes.fromhex("e9"),
-     "skip physical board-data retry/recovery path", 41),
+     "nar5520_wdt_thread(): skip the u-watchdog timeout retry block", 41),
 ]
 
 

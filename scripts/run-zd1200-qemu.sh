@@ -198,6 +198,18 @@ if [ "${ZD_IPMI:-1}" != "0" ]; then
     ipmi_args+=( -device isa-ipmi-kcs,id=isa0,bmc=bmc0 )
 fi
 
+# SeaBIOS writes its early debug output to the QEMU debug console port 0x402.
+# Nothing claims that port by default, so those writes are dropped and
+# firmware-level bring-up failures (before the kernel has a console) leave no
+# trace.  Attach an isa-debugcon on 0x402 and append what it prints to a log
+# next to the console log.  Set ZD_DEBUGCON=0 to disable.
+debugcon_args=()
+if [ "${ZD_DEBUGCON:-1}" != "0" ]; then
+    debugcon_log="${ZD_DEBUGCON_LOG:-/tmp/zd1200-debugcon.log}"
+    debugcon_args=( -chardev "file,id=dbgcon0,path=$debugcon_log,append=on"
+                    -device isa-debugcon,iobase=0x402,chardev=dbgcon0 )
+fi
+
 # Interactive console (ttyS0).  The guest kernel boots with console=ttyS0 and
 # /etc/inittab runs `/dev/console::respawn:/bin/login.sh` on it, so this is the
 # SAME console the ZD1200 CLI login is presented on.  We forward it to a QEMU
@@ -247,6 +259,7 @@ qemu_args=(
     "${net_args[@]}"
     "${nic_args[@]}"
     "${ipmi_args[@]}"
+    "${debugcon_args[@]}"
     "${console_args[@]}"
     "${pacing_args[@]}"
     "${debug_args[@]}"
