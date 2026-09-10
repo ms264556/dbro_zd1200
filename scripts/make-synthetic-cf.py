@@ -80,8 +80,11 @@ def seed_writable_config(ext2_path):
             f"write {passwd_src} /etc/config/passwd",
             f"write {shadow_src} /etc/config/shadow",
             "set_inode_field /etc/config/shadow mode 0100640"]
-    cmdfile = base / ".seed-writable.cmds"
-    cmdfile.write_text("\n".join(cmds) + "\n")
+    # Write the debugfs command file somewhere writable: BASE (/opt/zd1200 in
+    # the container) is read-only when this runs as an unprivileged user.
+    with tempfile.NamedTemporaryFile("w", suffix=".cmds", delete=False) as handle:
+        handle.write("\n".join(cmds) + "\n")
+        cmdfile = Path(handle.name)
     try:
         subprocess.run(["debugfs", "-w", "-f", str(cmdfile), ext2_path],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

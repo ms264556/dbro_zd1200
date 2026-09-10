@@ -156,6 +156,8 @@ a bootloader/rootfs change without disturbing the running container or the LAN.
 ./scripts/boot-test.sh --firmware ~/images/zd1200_*.img  # first run: also prepare image/
 ./scripts/boot-test.sh --expect ready --timeout 300      # wait for the controller's READY marker
 ./scripts/boot-test.sh --reuse --no-build                # re-boot the disks already prepared
+./scripts/boot-test.sh --cpu n270 --machine pc,acpi=off  # pick the QEMU CPU / machine spec
+./scripts/boot-test.sh --reboot --expect ready           # also reboot the guest and re-check READY
 ```
 
 Milestones, in order, detected on the guest serial console:
@@ -173,6 +175,14 @@ Exit status 0 means the requested milestone was reached; 1 means it was not
 selected partition` / `Kernel panic`). The serial log is kept at
 `.boot-test/serial.log` (gitignored), and each milestone is printed with its
 elapsed time.
+
+`--reboot` goes further: once the milestone is reached it drives the guest
+serial console (declining the setup wizard and logging in) and runs `reboot`,
+then requires the guest to reach the milestone again. That exercises the
+kernel's `machine_restart` path, not just boot. The console login comes from
+`dropbear-provision/{passwd,shadow}` (a gitignored local input) seeded into
+`/writable`; set `ZD_CONSOLE_USER`/`ZD_CONSOLE_PASSWORD` to use another
+account. A freshly seeded appliance logs in as `admin`/`admin`.
 
 It runs `build-container.sh --no-up` to build the container image, prepares the
 synthetic CF + qcow2 overlay in `.boot-test/` using the container's own

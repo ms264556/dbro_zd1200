@@ -40,7 +40,7 @@ services:
       - "c *:* rwm"
 
     environment:
-      CPU_MODEL: pentium3
+      CPU_MODEL: n270
       MEMORY_MB: "2048"
       NETWORK_MODE: macvtap
       ZD_HOST_NET: "1"

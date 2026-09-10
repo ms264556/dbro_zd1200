@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Patch the ZD1200 2.6.32 kernel for QEMU and rebuild the bzImage.
 
-The stock kernel drives the watchdog, board-data queries and halt/restart
-through ZD1200 hardware that QEMU does not emulate, so those paths have to be
-patched out before boot.
+The stock kernel drives the watchdog, board-data queries and halt through
+ZD1200 hardware that QEMU does not emulate, so those paths have to be patched
+out before boot.
 
 Patches are located by byte signature, not by address: the kernel is relinked
 for every release, so the same function moves.  Each patch carries the entry
@@ -51,10 +51,6 @@ PATCHES = [
      "83ec08e8????????85c0741fc7442404????????c70424????????e8????????e8????????31c083c408c3",
      0, bytes.fromhex("31c0c3"),
      "rks_pkt_trace_init(): skip tif0 path", 0),
-    ("machine_restart",
-     "??ec04c70424????????e8????????8b0d????????85c97506ff15????????c705????????00000000ff15????????83c404c3",
-     0, bytes.fromhex("b0fee664f4ebfd"),
-     "machine_restart(): request a QEMU i8042 system reset (mov al,0xfe; out 0x64; hlt; jmp $)", 0),
     ("cob7402_reset_watchdog",
      "5383ec08e8????????83f801741283f803",
      0, bytes.fromhex("31c0c3"),

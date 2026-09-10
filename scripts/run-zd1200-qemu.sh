@@ -233,8 +233,10 @@ fi
 qemu_args=(
     -name zd1200-10.5.1-lab
     "${accel_args[@]}"
-    -machine pc
-    -cpu "${CPU_MODEL:-pentium3}"
+    # acpi=off: the cob7402 board has no ACPI.
+    -machine pc,acpi=off
+    # n270: ZD1200's CPU is a similar ATOM E3800 series.
+    -cpu "${CPU_MODEL:-n270}"
     -m "${MEMORY_MB:-2048}"
     -smp 1
     "${initrd_args[@]}"

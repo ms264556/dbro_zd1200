@@ -26,6 +26,11 @@
 #   --state-dir DIR   state dir for the disks/log (default: ./.boot-test)
 #   --no-build        skip step 1 (use the container image as-is)
 #   --reuse           skip step 2 (reuse the disks already in the state dir)
+#   --cpu MODEL       QEMU -cpu model (default: $CPU_MODEL or n270)
+#   --machine SPEC    QEMU -machine spec (default: pc,acpi=off)
+#   --reboot          after the milestone, reboot the guest over its serial
+#                     console and require it to reach the milestone again
+#                     (exercises the kernel machine_restart path)
 #   -h | --help
 #
 # Exit status: 0 = reached the requested milestone, 1 = did not (timeout, QEMU
@@ -44,6 +49,9 @@ state_dir="$repo/.boot-test"
 firmware=""
 do_build=1
 do_prepare=1
+cpu="${CPU_MODEL:-n270}"
+machine="${MACHINE:-pc,acpi=off}"
+do_reboot=0
 
 # Milestones in order.  The strings are what the guest actually prints (see a
 # known-good boot: GRUB's menu line, GRUB's kernel-load line, the init script
@@ -66,7 +74,7 @@ fatal_patterns=(
   "Error 1[0-9]: "
 )
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -78,6 +86,9 @@ while [ $# -gt 0 ]; do
     --state-dir) state_dir="${2:?--state-dir needs a path}"; shift 2 ;;
     --no-build) do_build=0; shift ;;
     --reuse) do_prepare=0; shift ;;
+    --cpu) cpu="${2:?--cpu needs a model}"; shift 2 ;;
+    --machine) machine="${2:?--machine needs a spec}"; shift 2 ;;
+    --reboot) do_reboot=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "boot-test: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -127,6 +138,12 @@ if [ "$do_prepare" = 1 ]; then
   [ -d "$cert_dir" ] || die "signing cert dir missing: $cert_dir (set ZD_SIGN_CERT_HOST)"
 
   say "preparing the synthetic CF + qcow2 overlay in $state_dir (container)"
+  # Optional login seed: make-synthetic-cf.py seeds /writable/etc/config from
+  # dropbear-provision/{passwd,shadow} when present (a gitignored local input).
+  # Mounted read-only so the guest console/CLI can be logged into (--reboot).
+  seed_args=()
+  [ -d "$repo/dropbear-provision" ] \
+    && seed_args=( -v "$repo/dropbear-provision:/opt/zd1200/dropbear-provision:ro" )
   docker run --rm --init \
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp \
@@ -136,6 +153,7 @@ if [ "$do_prepare" = 1 ]; then
     -e ZD_SIGN_CERT_DIR=/opt/zd1200/signing-cert \
     -v "$repo/image:/opt/zd1200/image:ro" \
     -v "$cert_dir:/opt/zd1200/signing-cert:ro" \
+    "${seed_args[@]}" \
     -v "$state_dir:/var/lib/zd1200" \
     --entrypoint /opt/zd1200/apply-rootfs-patches.sh \
     "$image"
@@ -180,12 +198,24 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-say "booting $overlay under QEMU ($accel, net=$net_mode, IPMI BMC, serial -> $log)"
+# --reboot needs an input path to the guest console, so the serial is a socket
+# chardev (with the same logfile) instead of a write-only file.  wait=off keeps
+# QEMU from blocking until a client attaches.
+console_sock=""
+serial_args=( -serial "file:$log" )
+if [ "$do_reboot" = 1 ]; then
+  console_sock="$state_dir/console.sock"
+  rm -f "$console_sock"
+  serial_args=( -chardev "socket,id=con0,path=$console_sock,server=on,wait=off,logfile=$log,logappend=on"
+                -serial chardev:con0 )
+fi
+
+say "booting $overlay under QEMU ($accel, net=$net_mode, machine=$machine, cpu=$cpu, IPMI BMC, serial -> $log)"
 setsid qemu-system-i386 \
   -name zd1200-boot-test \
   -accel "$accel" \
-  -machine pc \
-  -cpu pentium3 \
+  -machine "$machine" \
+  -cpu "$cpu" \
   -m "${MEMORY_MB:-2048}" \
   -smp 1 \
   -device ich9-ahci,id=ahci \
@@ -196,7 +226,7 @@ setsid qemu-system-i386 \
   -device ipmi-bmc-sim,id=bmc0 \
   -device isa-ipmi-kcs,id=isa0,bmc=bmc0 \
   -display none \
-  -serial "file:$log" \
+  "${serial_args[@]}" \
   >"$qemu_err" 2>&1 </dev/null &
 qemu_pid=$!
 
@@ -217,7 +247,39 @@ while :; do
   if [ -n "${at[$expect_idx]:-}" ]; then
     say "PASS — reached '$target' after ${at[$expect_idx]}s"
     printf '   serial log: %s\n' "$log"
-    exit 0
+    [ "$do_reboot" = 0 ] && exit 0
+
+    # Reboot the guest from its own console and require it to reach the target
+    # again.  This is what the kernel's machine_restart path drives: a broken
+    # machine_restart leaves the guest hung, so the second boot never happens.
+    say "rebooting the guest over its serial console (machine_restart)"
+    if ! python3 "$repo/scripts/console-reboot.py" "$console_sock" \
+         >"$state_dir/console-reboot.log" 2>&1; then
+      say "FAIL — could not drive the guest console to reboot"
+      tail -40 "$state_dir/console-reboot.log" >&2
+      exit 1
+    fi
+    before=$(grep -cF -- "${patterns[$expect_idx]}" "$log" 2>/dev/null || true)
+    reboot_start=$SECONDS
+    say "waiting for the guest to reboot and reach '$target' again"
+    while :; do
+      now=$(grep -cF -- "${patterns[$expect_idx]}" "$log" 2>/dev/null || true)
+      if [ "${now:-0}" -gt "${before:-0}" ]; then
+        say "PASS — guest rebooted and reached '$target' again after $((SECONDS - reboot_start))s"
+        exit 0
+      fi
+      if ! kill -0 "$qemu_pid" 2>/dev/null; then
+        say "FAIL — QEMU exited during the reboot (stderr: $qemu_err)"
+        tail -40 "$log" >&2
+        exit 1
+      fi
+      if (( SECONDS - reboot_start >= timeout_s )); then
+        say "FAIL — guest did not come back after the reboot within ${timeout_s}s"
+        tail -40 "$log" >&2
+        exit 1
+      fi
+      sleep 0.5
+    done
   fi
   for fatal in "${fatal_patterns[@]}"; do
     if grep -qE -- "$fatal" "$log" 2>/dev/null; then
