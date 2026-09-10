@@ -1,3 +1,12 @@
+# Advanced alternative to the dedicated-USB-adapter profile.
+#
+# Use this complete Compose file on its own:
+#   docker compose -f docker-compose.macvlan.yml up -d --build
+#
+# The macvlan interface is bridged to QEMU's private TAP inside the container,
+# so the ZoneDirector guest owns the LAN identity and management address. The
+# Docker host normally cannot talk directly to macvlan guests; use a separate
+# management station on the selected VLAN.
 services:
   zd1200-prepare:
     platform: ${ZD_HOST_PLATFORM:-linux/amd64}
@@ -6,6 +15,7 @@ services:
       dockerfile: Dockerfile
     image: local/zd1200-qemu:lab
     restart: "no"
+    network_mode: none
     environment:
       ZD_VENDOR_ARCHIVE: ${ZD_VENDOR_ARCHIVE:?Set ZD_VENDOR_ARCHIVE to the basename of the downloaded ZD archive in ./vendor}
       ZD_VIRTUAL_BUILD_ID: ${ZD_VIRTUAL_BUILD_ID:-}
@@ -16,9 +26,6 @@ services:
         target: /source-git
         read_only: true
         bind:
-          # Portainer keeps its Git checkout inside the Portainer container;
-          # create the optional host-side path when that checkout is not
-          # available to the Docker daemon.
           create_host_path: true
       - zd1200-runtime:/runtime
     entrypoint: ["/opt/zd1200/prepare-compose-runtime.sh"]
@@ -41,37 +48,26 @@ services:
       - /dev/kvm:/dev/kvm
       - /dev/net/tun:/dev/net/tun
 
-    # The optional host/zd1200-bridge service creates the TAP device.
-    network_mode: host
+    networks:
+      zd1200-macvlan: {}
 
     environment:
       CPU_MODEL: pentium3
       MEMORY_MB: "2048"
-      NETWORK_MODE: tap
+      NETWORK_MODE: bridge
+      # Docker names the macvlan attachment eth0 inside this container.
+      BRIDGE_UPLINK_IF: eth0
       TAP_IF: ${ZD_TAP_IF:-tap-zd}
-      # `auto` disables HTTP probing for the normal TAP network and enables it
-      # for user-mode networking. Guest addressing belongs to the ZD wizard.
       WEB_PROBE: ${ZD_WEB_PROBE:-auto}
-      # Optional board identity override. Set both values, or leave both empty
-      # to generate and retain a unique locally administered identity.
       ZD_SERIAL: ${ZD_SERIAL:-}
       ZD_MAC1: ${ZD_MAC1:-}
-      # Keep RSA; optionally advertise an additional ECDSA host key.
       ZD_ENABLE_ECDSA_SSH: ${ZD_ENABLE_ECDSA_SSH:-0}
-      # Opt-in local diagnostic root CLI; it adds no network listener.
       ZD_ENABLE_ROOT_CLI: ${ZD_ENABLE_ROOT_CLI:-0}
-      # Optional single-line OpenSSH public key; enables root SSH on port 2222
-      # only for release manifests that explicitly support vendor Dropbear.
       ZD_ROOT_SSH_PUBLIC_KEY: ${ZD_ROOT_SSH_PUBLIC_KEY:-}
-      # Optional finite support entitlement end date (YYYY-MM-DD).
       ZD_SUPPORT_ENTITLEMENT_END: ${ZD_SUPPORT_ENTITLEMENT_END:-}
-      # Semicolon-separated opt-in client targets: MAC|IPv4|friendly name.
       ZD_PING_CLIENT_TARGETS: ${ZD_PING_CLIENT_TARGETS:-}
-      # Initial Ping Monitor timing. Page settings persist in ZD and override
-      # these defaults after the first save.
       ZD_PING_INTERVAL_SECONDS: ${ZD_PING_INTERVAL_SECONDS:-60}
       ZD_SNAPSHOT_INTERVAL_SECONDS: ${ZD_SNAPSHOT_INTERVAL_SECONDS:-60}
-      # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
       KERNEL_EXTRA: nohz=off
       WEB_WAIT_SECONDS: "600"
       VM_SNAPSHOT: "0"
@@ -82,14 +78,10 @@ services:
 
     cap_drop:
       - ALL
-    # QEMU must issue TUNSETIFF for the pre-created TAP device. Keep the
-    # privilege narrow: the container retains no other Linux capabilities.
     cap_add:
       - NET_ADMIN
     security_opt:
       - no-new-privileges:true
-    # Allow the launcher to request the guest's stock orderly shutdown and
-    # wait for its repository/filesystem flush before terminating QEMU.
     stop_grace_period: 2m
 
     healthcheck:
@@ -104,3 +96,14 @@ volumes:
     name: ${ZD_RUNTIME_VOLUME:-zd1200-runtime}
   zd1200-state:
     name: ${ZD_STATE_VOLUME:-zd1200-state}
+
+networks:
+  zd1200-macvlan:
+    name: ${ZD_MACVLAN_NETWORK_NAME:-zd1200-macvlan}
+    driver: macvlan
+    driver_opts:
+      parent: ${ZD_MACVLAN_PARENT:?Set ZD_MACVLAN_PARENT to the Docker host interface carrying the intended management VLAN}
+    ipam:
+      config:
+        - subnet: ${ZD_MACVLAN_SUBNET:?Set ZD_MACVLAN_SUBNET, for example 192.168.222.0/24}
+          gateway: ${ZD_MACVLAN_GATEWAY:?Set ZD_MACVLAN_GATEWAY for the selected subnet}

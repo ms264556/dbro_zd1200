@@ -9,16 +9,17 @@ started_at=$SECONDS
 high_cpu_samples=0
 ready=0
 http_status=""
-gdb_port="${GDB_PORT:-$((21000 + $$ % 1000))}"
 http_port="${HTTP_PORT:-38080}"
 https_port="${HTTPS_PORT-38443}"
 network_mode="${NETWORK_MODE:-user}"
-guest_ip="${GUEST_IP:-192.168.10.20}"
+web_probe="${WEB_PROBE:-auto}"
 state_dir="${STATE_DIR:-$work_dir}"
 synthetic_disk="${SYNTHETIC_DISK:-$state_dir/synthetic-cf.img}"
 persistent_disk="${PERSISTENT_DISK:-$state_dir/zd1200-vm.qcow2}"
+patched_kernel="${PATCHED_KERNEL:-$state_dir/bzImage.patched}"
 vm_snapshot="${VM_SNAPSHOT:-0}"
 cpu_limit="${CPU_LIMIT:-}"
+control_socket="${CONTROL_SOCKET:-/tmp/zd1200-control.sock}"
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     vm_accel=kvm
 else
@@ -32,17 +33,43 @@ cleanup() {
             kill "$limiter_pid" 2>/dev/null || true
             wait "$limiter_pid" 2>/dev/null || true
         fi
+        # Ask the guest's stock PID 1 to perform its normal repository flush
+        # and shutdown sequence. The patched restart path resets QEMU after
+        # that sequence, so stop QEMU as soon as the serial restart marker is
+        # visible rather than allowing the next boot to proceed.
+        if [ -S "$control_socket" ]; then
+            marker_start=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+            if python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(sys.argv[1]); s.sendall(b"reboot\n"); s.close()' \
+                "$control_socket" 2>/dev/null; then
+                echo "Requested orderly ZoneDirector guest shutdown."
+                for _ in {1..90}; do
+                    if tail -n "+$((marker_start + 1))" "$log_file" 2>/dev/null \
+                        | grep -q 'Restarting system\.'; then
+                        echo "ZoneDirector guest completed its shutdown sequence."
+                        break
+                    fi
+                    kill -0 "$qemu_pid" 2>/dev/null || break
+                    sleep 1
+                done
+            fi
+        fi
         kill -CONT -- "-$qemu_pid" 2>/dev/null || true
         kill -TERM -- "-$qemu_pid" 2>/dev/null || true
-        for _ in {1..20}; do
+        for _ in {1..100}; do
             kill -0 "$qemu_pid" 2>/dev/null || break
             sleep 0.1
         done
         kill -KILL -- "-$qemu_pid" 2>/dev/null || true
         wait "$qemu_pid" 2>/dev/null || true
     fi
+    rm -f -- "$control_socket"
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+    cleanup
+    exit 0
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 cd "$work_dir" || exit 1
 mkdir -p "$state_dir"
@@ -53,43 +80,53 @@ if [ ! -f image/bootinitramfs.gz ]; then
 fi
 runtime_initrd="${RUNTIME_INITRD:-$state_dir/bootinitramfs.runtime.gz}"
 RUNTIME_INITRD="$runtime_initrd" "$work_dir/make-runtime-initrd.sh"
-if ! command -v gdb >/dev/null 2>&1; then
-    echo "gdb is required" >&2
-    exit 1
-fi
 if ! command -v qemu-img >/dev/null 2>&1; then
     echo "qemu-img is required" >&2
     exit 1
 fi
+echo "Preparing signature-patched kernel ..."
+python3 "$work_dir/patch_binary_artifact.py" \
+    --artifact zd1200_kernel_elf \
+    --in "$work_dir/image/bzImage" \
+    --out "$patched_kernel" \
+    --vmlinux "$work_dir/image/vmlinux"
 if [ ! -f "$synthetic_disk" ]; then
     echo "Creating persistent synthetic CF base image in $state_dir ..."
     SYNTHETIC_DISK="$synthetic_disk" python3 "$work_dir/make-synthetic-cf.py"
 fi
+# The serial number and MACs live in the board-data records on the CF image
+# (read by the kernel's v54bsp driver; NOT patched into the kernel).  When an
+# operator does not explicitly set both values, create one unique local
+# identity in the persistent state volume. MAC2 = MAC1 + 1.
+IFS=$'\t' read -r identity_serial identity_mac identity_source < <(
+    python3 "$work_dir/zd_identity.py" --state-dir "$state_dir" \
+        --serial "${ZD_SERIAL:-}" --mac "${ZD_MAC1:-}"
+)
+echo "Board identity: $identity_serial / $identity_mac ($identity_source)"
+python3 "$work_dir/write-boarddata.py" \
+    --disk "$synthetic_disk" \
+    --serial "$identity_serial" \
+    --mac "$identity_mac" \
+    --model "${ZD_MODEL:-ZD1200}" \
+    --customer "${ZD_CUSTOMER:-ruckus}"
 if [ ! -f "$persistent_disk" ]; then
     qemu-img create -q -f qcow2 -F raw -b "$synthetic_disk" "$persistent_disk"
     echo "Created persistent VM disk overlay: $persistent_disk"
 fi
 
 : > "$log_file"
-setsid env INITRD="$runtime_initrd" \
+setsid env KERNEL="$patched_kernel" INITRD="$runtime_initrd" \
     DISK_IMAGE="$persistent_disk" DISK_FORMAT=qcow2 DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
     ACCEL="$vm_accel" \
-    GDB_PORT="$gdb_port" \
     HTTP_PORT="$http_port" \
     HTTPS_PORT="$https_port" \
     NETWORK_MODE="$network_mode" \
     TAP_IF="${TAP_IF:-tap-zd}" \
-    DEBUG=1 nice -n 10 ./run-zd1200-qemu.sh \
+    CONTROL_SOCKET="$control_socket" \
+    QEMU_NIC_MAC="$identity_mac" \
+    nice -n 10 ./run-zd1200-qemu.sh \
     >>"$log_file" 2>&1 </dev/null &
 qemu_pid=$!
-
-sleep 3
-
-timeout "${GDB_TIMEOUT:-30}s" gdb -q -batch image/vmlinux \
-    -ex 'set architecture i386' \
-    -ex "target remote :$gdb_port" \
-    -x zd1200-patch.gdb \
-    >/tmp/zd1200-web-gdb.log 2>&1 || true
 
 # CPU_LIMIT is opt-in for KVM. TCG retains its historical 60% safety cap.
 if [ -z "$cpu_limit" ] && [ "$vm_accel" = tcg ]; then
@@ -105,25 +142,50 @@ if [ -n "$cpu_limit" ]; then
     echo "QEMU CPU duty cycle capped at ${cpu_limit}% while the VM runs."
 fi
 
-echo "ZD1200 is starting; waiting for the web service..."
+case "$web_probe" in
+    auto)
+        if [ "$network_mode" = tap ] || [ "$network_mode" = bridge ]; then
+            web_probe=off
+        else
+            web_probe=on
+        fi
+        ;;
+    on|off) ;;
+    *)
+        echo "WEB_PROBE must be auto, on, or off." >&2
+        exit 2
+        ;;
+esac
+
 wait_seconds="${WEB_WAIT_SECONDS:-${WEB_WAIT_LOOPS:-180}}"
 if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]] || (( wait_seconds < 1 )); then
     echo "WEB_WAIT_SECONDS must be a positive integer." >&2
     exit 2
 fi
-if [ -n "$cpu_limit" ]; then
+if [ "$web_probe" = off ]; then
+    echo "ZD1200 is starting with external web readiness checks."
+    echo "First setup without DHCP: https://192.168.0.2/"
+    echo "Set the permanent guest address in the ZoneDirector wizard."
+    echo "The TAP bridge is intentionally unnumbered on the Docker host."
+    ready=1
+elif [ -n "$cpu_limit" ]; then
+    echo "ZD1200 is starting; waiting for the web service..."
     echo "Startup is CPU-limited and has a ${wait_seconds}s readiness deadline."
 else
+    echo "ZD1200 is starting; waiting for the web service..."
     echo "Startup runs at full speed and has a ${wait_seconds}s readiness deadline."
 fi
-if [ "$network_mode" = tap ]; then
-    probe_base="https://$guest_ip"
-else
-    probe_base="https://127.0.0.1:$https_port"
+if [ "$web_probe" != off ]; then
+    if [ "$network_mode" = tap ] || [ "$network_mode" = bridge ]; then
+        echo "WEB_PROBE=on is not supported with NETWORK_MODE=$network_mode; use auto or off." >&2
+        exit 2
+    else
+        probe_base="https://127.0.0.1:$https_port"
+    fi
 fi
 deadline=$((SECONDS + wait_seconds))
 next_notice=$((SECONDS + 30))
-while (( SECONDS < deadline )); do
+while (( ready == 0 && SECONDS < deadline )); do
     http_status="$(curl -ksS --max-time 3 -o /tmp/zd1200-login.html \
         -w '%{http_code}' \
         "$probe_base/admin10/login.jsp" \
