@@ -6,7 +6,7 @@ this turns one into the gzip-TAR payload the rest of the tooling consumes.  It
 performs no networking and writes its output atomically.
 
 Usage:
-    ruckus_tac_decrypt.py <encrypted .img> <output .tgz>
+    tac-decrypt.py <encrypted .img> <output .tgz>
 """
 
 from __future__ import annotations

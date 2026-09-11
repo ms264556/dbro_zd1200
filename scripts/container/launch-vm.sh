@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NOTE: This is the container's GUEST LAUNCHER. It is invoked by
-# run-zd1200-web.sh (the container entrypoint) — do NOT run it directly on the
+# entrypoint.sh (the container entrypoint) — do NOT run it directly on the
 # host. The supported way to run this project is `sudo ./build-container.sh`
 # (= docker compose up -d --build). See README.md.
 set -u
@@ -35,7 +35,7 @@ if [ -n "$initrd" ] && [ ! -f "$initrd" ]; then
 fi
 
 if [ "$disk_image" = "$synthetic_disk" ] && [ ! -f "$synthetic_disk" ]; then
-    python3 "$work_dir/make-synthetic-cf.py"
+    python3 "$work_dir/build-synthetic-cf.py"
 fi
 if [ ! -f "$disk_image" ]; then
     echo "Missing disk image: $disk_image" >&2
@@ -140,9 +140,9 @@ if [ "${SNAPSHOT:-1}" = "1" ]; then
     snapshot_args+=( -snapshot )
 fi
 
-# Reboot/upgrade loop: QEMU runs once per guest boot under qemu-run.py, which
+# Reboot/upgrade loop: QEMU runs once per guest boot under qemu-once.py, which
 # passes -no-reboot and reports a guest reset as exit 10 and a guest poweroff as
-# exit 0.  Before each launch apply-rootfs-patches.sh re-applies the kernel and
+# exit 0.  Before each launch prepare-vm-disks.sh re-applies the kernel and
 # rootfs patches when the guest upgraded (or the base/patch set changed); it
 # no-ops otherwise.  A poweroff ends the loop and the container.
 
@@ -214,14 +214,14 @@ fi
 # /etc/inittab runs `/dev/console::respawn:/bin/login.sh` on it, so this is the
 # SAME console the ZD1200 CLI login is presented on.  We forward it to a QEMU
 # chardev that (1) appends every byte to $ZD_CONSOLE_LOG so the entrypoint's
-# READY detection (grep on /tmp/zd1200-web.log) and `docker exec … tail -f`
+# READY detection (grep on /tmp/zd1200-console.log) and `docker exec … tail -f`
 # keep working, and (2) serves an interactive socket so you can attach to the
 # login prompt.  Set ZD_CONSOLE=0 for the old -nographic behaviour (console ->
 # stdio -> the entrypoint's log only, not interactive).
 console_args=()
 if [ "${ZD_CONSOLE:-1}" != "0" ]; then
     console_sock="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}"
-    console_log="${ZD_CONSOLE_LOG:-/tmp/zd1200-web.log}"
+    console_log="${ZD_CONSOLE_LOG:-/tmp/zd1200-console.log}"
     # 'path=' for a unix socket (default); 'host='/'port=' for a TCP listener
     # when ZD_CONSOLE_SOCK looks like host:port (e.g. 127.0.0.1:5555).
     if [[ "$console_sock" == *":"* && "$console_sock" != *"/"* ]]; then
@@ -243,7 +243,7 @@ fi
 # root=/dev/sda2|sda3, so the disk naming has to match for a menu rewrite to
 # stay bootable.
 qemu_args=(
-    -name zd1200-10.5.1-lab
+    -name zd1200-vm
     "${accel_args[@]}"
     # acpi=off: the cob7402 board has no ACPI.
     -machine pc,acpi=off
@@ -266,10 +266,10 @@ qemu_args=(
 )
 
 while :; do
-    if [ "${ZD_REPREP:-1}" = "1" ] && [ -x "$work_dir/apply-rootfs-patches.sh" ]; then
-        "$work_dir/apply-rootfs-patches.sh" || exit 1
+    if [ "${ZD_REPREP:-1}" = "1" ] && [ -x "$work_dir/prepare-vm-disks.sh" ]; then
+        "$work_dir/prepare-vm-disks.sh" || exit 1
     fi
-    python3 "$work_dir/qemu-run.py" "${qemu_args[@]}"
+    python3 "$work_dir/qemu-once.py" "${qemu_args[@]}"
     rc=$?
     if [ "$rc" -ne 10 ]; then
         exit "$rc"

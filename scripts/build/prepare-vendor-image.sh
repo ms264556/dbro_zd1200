@@ -5,7 +5,7 @@
 # material is redistributed.
 set -euo pipefail
 
-work_dir="$(cd "$(dirname "$0")/.." && pwd)"   # repo root: image/ lives there
+work_dir="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root: image/ lives there
 archive_path="${1:-}"
 # Optional payload-integrity gate: set EXPECTED_ARCHIVE_SHA256 to enforce a
 # specific (decrypted payload) hash; leave empty to accept any compatible build.
@@ -22,7 +22,7 @@ for command in tar gzip python3 md5sum sha256sum; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 
-staging="$(mktemp -d "${TMPDIR:-/tmp}/zd1051-vendor.XXXXXX")"
+staging="$(mktemp -d "${TMPDIR:-/tmp}/zd1200-vendor.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 
 # The downloaded firmware is TAC-encrypted; decrypt it to the gzip-TAR payload
@@ -30,7 +30,7 @@ trap 'rm -rf "$staging"' EXIT
 payload="$archive_path"
 if ! gzip -t "$archive_path" >/dev/null 2>&1; then
     payload="$staging/payload.tgz"
-    python3 "$work_dir/scripts/ruckus_tac_decrypt.py" "$archive_path" "$payload" \
+    python3 "$work_dir/scripts/build/tac-decrypt.py" "$archive_path" "$payload" \
         || fail "could not decrypt $archive_path"
 fi
 
@@ -90,7 +90,7 @@ cp -f "$source_dir/rootfs.i386.ext2.director1200.img" "$output_dir/rootfs.ext2"
 # The ZD1200 firmware-signing cert payload (image-signing / upgrade-entitlement
 # bypass cert) ships in the vendor archive.  Extract it into image/signing-cert/
 # so the container can mount it at /opt/zd1200/signing-cert for
-# patches/20 - PatchSigningLicense.sh (the license).  Override with ZD_SIGN_CERT_HOST if you
+# scripts/container/patches/20-signing-license.sh (the license).  Override with ZD_SIGN_CERT_HOST if you
 # have a specific cert.  Missing files are warned, not fatal (the guest then
 # boots without the license).
 signing_out="$output_dir/signing-cert"
@@ -104,7 +104,7 @@ for f in signing_cert.pem digital_sig_sha256.bin digital_sig_sha384.bin all_chec
 done
 # The vendor ships the two signature blobs 0600 (owner-only); make them readable
 # so the container (which runs under user-namespace remap, not host-root) can
-# read them during patches/20 - PatchSigningLicense.sh.  Public signing material, not a secret.
+# read them during scripts/container/patches/20-signing-license.sh.  Public signing material, not a secret.
 chmod 644 "$signing_out"/* 2>/dev/null || true
 python3 - "$output_dir/rootfs.ext2" <<'PY'
 import sys
@@ -150,9 +150,9 @@ else:
     raise SystemExit("could not locate an ELF kernel inside bzImage")
 PY
 
-tar -C "$source_dir" -czf "$output_dir/zd1051-payload.tar.gz" \
+tar -C "$source_dir" -czf "$output_dir/zd1200-payload.tar.gz" \
     firmwares aidfs ap-models file_list.txt
 
 echo "Prepared local vendor-derived artifacts in $output_dir"
 sha256sum "$output_dir/bzImage" "$output_dir/vmlinux" "$output_dir/rootfs.ext2" \
-    "$output_dir/restoreinitramfs.gz" "$output_dir/zd1051-payload.tar.gz"
+    "$output_dir/restoreinitramfs.gz" "$output_dir/zd1200-payload.tar.gz"

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Build the ZD1200 boot area from the GRUB binaries the firmware ships.
 
-`make-synthetic-cf.py` calls `build_bootfs()` and writes the returned bytes at
+`build-synthetic-cf.py` calls `build_bootfs()` and writes the returned bytes at
 sector 0 of the synthetic CF, so the boot area is derived on the fly — there is no
 bootfs image file in the repo.  GRUB's `stage1`/`stage2`/`e2fs_stage1_5` are taken
 straight out of the firmware's factory-restore initramfs
 (`image/restoreinitramfs.gz`, `lib/grub/i386-pc/`), which already carries the
 ZD1200 pt sector; `menu.lst` comes from the firmware archive (`image/menu.lst`)
 and the saved-default file is generated.  The layout it produces is the one
-`make-synthetic-cf.py` expects:
+`build-synthetic-cf.py` expects:
 
     sector 0            MBR  = GRUB stage1 (patched) + partition-table area + 0x55AA
     sectors 1..61       the *installed* e2fs_stage1_5, raw (outside any fs)
@@ -66,7 +66,7 @@ GRUB_FILES = ("stage1", "stage2", "e2fs_stage1_5")
 CONFIG_FILES = ("menu.lst", "default")
 
 SECTOR = 512
-H1, C1 = 62, 84506          # hda1 /boot: first sector, sector count (make-synthetic-cf.py)
+H1, C1 = 62, 84506          # hda1 /boot: first sector, sector count (build-synthetic-cf.py)
 GAP_SECTORS = H1 - 1        # sectors 1..61, between the MBR and hda1
 BOOT_AREA = (H1 + C1) * SECTOR
 
@@ -120,7 +120,7 @@ SBIN_DIR = "/sbin"
 FILES = GRUB_FILES + CONFIG_FILES
 
 # The guest enumerates the CF as /dev/sda (QEMU AHCI controller; see
-# run-zd1200-qemu.sh), so the vendor's own menu template is used verbatim:
+# launch-vm.sh), so the vendor's own menu template is used verbatim:
 # current = root A = sda2, backup = root B = sda3.  That is exactly the menu
 # ac_upg.sh:_upg_boot installs when it rewrites the boot area, so the bootfs and
 # the post-upgrade menu never diverge.
@@ -160,7 +160,7 @@ def extract_grub() -> dict:
     /boot/sbin/grub-set-default to move the saved default).
     """
     check(INITRAMFS.is_file(),
-          f"missing {INITRAMFS} — run scripts/prepare-vendor-image.sh")
+          f"missing {INITRAMFS} — run scripts/build/prepare-vendor-image.sh")
     wanted = {f"{GRUB_INITRAMFS_DIR}/{n}": n for n in GRUB_FILES}
     found = {}
     with gzip.open(INITRAMFS, "rb") as fh:
@@ -200,7 +200,7 @@ def build_default(entry: int = 0) -> bytes:
 
 def read_sources() -> dict:
     out = extract_grub()
-    check(MENU_LST.is_file(), f"missing {MENU_LST} — run scripts/prepare-vendor-image.sh")
+    check(MENU_LST.is_file(), f"missing {MENU_LST} — run scripts/build/prepare-vendor-image.sh")
     out["menu.lst"] = MENU_LST.read_bytes()
     out["default"] = build_default()
     return out

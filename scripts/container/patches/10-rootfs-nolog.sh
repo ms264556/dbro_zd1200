@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 #
-# 10 - PatchRootfsNolog.sh — patch files inside the ZD1200 lab VM rootfs partitions,
-# writing the result into the qcow2 overlay only.  Runs as a standard user:
+# 10-rootfs-nolog.sh — patch files inside the ZD1200 lab VM rootfs partitions,
+# writing the result into the flat disk.  Runs as a standard user:
 # no root, no loop devices, no nbd, no mount.
 #
-#   read  : qemu-img convert  (overlay + backing file -> flat raw view)
+#   read  : dd                (the flat disk is read directly)
 #           debugfs           (userspace ext2 reader/writer)
-#   write : qemu-io           (writes only the changed byte ranges into the
-#                              qcow2 overlay; the backing file is untouched)
+#   write : dd                (writes only the changed byte ranges back to the
+#                              disk)
 #
-# Usage:  run from the patches/ pipeline via apply-rootfs-patches.sh
-# (QCOW=<overlay.qcow2> WORK=<workdir> ./"10 - PatchRootfsNolog.sh")
+# Usage:  run from the patches/ pipeline via prepare-vm-disks.sh
+# (QCOW=<flat-disk> WORK=<workdir> ./"10-rootfs-nolog.sh")
 #
 # Configure PARTITIONS and PATCHES below.  Each PATCHES entry is
 #   <rootfs-path>|<sed-expression>
 # and is applied to every listed partition that contains the file.  Only byte
-# ranges that actually change are written back, so the overlay stays small and
+# ranges that actually change are written back, so the disk stays small and
 # re-runs are idempotent (a file that is already patched is left alone).
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/zd1200-vm.qcow2}"
-# Work dir holds two ~2 GiB flatten files, so keep it on disk-backed storage
+QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
+# Work dir holds the partition scratch images, so keep it on disk-backed storage
 # (a small /tmp tmpfs fills up; the repo dir is on real disk).
 WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
 
-# name|start_sector|sector_count   (mirrors make-synthetic-cf.py; hda1 is the
+# name|start_sector|sector_count   (mirrors build-synthetic-cf.py; hda1 is the
 # /boot seed and is deliberately not patched — it never boots as a root fs)
 PARTITIONS=(
     "hda2|84568|415152"
@@ -48,8 +48,8 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 say() { printf '\n== %s\n' "$*"; }
 
-say "flattening overlay+backing to $WORK/flat.raw"
-qemu-img convert -f qcow2 -O raw "$QCOW" "$WORK/flat.raw"
+say "reading the flat disk $QCOW"
+ln -sf "$QCOW" "$WORK/flat.raw"
 
 patched_any=0
 for part in "${PARTITIONS[@]}"; do
@@ -107,11 +107,11 @@ for part in "${PARTITIONS[@]}"; do
         if [ "$type_old" != "$type_new" ] || [ "$mode_old" != "$mode_new" ] \
            || [ "$uid_old" != "$uid_new" ] || [ "$gid_old" != "$gid_new" ]; then
             echo "  !! inode metadata mismatch after write: type $type_old->$type_new mode $mode_old->$mode_new uid $uid_old->$uid_new gid $gid_old->$gid_new" >&2
-            echo "  !! aborting before writing anything to the overlay" >&2
+            echo "  !! aborting before writing anything to the disk" >&2
             exit 1
         fi
 
-        # verify the file content round-trips before anything hits the overlay
+        # verify the file content round-trips before anything hits the disk
         debugfs -R "dump $fspath $WORK/file.check" "$WORK/$name.img" 2>/dev/null
         if ! cmp -s "$WORK/file.check" "$WORK/file.new"; then
             echo "  !! content verification failed for $fspath on $name; aborting" >&2
@@ -137,7 +137,7 @@ for s, e in runs:
 PYEOF
 
         if [ ! -s "$WORK/$name.runs" ]; then
-            echo "  no byte changes for $fspath (already patched in overlay?)"
+            echo "  no byte changes for $fspath (already patched on the disk?)"
             continue
         fi
 
@@ -146,36 +146,36 @@ PYEOF
             dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
                skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
             abs_off=$((abs_start + off))
-            echo "  qemu-io: $len bytes at offset $abs_off"
-            qemu-io -f qcow2 -c "write -s $WORK/chunk.bin $abs_off $len" "$QCOW" >/dev/null
+            echo "  write: $len bytes at offset $abs_off"
+            dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN seek=$((abs_off / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
         done < "$WORK/$name.runs"
         patched_any=1
     done
 done
 
 if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing was written to the overlay"
+    say "no patch produced changes; nothing was written to the disk"
     exit 0
 fi
 
-say "verifying: re-flattening overlay and comparing each partition"
-qemu-img convert -f qcow2 -O raw "$QCOW" "$WORK/flat.verify.raw"
+say "verifying: re-reading the disk and comparing each partition"
+ln -sf "$QCOW" "$WORK/flat.verify.raw"
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
        skip="$start" count="$sectors" status=none
     if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: overlay now matches the patched partition image"
+        echo "OK   $name: disk now matches the patched partition image"
     else
-        echo "FAIL $name: overlay does not match the patched partition image" >&2
+        echo "FAIL $name: disk does not match the patched partition image" >&2
         exit 1
     fi
 done
 
 for patch in "${PATCHES[@]}"; do
     IFS='|' read -r fspath _ <<< "$patch"
-    say "patched content of $fspath (as read back through the overlay):"
+    say "patched content of $fspath (as read back through the disk):"
     debugfs -R "cat $fspath" "$WORK/hda2.verify.img" 2>/dev/null | grep -n -E 'nolog|mount -o' || true
 done
 
-say "done — patches applied to $QCOW; backing file untouched"
+say "done — patches applied to $QCOW"

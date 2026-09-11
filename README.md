@@ -42,13 +42,13 @@ zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
 ```
 
 Pass that file to `build-container.sh` as-is. The download is TAC-encrypted, and
-`scripts/prepare-vendor-image.sh` decrypts it with
-`scripts/ruckus_tac_decrypt.py` before extracting. The decrypted payload is a
+`scripts/build/prepare-vendor-image.sh` decrypts it with
+`scripts/build/tac-decrypt.py` before extracting. The decrypted payload is a
 gzipped tar containing `metadata`, `bzImage`,
 `rootfs.i386.ext2.director1200.img`, `restoreinitramfs.gz`, `firmwares/` and the
 AP models list.
 
-Any ZD1200 release works — `scripts/prepare-vendor-image.sh` validates the
+Any ZD1200 release works — `scripts/build/prepare-vendor-image.sh` validates the
 `metadata` (`REQUIRE_PLATFORM=nar5520`, `REQUIRE_SUBPLATFORM=cob7402`) and the
 kernel/rootfs MD5s, and does not pin a version. The prepared artifacts land in
 `image/` (gitignored).
@@ -59,18 +59,18 @@ integrity, set `EXPECTED_ARCHIVE_SHA256`; the 10.5.1.0.282 payload is
 
 The GRUB bootloader is taken from the firmware: its factory-restore initramfs
 ships `stage1`/`stage2`/`e2fs_stage1_5` (already built for the ZD1200's partition
-layout), and `scripts/build-bootfs.py` writes them into the boot area together
+layout), and `scripts/container/build-bootfs.py` writes them into the boot area together
 with `menu.lst` from the firmware archive and a generated saved-default file.
 Nothing is compiled and nothing is committed.
 
 ### The `image/` directory
 
-`build-container.sh` runs `scripts/prepare-vendor-image.sh` once to unpack the
+`build-container.sh` runs `scripts/build/prepare-vendor-image.sh` once to unpack the
 firmware archive into `image/` at the repo root (gitignored). It holds the
 vendor-derived `rootfs.ext2`, `bzImage`, `restoreinitramfs.gz`, the signing-cert
 payload and the AP firmware payload, and is mounted read-only into the container
 at `/opt/zd1200/image`. Later runs reuse it; delete the directory (or re-run
-`scripts/prepare-vendor-image.sh <archive>`) to extract again.
+`scripts/build/prepare-vendor-image.sh <archive>`) to extract again.
 
 ---
 
@@ -87,7 +87,7 @@ Watch it boot:
 
 ```sh
 docker logs -f zd1200
-docker exec zd1200 tail -f /tmp/zd1200-web.log     # guest serial console
+docker exec zd1200 tail -f /tmp/zd1200-console.log     # guest serial console
 ```
 
 The container reports `Up (healthy)` once the guest prints
@@ -132,7 +132,7 @@ get on the physical box). It is logged, and also exposed interactively:
 
 ```sh
 # raw console log (also what the healthcheck greps)
-docker exec zd1200 tail -f /tmp/zd1200-web.log
+docker exec zd1200 tail -f /tmp/zd1200-console.log
 
 # interactive console (ZD1200 CLI login prompt)
 docker exec -it zd1200 python3 /opt/zd1200/attach-console.py
@@ -148,18 +148,18 @@ firmware uses for watchdog and power handling, and a debug console
 
 ## Boot test without the container
 
-`scripts/boot-test.sh` boots the prepared disk under a **direct QEMU** (KVM, a software
+`scripts/test/boot-test.sh` boots the prepared disk under a **direct QEMU** (KVM, a software
 IPMI BMC, user-mode networking — no macvtap, no LAN traffic) and watches the
 guest serial console until it reaches a milestone. It is the quick way to check
 a bootloader/rootfs change without disturbing the running container or the LAN.
 
 ```sh
-./scripts/boot-test.sh                          # build + prepare + boot; pass when init runs
-./scripts/boot-test.sh --firmware ~/images/zd1200_*.img  # first run: also prepare image/
-./scripts/boot-test.sh --expect ready --timeout 300      # wait for the controller's READY marker
-./scripts/boot-test.sh --reuse --no-build                # re-boot the disks already prepared
-./scripts/boot-test.sh --cpu n270 --machine pc,acpi=off  # pick the QEMU CPU / machine spec
-./scripts/boot-test.sh --reboot --expect ready           # also reboot the guest and re-check READY
+./scripts/test/boot-test.sh                          # build + prepare + boot; pass when init runs
+./scripts/test/boot-test.sh --firmware ~/images/zd1200_*.img  # first run: also prepare image/
+./scripts/test/boot-test.sh --expect ready --timeout 300      # wait for the controller's READY marker
+./scripts/test/boot-test.sh --reuse --no-build                # re-boot the disks already prepared
+./scripts/test/boot-test.sh --cpu n270 --machine pc,acpi=off  # pick the QEMU CPU / machine spec
+./scripts/test/boot-test.sh --reboot --expect ready           # also reboot the guest and re-check READY
 ```
 
 Milestones, in order, detected on the guest serial console:
@@ -188,8 +188,8 @@ kernel's `machine_restart` path, not just boot. The console login comes from
 account. A freshly seeded appliance logs in as `admin`/`admin`.
 
 It runs `build-container.sh --no-up` to build the container image, prepares the
-synthetic CF + qcow2 overlay in `.boot-test/` using the container's own
-`apply-rootfs-patches.sh`, then boots that overlay on the host. The running
+synthetic CF disk in `.boot-test/` using the container's own
+`prepare-vm-disks.sh`, then boots that disk on the host. The running
 container's state volume is never touched.
 
 ---
@@ -199,20 +199,27 @@ container's state volume is never touched.
 - `docker/Dockerfile` builds a Debian image with QEMU and the guest-image
   tooling; `docker/docker-compose.yml` runs it with `network_mode: host`, the
   `NET_ADMIN`/`MKNOD`/`NET_RAW` capabilities and the `zd1200-state` volume.
-- On start, the entrypoint (`scripts/run-zd1200-web.sh`) patches the kernel for
-  QEMU, then `scripts/apply-rootfs-patches.sh` builds the synthetic CompactFlash
-  (`scripts/make-synthetic-cf.py` + `scripts/write-boarddata.py`), creates the
-  persistent qcow2 overlay and runs the ordered patches in `patches/`.
+- On start, `scripts/container/prepare-vm-disks.sh` builds the synthetic CompactFlash
+  (`scripts/container/build-synthetic-cf.py` + `scripts/container/write-boarddata.py`) if it is
+  missing or the prepared firmware changed, then applies the QEMU kernel patch and the
+  ordered patches in `scripts/container/patches/` to whichever root partitions lack the
+  current sentinel (`/etc/.zd-image`). The flat CF image *is* the live disk — there is no
+  qcow2 overlay.
 - The board data (serial + MACs) is **authoritative**: it is seeded into the CF
-  when the base disk is built, and `scripts/read-boarddata.py` reads it back from
+  when the base disk is built, and `scripts/container/read-boarddata.py` reads it back from
   the disk on every start. The macvtap, the QEMU NIC and the DHCP sniffer all use
   the value read back, so a MAC changed in the appliance's web UI is honoured on
   the next start.
 - The `/boot` bootloader filesystem is built from the firmware's GRUB binaries by
-  `scripts/build-bootfs.py` and written at sector 0 of the synthetic CF.
+  `scripts/container/build-bootfs.py` and written at sector 0 of the synthetic CF.
+- The root partitions are laid down from `image/rootfs.ext2`, `resize2fs`'d to fill
+  the partition (as the vendor install does), and `/writable` is seeded the way a
+  firmware install leaves it: the AP images + web `aidfs` staged from the `image/`
+  payload.
 - QEMU boots the guest with a macvtap (`mvt0`) on the host's physical NIC.
-- Re-runs are cheap: the coordinator records a signature (`rootfs`/`bootfs`/
-  `patches` hashes) in the state volume and no-ops when nothing changed.
+- Re-runs are cheap: each root partition records the patch set it was customised
+  with in `/etc/.zd-image`, so a start where nothing changed just re-reads two
+  sentinels and exits.
 
 ## Configuration
 
@@ -237,16 +244,18 @@ usual knobs:
   appliance's web UI takes effect on the next start. Re-seeding it (new
   `ZD_CONTAINER_MAC`, or pinning `ZD_BOARDDATA_FROM_MAC=0` with
   `ZD_SERIAL`/`ZD_MAC1`) needs a fresh state volume (see *Factory reset*).
-- **The guest reboots by relaunching QEMU.** `run-zd1200-qemu.sh` runs QEMU once
-  per guest boot under `scripts/qemu-run.py`, which passes `-no-reboot` and maps
+- **The guest reboots by relaunching QEMU.** `launch-vm.sh` runs QEMU once
+  per guest boot under `scripts/container/qemu-once.py`, which passes `-no-reboot` and maps
   the QMP `guest-reset` event to exit 10: the loop re-applies the patches and
   relaunches QEMU. A guest poweroff maps to exit 0 and stops the container
   (compose `restart: on-failure`, so a clean exit is not restarted).
-- **In-guest firmware upgrades work.** A web-UI upgrade writes the new image to
-  the spare root partition and reboots; the loop detects it (the `duplicate`
-  marker on `/writable`), folds the upgraded partition into the base, re-applies
-  the kernel + rootfs patches, and boots it. A fresh state volume still starts
-  from whatever firmware you prepared into `image/`.
+- **In-guest firmware upgrades work.** A web-UI upgrade writes the new firmware
+  onto the spare root partition and reboots. That partition has no sentinel, so
+  the next start applies the kernel patch (to *its* `/bzImage`) and the rootfs
+  patches to it and records the sentinel; the untouched root is left alone. A
+  rollback to the other root needs nothing — it already carries a current
+  sentinel. A fresh state volume still starts from whatever firmware you prepared
+  into `image/`.
 - **No NAT fallback.** The container shares the host's network namespace and the
   guest is a macvtap on the host NIC, so APs reach it directly on the LAN. A
   user-mode NAT setup would hide the appliance from the APs, so there is none —
@@ -269,9 +278,10 @@ Removes the container **and** the `zd1200-state` volume, so the next
 ```
 build-container.sh   the one entry point
 docker/              Dockerfile, compose files, .env.example, Dockerfile.dockerignore
-scripts/             host prepare step, container entrypoint, guest-image prep, console
-                     helper, and boot-test.sh (boot the prepared disk under QEMU)
-patches/             ordered rootfs patches applied before each boot
+scripts/container/   entrypoint, guest-image prep, console helper, and the ordered
+                     rootfs patches (its patches/ subdir) applied before each boot
+scripts/build/       host-side vendor-image prep (firmware decrypt + extract)
+scripts/test/        boot-test.sh (boot the prepared disk under QEMU) and console-reboot.py
 image/               vendor-derived artifacts built from your firmware (gitignored)
 ```
 

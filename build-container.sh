@@ -58,9 +58,9 @@ if [ ! -f image/rootfs.ext2 ]; then
         exit 1
     fi
     echo "== Extracting the firmware image from $archive =="
-    ./scripts/prepare-vendor-image.sh "$archive"
+    ./scripts/build/prepare-vendor-image.sh "$archive"
 else
-    echo "== Reusing image/ (delete it to re-extract, or run scripts/prepare-vendor-image.sh) =="
+    echo "== Reusing image/ (delete it to re-extract, or run scripts/build/prepare-vendor-image.sh) =="
 fi
 
 # --- 2. .env + a unique container MAC ----------------------------------------
@@ -101,5 +101,5 @@ else
     "${compose_cmd[@]}" up -d --build
     echo
     echo "Started. Follow boot:  ${docker_cmd[*]} logs -f zd1200"
-    echo "Guest console:         ${docker_cmd[*]} exec zd1200 tail -f /tmp/zd1200-web.log"
+    echo "Guest console:         ${docker_cmd[*]} exec zd1200 tail -f /tmp/zd1200-console.log"
 fi

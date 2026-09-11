@@ -18,7 +18,7 @@ Usage:
 
 Prints `guest leased IP: <ip>` on stdout when found and writes the bare IP to
 <out-file>.  Exits 0 once found, or after the window (default 900s) if no lease
-is observed.  Intended to run in the background from run-zd1200-web.sh.
+is observed.  Intended to run in the background from entrypoint.sh.
 """
 import socket
 import struct

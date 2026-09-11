@@ -20,14 +20,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/zd1200
-# Container-side scripts (entrypoint, guest-image prep, console helper).  The
-# host-side prepare-vendor-image.sh rides along; it is only used by
-# build-container.sh before the image exists.
-COPY scripts/ /opt/zd1200/
-# The ordered rootfs patches live in patches/ and run (in lexical filename
-# order) against the qcow2 overlay; apply-rootfs-patches.sh decides whether
-# they are needed (first run / after an upgrade) before launching QEMU.
-COPY patches/ /opt/zd1200/patches/
+# Container-side scripts (entrypoint, guest-image prep, console helper) plus the
+# ordered rootfs patches (scripts/container/patches/, run in lexical filename
+# order against the qcow2 overlay).  prepare-vm-disks.sh decides whether the
+# patches are needed (first run / after an upgrade) before launching QEMU.
+# Host-only tooling under scripts/build/ and scripts/test/ is not copied.
+COPY scripts/container/ /opt/zd1200/
 
 RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py /opt/zd1200/patches/*.sh \
     && mkdir -p /opt/zd1200/image /var/lib/zd1200
@@ -42,6 +40,6 @@ ENV STATE_DIR=/var/lib/zd1200 \
 VOLUME ["/var/lib/zd1200"]
 
 HEALTHCHECK --interval=30s --timeout=8s --start-period=10m --retries=3 \
-    CMD rg -qF 'System go into READY status.' /tmp/zd1200-web.log || exit 1
+    CMD rg -qF 'System go into READY status.' /tmp/zd1200-console.log || exit 1
 
-CMD ["./run-zd1200-web.sh"]
+CMD ["./entrypoint.sh"]

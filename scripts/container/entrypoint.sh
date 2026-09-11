@@ -6,7 +6,7 @@
 set -euo pipefail
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
-log_file="${LOG_FILE:-/tmp/zd1200-web.log}"
+log_file="${LOG_FILE:-/tmp/zd1200-console.log}"
 qemu_pid=""
 limiter_pid=""
 started_at=$SECONDS
@@ -19,7 +19,6 @@ network_mode="${NETWORK_MODE:-user}"
 guest_ip="${GUEST_IP:-192.168.10.20}"
 state_dir="${STATE_DIR:-$work_dir}"
 synthetic_disk="${SYNTHETIC_DISK:-$state_dir/synthetic-cf.img}"
-persistent_disk="${PERSISTENT_DISK:-$state_dir/zd1200-vm.qcow2}"
 vm_snapshot="${VM_SNAPSHOT:-0}"
 cpu_limit="${CPU_LIMIT:-}"
 # Consecutive >95% CPU samples (5s each) before the supervisor stops QEMU.
@@ -69,18 +68,14 @@ if [ ! -f "$patched_kernel" ] || [ ! -s "$patched_kernel" ]; then
         --in "$work_dir/image/bzImage" \
         --out "$patched_kernel"
 fi
-if ! command -v qemu-img >/dev/null 2>&1; then
-    echo "qemu-img is required" >&2
-    exit 1
-fi
 # The serial number and MACs live in the board-data records on the CF image
 # (read by the kernel's v54bsp driver; NOT patched into the kernel).  This block
 # only computes the identity to WRITE when the synthetic base is first built
-# (see apply-rootfs-patches.sh below); on every start the board data is read
+# (see prepare-vm-disks.sh below); on every start the board data is read
 # back afterwards and takes precedence.
 # By default the identity is derived from ZD_CONTAINER_MAC, a unique
 # locally-administered MAC generated into .env by build-container.sh
-# (scripts/boarddata-from-mac.sh: MAC1 = ZD_CONTAINER_MAC, serial hashed
+# (scripts/container/boarddata-from-mac.sh: MAC1 = ZD_CONTAINER_MAC, serial hashed
 # from MAC1); MAC2 = MAC1 + 1.  Set ZD_BOARDDATA_FROM_MAC=0 to pin the fixed
 # ZD_SERIAL/ZD_MAC1 instead.
 if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_BOARDDATA_FROM_MAC:-1}" != "0" ]; then
@@ -93,22 +88,18 @@ else
     zd_mac1="${ZD_MAC1:-00:0c:e6:12:00:01}"
     zd_mac2="${ZD_MAC2:-}"
 fi
-# Prepare the writable synthetic disk (creates+populates the /writable partition),
-# write the board data, create the persistent qcow2 overlay, and -- whenever the
-# coordinator decides the rootfs needs patching (first run, a changed base rootfs,
-# or a changed patch set) -- recreate the overlay and run the ordered rootfs
-# patches from patches/ into it.  The coordinator is the ONLY place that builds
-# the overlay or patches the rootfs.
+# Build the flat synthetic disk if missing, write the board data, and run the
+# kernel + rootfs customisations on whichever root partitions still need them
+# (see prepare-vm-disks.sh).  It is the ONLY place that builds or patches the disk.
 STATE_DIR="$state_dir" \
 SYNTHETIC_DISK="$synthetic_disk" \
-PERSISTENT_DISK="$persistent_disk" \
 WORK="$state_dir/.rootfs-patch-work" \
 ZD_SERIAL="$zd_serial" \
 ZD_MAC1="$zd_mac1" \
 ZD_MODEL="${ZD_MODEL:-ZD1200}" \
 ZD_CUSTOMER="${ZD_CUSTOMER:-ruckus}" \
 ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
-"$work_dir/apply-rootfs-patches.sh"
+"$work_dir/prepare-vm-disks.sh"
 
 : > "$log_file"
 
@@ -116,16 +107,16 @@ ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
 # the firmware writes it back into the board-data record.  Read it back now and
 # use it for the macvtap, the QEMU NIC and the DHCP sniffer, so a MAC changed
 # inside the guest is honoured on the next start.  Only a freshly built base disk
-# gets the identity derived above written into it (apply-rootfs-patches.sh).
+# gets the identity derived above written into it (prepare-vm-disks.sh).
 if [ -f "$work_dir/read-boarddata.py" ]; then
-    if boarddata="$(python3 "$work_dir/read-boarddata.py" "$persistent_disk" 2>>"$log_file")"; then
+    if boarddata="$(python3 "$work_dir/read-boarddata.py" "$synthetic_disk" 2>>"$log_file")"; then
         eval "$boarddata"
         zd_serial="${SERIAL:-$zd_serial}"
         zd_mac1="${MAC:-$zd_mac1}"
         zd_mac2="${MAC2:-$zd_mac2}"
         echo "board data: serial=$zd_serial MAC1=$zd_mac1 MAC2=$zd_mac2" >>"$log_file"
     else
-        echo "warning: no board data read from $persistent_disk; using the derived identity" >>"$log_file"
+        echo "warning: no board data read from $synthetic_disk; using the derived identity" >>"$log_file"
     fi
 fi
 
@@ -150,16 +141,15 @@ if [ "${NETWORK_MODE:-user}" = macvtap ]; then
             >>"$log_file" 2>&1 &
     fi
 fi
-# Interactive serial console (see run-zd1200-qemu.sh): the chardev logfile must be
+# Interactive serial console (see launch-vm.sh): the chardev logfile must be
 # the SAME file the READY detect + healthcheck grep, and the socket path is where
 # you attach to the guest's /dev/console login (set ZD_CONSOLE=0 to disable).
 setsid env KERNEL="$patched_kernel" \
     INITRD="" \
-    DISK_IMAGE="$persistent_disk" DISK_FORMAT=qcow2 DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
+    DISK_IMAGE="$synthetic_disk" DISK_FORMAT=raw DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
     ACCEL="$vm_accel" \
     STATE_DIR="$state_dir" \
     SYNTHETIC_DISK="$synthetic_disk" \
-    PERSISTENT_DISK="$persistent_disk" \
     WORK="$state_dir/.rootfs-patch-work" \
     ZD_SERIAL="$zd_serial" \
     ZD_MAC1="$zd_mac1" \
@@ -176,7 +166,7 @@ setsid env KERNEL="$patched_kernel" \
     ZD_CONSOLE="${ZD_CONSOLE:-1}" \
     ZD_CONSOLE_LOG="$log_file" \
     ZD_CONSOLE_SOCK="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}" \
-    nice -n 10 ./run-zd1200-qemu.sh \
+    nice -n 10 ./launch-vm.sh \
     >>"$log_file" 2>&1 </dev/null &
 qemu_pid=$!
 

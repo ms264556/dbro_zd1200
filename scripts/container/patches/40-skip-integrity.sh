@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 40 - PatchSkipIntegrity.sh — make the ZD1200 rootfs integrity checker skip
+# 40-skip-integrity.sh — make the ZD1200 rootfs integrity checker skip
 # every entry, so vendor "corrupted" warnings (e.g. `file:[./usr/sbin/sesame2]
 # corrupted`) never appear for our patched files.
 #
@@ -9,19 +9,19 @@
 # SKIP: line matches no branch and is ignored.  So rewriting every FILE/LINK/DIR/
 # OTHER entry to SKIP: makes the check a no-op (it finds zero errors).
 #
-# Applied to the ROOT partitions of the qcow2 overlay (hda2/hda3) with the same
-# flatten -> debugfs -> qemu-io channel as patch-rootfs.sh.  Runs as a normal
-# user; only changed byte ranges are written to the overlay (backing untouched).
+# Applied to the ROOT partitions of the flat disk (hda2/hda3) with the same
+# read -> debugfs -> dd channel as the other rootfs patches.  Runs as a normal
+# user; only changed byte ranges are written back to the disk.
 #
 # Usage:
-#   QCOW=<overlay.qcow2> WORK=<workdir> ./"40 - PatchSkipIntegrity.sh"
+#   QCOW=<flat-disk> WORK=<workdir> ./"40-skip-integrity.sh"
 #
 # Idempotent: a partition whose /file_list.txt already has no FILE/LINK/DIR/OTHER
 # entries (all SKIP) is left alone.
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/zd1200-vm.qcow2}"
+QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
 WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
 
@@ -31,7 +31,7 @@ TARGET="/file_list.txt"
 # parses `<type>:<data>` still sees a well-formed line.
 SEDEXPR='s/^(FILE|LINK|DIR|OTHER):/SKIP:/'
 
-# name|start_sector|sector_count  (mirrors make-synthetic-cf.py / patch-rootfs.sh)
+# name|start_sector|sector_count  (mirrors build-synthetic-cf.py)
 PARTITIONS=(
     "hda2|84568|415152"
     "hda3|499720|415152"
@@ -54,8 +54,8 @@ file_stat() {
                 }} END { print t, m, u, g }'
 }
 
-say "flattening $QCOW -> $WORK/flat.raw"
-qemu-img convert -f qcow2 -O raw "$QCOW" "$WORK/flat.raw"
+say "reading the flat disk $QCOW"
+ln -sf "$QCOW" "$WORK/flat.raw"
 
 patched_any=0
 for part in "${PARTITIONS[@]}"; do
@@ -119,7 +119,7 @@ for s, e in runs:
 PYEOF
 
     if [ ! -s "$WORK/$name.runs" ]; then
-        echo "  no byte changes for $TARGET on $name (already patched in overlay?)"
+        echo "  no byte changes for $TARGET on $name (already patched on the disk?)"
         continue
     fi
 
@@ -128,27 +128,27 @@ PYEOF
         dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
            skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
         abs_off=$((abs_start + off))
-        echo "  qemu-io: $len bytes at offset $abs_off"
-        qemu-io -f qcow2 -c "write -s $WORK/chunk.bin $abs_off $len" "$QCOW" >/dev/null
+        echo "  write: $len bytes at offset $abs_off"
+        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN seek=$((abs_off / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
     done < "$WORK/$name.runs"
     patched_any=1
 done
 
 if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the overlay"
+    say "no patch produced changes; nothing written to the disk"
     exit 0
 fi
 
-say "verifying: re-flattening overlay and comparing each partition"
-qemu-img convert -f qcow2 -O raw "$QCOW" "$WORK/flat.verify.raw"
+say "verifying: re-reading the disk and comparing each partition"
+ln -sf "$QCOW" "$WORK/flat.verify.raw"
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
        skip="$start" count="$sectors" status=none
     if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: overlay matches the patched partition image"
+        echo "OK   $name: disk matches the patched partition image"
     else
-        echo "FAIL $name: overlay does not match the patched partition image" >&2
+        echo "FAIL $name: disk does not match the patched partition image" >&2
         exit 1
     fi
     debugfs -R "dump $TARGET $WORK/flist.check" "$WORK/$name.verify.img" >/dev/null 2>&1
@@ -161,4 +161,4 @@ for part in "${PARTITIONS[@]}"; do
     fi
 done
 
-say "done — integrity list in $QCOW is all-SKIP; backing file untouched"
+say "done — integrity list in $QCOW is all-SKIP"

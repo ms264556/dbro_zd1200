@@ -10,7 +10,7 @@ QEMU emit SHUTDOWN with reason "guest-reset"; a guest poweroff emits
     10  guest rebooted     -> the caller should relaunch QEMU
     n   anything else (QEMU error, host signal, unknown reason)
 
-Usage: qemu-run.py [QEMU arguments...]
+Usage: qemu-once.py [QEMU arguments...]
 """
 import json
 import os
@@ -37,7 +37,7 @@ def main() -> int:
     # default would make QEMU try to bind the path we already bound.
     cmd = ["qemu-system-i386", "-no-reboot",
            "-qmp", f"unix:{sock_path},server=off", *sys.argv[1:]]
-    # close_fds=False: run-zd1200-qemu.sh opens the macvtap device on fd 3 and
+    # close_fds=False: launch-vm.sh opens the macvtap device on fd 3 and
     # passes it as -net tap,fd=3; Python's default would close it before exec.
     proc = subprocess.Popen(cmd, close_fds=False)
 

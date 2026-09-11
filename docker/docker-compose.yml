@@ -63,7 +63,7 @@ services:
 
     volumes:
       # Vendor-derived artifacts extracted from the firmware archive by
-      # scripts/prepare-vendor-image.sh (see README.md "The image/ directory").
+      # scripts/build/prepare-vendor-image.sh (see README.md "The image/ directory").
       - ./image:/opt/zd1200/image:ro
       # Signing cert payload consumed by the license patch (the license
       # bypass).  Host path configurable via ZD_SIGN_CERT_HOST (set in .env).
@@ -80,8 +80,8 @@ services:
       # macvlan isolates the container from its own macvtap guest, so the
       # guest's HTTPS is not reachable from inside the container.  Mark healthy
       # on the guest's READY marker in the serial-console log (written by
-      # run-zd1200-web.sh) instead of curling an unreachable static IP.
-      test: ["CMD-SHELL", "rg -qF 'System go into READY status.' /tmp/zd1200-web.log 2>/dev/null || exit 1"]
+      # entrypoint.sh) instead of curling an unreachable static IP.
+      test: ["CMD-SHELL", "rg -qF 'System go into READY status.' /tmp/zd1200-console.log 2>/dev/null || exit 1"]
       interval: 30s
       timeout: 8s
       start_period: 10m

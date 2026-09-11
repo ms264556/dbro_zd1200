@@ -7,16 +7,16 @@
 # Steps:
 #   1. build the container image with build-container.sh --no-up (which also
 #      prepares image/ from the firmware on first run);
-#   2. prepare the synthetic CompactFlash + qcow2 overlay in an isolated state
-#      dir, using the container's own apply-rootfs-patches.sh (never the running
+#   2. build/patch the synthetic CompactFlash disk in an isolated state dir,
+#      using the container's own prepare-vm-disks.sh (never the running
 #      container's state volume);
-#   3. boot that overlay with a direct QEMU: KVM, a software IPMI BMC (the
+#   3. boot that disk with a direct QEMU: KVM, a software IPMI BMC (the
 #      firmware's CLI talks to a BMC over KSM), user-mode networking, and the
 #      serial console written straight to a log file;
 #   4. watch the log for the milestones grub -> kernel -> init -> controller ->
 #      ready and stop at the requested one.
 #
-# Usage: ./scripts/boot-test.sh [options]
+# Usage: ./scripts/test/boot-test.sh [options]
 #   --firmware PATH   ZD1200 firmware .img (passed to build-container.sh; only
 #                     needed when image/ has not been prepared yet)
 #   --expect LEVEL    grub | kernel | init | controller | ready  (default: init)
@@ -38,7 +38,7 @@
 # <state-dir>/serial.log.
 set -euo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo"
 
 expect="init"
@@ -107,7 +107,7 @@ done
 case "$net_mode" in user|none) ;; *) die "--net must be user or none" ;; esac
 case "$accel" in kvm|tcg|auto) ;; *) die "--accel must be kvm, tcg or auto" ;; esac
 
-for tool in docker qemu-system-i386 qemu-img; do
+for tool in docker qemu-system-i386; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
 docker info >/dev/null 2>&1 || die "cannot reach the Docker daemon"
@@ -137,8 +137,8 @@ if [ "$do_prepare" = 1 ]; then
     || die "image/rootfs.ext2 missing — pass --firmware to build-container.sh"
   [ -d "$cert_dir" ] || die "signing cert dir missing: $cert_dir (set ZD_SIGN_CERT_HOST)"
 
-  say "preparing the synthetic CF + qcow2 overlay in $state_dir (container)"
-  # Optional login seed: make-synthetic-cf.py seeds /writable/etc/config from
+  say "building/patching the synthetic CF disk in $state_dir (container)"
+  # Optional login seed: build-synthetic-cf.py seeds /writable/etc/config from
   # dropbear-provision/{passwd,shadow} when present (a gitignored local input).
   # Mounted read-only so the guest console/CLI can be logged into (--reboot).
   seed_args=()
@@ -155,24 +155,13 @@ if [ "$do_prepare" = 1 ]; then
     -v "$cert_dir:/opt/zd1200/signing-cert:ro" \
     "${seed_args[@]}" \
     -v "$state_dir:/var/lib/zd1200" \
-    --entrypoint /opt/zd1200/apply-rootfs-patches.sh \
+    --entrypoint /opt/zd1200/prepare-vm-disks.sh \
     "$image"
 fi
 
-overlay="$state_dir/zd1200-vm.qcow2"
-[ -f "$overlay" ] || die "no overlay at $overlay (drop --reuse or check the prep step)"
-
-# The overlay is created inside the container, so its backing file is recorded
-# with the container path (/var/lib/zd1200/synthetic-cf.img).  Rebase it to the
-# host path of the same file; -u rewrites only the header (same backing data).
-base_img="$state_dir/synthetic-cf.img"
-[ -f "$base_img" ] || die "missing synthetic base disk: $base_img"
-current_backing="$(qemu-img info --output=json "$overlay" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("backing-filename",""))')"
-if [ "$current_backing" != "$base_img" ]; then
-  say "rebasing overlay backing file: $current_backing -> $base_img"
-  qemu-img rebase -u -f qcow2 -F raw -b "$base_img" "$overlay"
-fi
+# Flat model: the synthetic CF image IS the live disk (no qcow2 overlay).
+disk_img="$state_dir/synthetic-cf.img"
+[ -f "$disk_img" ] || die "missing synthetic CF disk: $disk_img (drop --reuse or check the prep step)"
 
 # --- 3. boot it under QEMU ---------------------------------------------------
 log="$state_dir/serial.log"
@@ -214,7 +203,7 @@ if [ "$do_reboot" = 1 ]; then
                 -serial chardev:con0 )
 fi
 
-say "booting $overlay under QEMU ($accel, net=$net_mode, machine=$machine, cpu=$cpu, IPMI BMC, serial -> $log)"
+say "booting $disk_img under QEMU ($accel, net=$net_mode, machine=$machine, cpu=$cpu, IPMI BMC, serial -> $log)"
 setsid qemu-system-i386 \
   -name zd1200-boot-test \
   -accel "$accel" \
@@ -223,7 +212,7 @@ setsid qemu-system-i386 \
   -m "${MEMORY_MB:-2048}" \
   -smp 1 \
   -device ich9-ahci,id=ahci \
-  -drive "file=$overlay,format=qcow2,if=none,id=disk0,cache=writeback" \
+  -drive "file=$disk_img,format=raw,if=none,id=disk0,cache=writeback" \
   -device "ide-hd,drive=disk0,bus=ahci.0" \
   -snapshot \
   "${net_args[@]}" \
@@ -259,7 +248,7 @@ while :; do
     # again.  This is what the kernel's machine_restart path drives: a broken
     # machine_restart leaves the guest hung, so the second boot never happens.
     say "rebooting the guest over its serial console (machine_restart)"
-    if ! python3 "$repo/scripts/console-reboot.py" "$console_sock" \
+    if ! python3 "$repo/scripts/test/console-reboot.py" "$console_sock" \
          >"$state_dir/console-reboot.log" 2>&1; then
       say "FAIL — could not drive the guest console to reboot"
       tail -40 "$state_dir/console-reboot.log" >&2

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# 20 - PatchSigningLicense.sh — bake the ZD1200 image-signing bypass and upgrade
+# 20-signing-license.sh — bake the ZD1200 image-signing bypass and upgrade
 # entitlement into the lab VM rootfs partitions (hda2/hda3), writing the
-# result into the qcow2 overlay only.  Runs as a standard user: no root, no
+# result into the flat disk.  Runs as a standard user: no root, no
 # loop devices, no nbd, no mount.
 #
 # This applies the sys_wrapper.sh patch from the create_zd1200_signing_bypass
@@ -26,7 +26,7 @@
 # patched sys_wrapper function creates the entitlement record when the web
 # UI invokes it.
 #
-# Usage:  ./"20 - PatchSigningLicense.sh" [CERT_DIR]
+# Usage:  ./"20-signing-license.sh" [CERT_DIR]
 #
 # CERT_DIR defaults to image/signing-cert, which prepare-vendor-image.sh fills
 # from the ZD firmware archive.  It must contain signing_cert.pem +
@@ -35,13 +35,13 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$BASE/zd1200-vm.qcow2}"
+QCOW="${QCOW:-$BASE/synthetic-cf.img}"
 WORK="${WORK:-$BASE/.rootfs-patch-work}"
 ALIGN=512
 
 CERT_DIR="${1:-$(dirname "$BASE")/image/signing-cert}"
 
-# name|start_sector|sector_count   (mirrors make-synthetic-cf.py / patch-rootfs.sh)
+# name|start_sector|sector_count   (mirrors build-synthetic-cf.py)
 PARTITIONS=(
     "hda2|84568|415152"
     "hda3|499720|415152"
@@ -68,8 +68,8 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 say() { printf '\n== %s\n' "$*"; }
 
-say "flattening overlay+backing to $WORK/flat.raw"
-qemu-img convert -f qcow2 -O raw "$QCOW" "$WORK/flat.raw"
+say "reading the flat disk $QCOW"
+ln -sf "$QCOW" "$WORK/flat.raw"
 
 # Pack the cert payload once (content identical on every partition).
 ( cd "$CERT_DIR" && tar -czf "$WORK/cert.tgz" . )
@@ -192,8 +192,8 @@ EOF
     done
     debugfs -w -f "$WORK/cmds2.txt" "$WORK/$name.img" 2>/dev/null
 
-    # ---- delta: only changed 512-byte blocks reach the overlay ----
-    say "[$name] writing changed blocks into the overlay"
+    # ---- delta: only changed 512-byte blocks reach the disk ----
+    say "[$name] writing changed blocks into the disk"
     python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
 import sys
 orig = open(sys.argv[1], 'rb').read()
@@ -212,7 +212,7 @@ for s, e in runs:
 PYEOF
 
     if [ ! -s "$WORK/$name.runs" ]; then
-        echo "  no byte changes (already patched in overlay?)"
+        echo "  no byte changes (already patched on the disk?)"
         continue
     fi
     abs_start=$((start * ALIGN))
@@ -220,27 +220,27 @@ PYEOF
         dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
            skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
         abs_off=$((abs_start + off))
-        echo "  qemu-io: $len bytes at offset $abs_off"
-        qemu-io -f qcow2 -c "write -s $WORK/chunk.bin $abs_off $len" "$QCOW" >/dev/null
+        echo "  write: $len bytes at offset $abs_off"
+        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN seek=$((abs_off / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
     done < "$WORK/$name.runs"
     patched_any=1
 done
 
 if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing was written to the overlay"
+    say "no patch produced changes; nothing was written to the disk"
     exit 0
 fi
 
-say "verifying: re-flattening overlay and comparing each partition"
-qemu-img convert -f qcow2 -O raw "$QCOW" "$WORK/flat.verify.raw"
+say "verifying: re-reading the disk and comparing each partition"
+ln -sf "$QCOW" "$WORK/flat.verify.raw"
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
        skip="$start" count="$sectors" status=none
     if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: overlay now matches the patched partition image"
+        echo "OK   $name: disk now matches the patched partition image"
     else
-        echo "FAIL $name: overlay does not match the patched partition image" >&2
+        echo "FAIL $name: disk does not match the patched partition image" >&2
         exit 1
     fi
 done
@@ -251,4 +251,4 @@ debugfs -R "cat /bin/sys_wrapper.sh" "$WORK/hda2.verify.img" 2>/dev/null | grep 
 echo "--- patch-storage payload ---"
 debugfs -R "ls -l /etc/persistent-scripts/patch-storage" "$WORK/hda2.verify.img" 2>/dev/null | grep -v "^debugfs"
 
-say "done — signing bypass + upgrade entitlement baked into $QCOW; backing file untouched"
+say "done — signing bypass + upgrade entitlement baked into $QCOW"

@@ -40,7 +40,7 @@ With a valid record in place, the stock kernel populates its `rbd` struct
 from the CF at boot, so /proc/v54bsp/serial and the MAC queries return the
 values written here -- no kernel patch is needed for serial number or MACs.
 
-This mirrors (and supersedes the magic-only seeds of) make-synthetic-cf.py.
+This mirrors (and supersedes the magic-only seeds of) build-synthetic-cf.py.
 """
 
 import argparse
@@ -68,7 +68,7 @@ RKS_BD_OFFSET = 0x8000             # DATA_PART_SIZE(0x1000) * 8
 ZD_PART_SECTOR_P1 = 3927001         # CONFIG_V54_ZD_PLATFORM == 1
 ZD_PART_SECTOR_P0 = 3982101         # CONFIG_V54_ZD_PLATFORM == 0
 
-# Synthetic CF geometry (must match make-synthetic-cf.py).  Boot flags are
+# Synthetic CF geometry (must match build-synthetic-cf.py).  Boot flags are
 # limited to 0x00/0x80: the vendor msdos_partition() rejects any entry whose
 # boot indicator is neither, so a raw 0x01 (as on the real CF) would make the
 # kernel report "unknown partition table".

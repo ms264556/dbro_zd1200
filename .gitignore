@@ -40,5 +40,5 @@ __pycache__/
 .reasonix/
 reasonix.toml
 
-# scripts/boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
+# scripts/test/boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
 .boot-test/

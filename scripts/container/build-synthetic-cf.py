@@ -13,10 +13,11 @@ stage1_5 (self-load count baked in) + the /boot filesystem (stage2 / menu.lst /
 default) — is built in-process by `build-bootfs.py` from the source-built GRUB
 artifacts the firmware ships in its restore initramfs, with the patched kernel placed on
 /boot as /bzImage.
-make-synthetic-cf.py writes those bytes at sector 0, then lays down sda2/sda3
+build-synthetic-cf.py writes those bytes at sector 0, then lays down sda2/sda3
 (rootfs) and sda4 (/writable) from `image/`.  No per-build repatching.
 
-kernel / rootfs / /writable come from `image/`.
+kernel / rootfs come from `image/`; /writable is seeded from the payload
+tarball (AP images + aidfs) plus the optional dropbear-provision login.
 """
 
 from pathlib import Path
@@ -55,7 +56,7 @@ mke2fs = os.environ.get("MKE2FS") or which("mke2fs")
 if not mke2fs:
     raise SystemExit("mke2fs not found: e2fsprogs is required to build the ext2 data partition")
 
-# Patch the kernel for QEMU (scripts/patch-kernel.py); the raw
+# Patch the kernel for QEMU (scripts/container/patch-kernel.py); the raw
 # bzImage triggers a kernel `BUG: scheduling while atomic` early in init.
 with tempfile.TemporaryDirectory() as _kp:
     _kp = Path(_kp)
@@ -76,7 +77,8 @@ def seed_writable_config(ext2_path):
     if not passwd_src.exists() or not shadow_src.exists():
         print("  dropbear-provision/passwd/shadow missing; leaving /writable unseeded")
         return
-    cmds = ["mkdir /etc", "mkdir /etc/config",
+    # /etc already exists (mke2fs -d creates it from the staged tree).
+    cmds = ["mkdir /etc/config",
             f"write {passwd_src} /etc/config/passwd",
             f"write {shadow_src} /etc/config/shadow",
             "set_inode_field /etc/config/shadow mode 0100640"]
@@ -120,7 +122,7 @@ with tempfile.TemporaryDirectory() as td:
     # that rewrite.
     ver = base / "image" / "restoreinitramfs.ver"
     if not ver.exists():
-        raise SystemExit(f"missing {ver} — run scripts/prepare-vendor-image.sh")
+        raise SystemExit(f"missing {ver} — run scripts/build/prepare-vendor-image.sh")
     cmds.append(f"write {ver} /restoreinitramfs.ver")
     ker_cmds.write_text("\n".join(cmds) + "\n")
     subprocess.run(["debugfs", "-w", "-f", str(ker_cmds), str(h1_tmp)],
@@ -143,29 +145,68 @@ with tempfile.TemporaryDirectory() as td2:
     cmds.write_text(f"write {kernel_file} /bzImage\n")
     subprocess.run(["debugfs", "-w", "-f", str(cmds), str(rt)],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # ac_upg.sh _upg_rootfs resize2fs's the freshly written root to fill its
+    # partition; do the same so the guest sees the full partition, not the size
+    # of the rootfs.ext2 we were shipped.
+    os.truncate(rt, C2 * SECTOR)
+    subprocess.run(["resize2fs", str(rt)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     rfs = open(rt, "rb").read()
 with disk.open("r+b") as h:
     for start in (H2, H3):
         h.seek(start * SECTOR)
         h.write(rfs)
 
+
+def stage_payload(stage: Path) -> None:
+    """Stage the vendor /writable content a firmware install leaves behind: the
+    web-UI aidfs/ (ac_upg.sh _upg_aidfs) and the AP images under
+    etc/airespider-images/firmwares/ (_upg_apimg), sourced from the payload
+    tarball prepare-vendor-image.sh builds."""
+    payloads = sorted((base / "image").glob("*-payload.tar.gz"))
+    if not payloads:
+        print("  payload tarball (*-payload.tar.gz) missing; /writable left without AP images/aidfs")
+        return
+    import tarfile
+    with tarfile.open(payloads[0], "r:gz") as tar:
+        members = [m for m in tar.getmembers()
+                   if m.name.split("/", 1)[0] in ("aidfs", "firmwares")]
+        try:
+            tar.extractall(path=str(stage), members=members, filter="data")
+        except TypeError:          # Python < 3.12 has no extract filter
+            tar.extractall(path=str(stage), members=members)
+    made = stage / "firmwares"
+    if made.is_dir():
+        target = stage / "etc" / "airespider-images"
+        target.mkdir(parents=True, exist_ok=True)
+        made.rename(target / "firmwares")
+
+
 # ---- sda4 /writable (ext2) ---------------------------------------------------
-with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
-    tf_path = tf.name
-try:
-    os.truncate(tf_path, C4 * SECTOR)
-    subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", tf_path],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    seed_writable_config(tf_path)
-    with open(tf_path, "rb") as rf, disk.open("r+b") as h:
-        h.seek(H4 * SECTOR)
-        while True:
-            chunk = rf.read(4 * 1024 * 1024)
-            if not chunk:
-                break
-            h.write(chunk)
-finally:
-    os.unlink(tf_path)
+# Mirror the /writable state a firmware install leaves behind: the web-UI aidfs
+# (_upg_aidfs) and the AP images + manifest under
+# etc/airespider-images/firmwares (_upg_apimg), staged from the payload tarball.
+# mke2fs -d seeds the filesystem from the staged tree.
+with tempfile.TemporaryDirectory() as sd:
+    stage = Path(sd)
+    (stage / "etc").mkdir(parents=True, exist_ok=True)
+    stage_payload(stage)
+    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+        tf_path = tf.name
+    try:
+        os.truncate(tf_path, C4 * SECTOR)
+        subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", "-d", str(stage), tf_path],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        seed_writable_config(tf_path)
+        with open(tf_path, "rb") as rf, disk.open("r+b") as h:
+            h.seek(H4 * SECTOR)
+            while True:
+                chunk = rf.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                h.write(chunk)
+    finally:
+        os.unlink(tf_path)
 
 print(f"created {disk} ({DISK_SIZE // (1024 * 1024)} MiB)")
 print(f"  sda1 boot : sectors {H1}..{H1 + C1} (bootfs + kernel)")
