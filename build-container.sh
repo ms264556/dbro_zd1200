@@ -9,6 +9,10 @@
 #   ./build-container.sh /path/to/zd1200_*.img       # first run: extract + build + start
 #   ./build-container.sh                             # already extracted: build + start
 #   ./build-container.sh --no-up /path/to/*.img      # only build the image (no boot)
+#   ./build-container.sh --root-ssh-key ~/.ssh/id_ed25519.pub
+#                                                    # also build the static dropbear
+#                                                    # replacement and enable public-key
+#                                                    # root SSH on TCP 2222 (slow build)
 #
 # The container runs under host-netns; see README.md ("Host requirements" and
 # "Gotchas") for what the host must provide (MAC-spoofing NIC, KVM optional).
@@ -18,14 +22,19 @@ cd "$(dirname "$0")"
 
 no_up=0
 archive="${ZD_ARCHIVE:-}"
-for arg in "$@"; do
-    case "$arg" in
-        --no-up) no_up=1 ;;
+root_ssh_key=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-up) no_up=1; shift ;;
+        --root-ssh-key)
+            [ $# -ge 2 ] || { echo "--root-ssh-key needs a public-key file or key string" >&2; exit 2; }
+            root_ssh_key="$2"; shift 2 ;;
+        --root-ssh-key=*) root_ssh_key="${1#*=}"; shift ;;
         -h|--help)
-            sed -n '2,14p' "$0"
+            sed -n '2,17p' "$0"
             exit 0
             ;;
-        *) archive="${arg:-}" ;;
+        *) archive="${1:-}"; shift ;;
     esac
 done
 
@@ -103,6 +112,44 @@ if ! grep -qE '^ZD_VIRTUAL_BUILD_ID=..*' .env 2>/dev/null \
     export ZD_VIRTUAL_BUILD_ID
     [ -n "$ZD_VIRTUAL_BUILD_ID" ] \
         && echo "== Admin console will report source revision: virtual $ZD_VIRTUAL_BUILD_ID =="
+fi
+
+# --- 2c. optional public-key root SSH on TCP 2222 ---------------------------
+# Supplying a public key enables the static-dropbear replacement build and
+# installs a public-key-only root listener on 2222.  The key is staged in
+# dropbear-provision/ (gitignored) for the container, and its content is part
+# of the rootfs re-patch signature so rotating the key re-customises the disk.
+key_line=""
+if [ -n "$root_ssh_key" ]; then
+    if [ -r "$root_ssh_key" ]; then
+        key_line="$(head -n1 "$root_ssh_key" | tr -d '\r')"
+    else
+        key_line="$root_ssh_key"
+    fi
+elif [ -n "${ZD_ROOT_SSH_PUBLIC_KEY:-}" ]; then
+    if [ -r "${ZD_ROOT_SSH_PUBLIC_KEY}" ]; then
+        key_line="$(head -n1 "${ZD_ROOT_SSH_PUBLIC_KEY}" | tr -d '\r')"
+    else
+        key_line="${ZD_ROOT_SSH_PUBLIC_KEY}"
+    fi
+fi
+if [ -n "$key_line" ]; then
+    case "$key_line" in
+        ssh-rsa\ *|ssh-ed25519\ *|ecdsa-sha2-nistp256\ *|ecdsa-sha2-nistp384\ *|ecdsa-sha2-nistp521\ *) ;;
+        *) echo "--root-ssh-key is not an SSH public key: $key_line" >&2; exit 2 ;;
+    esac
+    mkdir -p dropbear-provision
+    printf '%s\n' "$key_line" > dropbear-provision/authorized_keys
+    # 0644, not 0600: it is a public key, and the container drops
+    # CAP_DAC_OVERRIDE so it could not read a root-only host file.
+    chmod 644 dropbear-provision/authorized_keys
+    export ZD_ROOT_SSH=1
+    export ZD_ROOT_SSH_PROVISION=./dropbear-provision
+    echo "== Root SSH on TCP 2222 enabled (${key_line%% *}) =="
+    echo "   The image build compiles the static dropbear replacement; the first"
+    echo "   build downloads a ~110 MB cross toolchain and is slow."
+else
+    export ZD_ROOT_SSH=0
 fi
 
 # --- 3. build / start -------------------------------------------------------

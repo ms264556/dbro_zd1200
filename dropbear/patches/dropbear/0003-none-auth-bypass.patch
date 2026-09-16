@@ -1,0 +1,24 @@
+--- a/src/svr-auth.c	2026-07-23 11:00:00.000000000 +0000
++++ b/src/svr-auth.c
+@@ -121,7 +121,21 @@
+ 			strncmp(methodname, AUTH_METHOD_NONE,
+ 				AUTH_METHOD_NONE_LEN) == 0) {
+ 		TRACE(("recv_msg_userauth_request: 'none' request"))
++		/* Ruckus ZD1200: -A none means no SSH authentication - accept the
++		 * 'none' auth method immediately and drop into the -e login shell
++		 * (the ruckus CLI), which prompts for credentials itself. */
+ 		if (valid_user
++				&& svr_opts.auth_type != NULL
++				&& strcmp(svr_opts.auth_type, "none") == 0)
++		{
++			dropbear_log(LOG_NOTICE,
++					"Auth via -A none (no SSH auth) for '%s' from %s",
++					ses.authstate.pw_name,
++					svr_ses.addrstring);
++			send_msg_userauth_success();
++			goto out;
++		}
++		else if (valid_user
+ 				&& svr_opts.allowblankpass
+ 				&& !svr_opts.noauthpass
+ 				&& !(svr_opts.norootpass && ses.authstate.pw_uid == 0) 
