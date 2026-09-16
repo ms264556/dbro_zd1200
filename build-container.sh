@@ -92,6 +92,19 @@ if ! grep -qE '^ZD_CONTAINER_MAC=([0-9a-f]{2}:){5}[0-9a-f]{2}$' .env; then
     echo "== Generated a unique container MAC: $container_mac (guest MAC1 = this) =="
 fi
 
+# --- 2b. optional source revision shown on the admin console ----------------
+# The Network Monitor patch appends " virtual <rev>" to the ZoneDirector version
+# so the running controller identifies the source it was built from.  Derive it
+# from the checked-out revision unless .env pins one explicitly; Compose passes
+# it to the container, where it is included in the patch signature.
+if ! grep -qE '^ZD_VIRTUAL_BUILD_ID=..*' .env 2>/dev/null \
+   && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    ZD_VIRTUAL_BUILD_ID="$(git rev-parse --short=7 HEAD 2>/dev/null | cut -c1-7 || true)"
+    export ZD_VIRTUAL_BUILD_ID
+    [ -n "$ZD_VIRTUAL_BUILD_ID" ] \
+        && echo "== Admin console will report source revision: virtual $ZD_VIRTUAL_BUILD_ID =="
+fi
+
 # --- 3. build / start -------------------------------------------------------
 if [ "$no_up" = 1 ]; then
     echo "== Building the ZD1200 container image (no boot) =="

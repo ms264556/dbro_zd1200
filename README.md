@@ -30,7 +30,8 @@ that build the boot area — so the host needs nothing but Docker.
   several minutes to boot instead of ~1–2.
 - Host tools for the prepare step: `tar`, `gzip`, `python3`, `md5sum`,
   `sha256sum` (coreutils) and `bash`.
-- **No compiler.** Nothing is built from source; the host only needs Docker.
+- **No host compiler.** The container build compiles the guest-side helper
+  binaries inside Docker; the host only needs Docker.
 
 ### Firmware
 
@@ -221,6 +222,35 @@ container's state volume is never touched.
   with in `/etc/.zd-image`, so a start where nothing changed just re-reads two
   sentinels and exits.
 
+## Network Monitor
+
+The image also carries the community **Network Monitor** page, ported from
+[`dbro/zd1200`](https://github.com/dbro/zd1200) (see `analytics/README.md`).
+After the setup wizard and a reboot it appears as the last item under
+**Troubleshooting**. It records one ICMP observation per managed device per
+collection interval, together with the controller's own AP telemetry and
+opaque AP/client/mesh configuration snapshots, and renders a per-target
+latency / loss / SNR / airtime history with an A/B "compare two moments"
+workflow and a downloadable analysis prompt.
+
+Collection is **off** on a fresh controller. Enable it, and pick the shared
+30–3600 second interval, from the ⚙ menu on the page; the setting is stored
+through ZoneDirector's normal authenticated preference mechanism. Runtime state
+lives on the writable partition under `/writable/zd1200-ping-monitor/` and
+nothing is uploaded off the controller.
+
+Unlike the upstream project, this fork installs the page from the same offline
+patch pipeline as everything else
+(`scripts/container/patches/50-network-monitor.sh`): the patch writes the i386
+helper binaries, the shell collectors and the page into each root partition and
+adds the menu entry to both admin bundles. The helpers are built inside the
+Docker image by the `analytics-helper` stage (i386/static/musl, SQLite 3.7.17),
+so the host still needs no compiler. Because the patch signature now includes
+this payload, rebuilding the image with a changed page or binary re-customises
+the roots on the next start.
+
+---
+
 ## Configuration
 
 `build-container.sh` copies `docker/.env.example` to `.env` on first run. The
@@ -232,6 +262,7 @@ usual knobs:
 | `ZD_SIGN_CERT_HOST` | host path to the signing-cert payload for the license patch (extracted from the firmware archive by default) |
 | `ZD_CONTAINER_MAC` | unique container MAC the guest identity is derived from (auto-generated into `.env` on first run) |
 | `ZD_SERIAL`, `ZD_MAC1` | only used if you pin the identity (`ZD_BOARDDATA_FROM_MAC=0`) |
+| `ZD_VIRTUAL_BUILD_ID` | seven-character source revision shown as `virtual <rev>` on the admin console; derived from Git unless pinned |
 | `ZD_CONTAINER_NAME`, `ZD_STATE_VOLUME` | container and volume names |
 
 ## Gotchas
@@ -278,6 +309,9 @@ Removes the container **and** the `zd1200-state` volume, so the next
 ```
 build-container.sh   the one entry point
 docker/              Dockerfile, compose files, .env.example, Dockerfile.dockerignore
+analytics/           Network Monitor payload (page, worker, collectors, helper
+                     sources) ported from dbro/zd1200; the Dockerfile compiles
+                     the i386 helpers from it
 scripts/container/   entrypoint, guest-image prep, console helper, and the ordered
                      rootfs patches (its patches/ subdir) applied before each boot
 scripts/build/       host-side vendor-image prep (firmware decrypt + extract)
