@@ -52,17 +52,18 @@ AP models list.
 Any ZD1200 release works — `scripts/build/prepare-vendor-image.sh` validates the
 `metadata` (`REQUIRE_PLATFORM=nar5520`, `REQUIRE_SUBPLATFORM=cob7402`) and the
 kernel/rootfs MD5s, and does not pin a version. The prepared artifacts land in
-`image/` (gitignored). The tested matrix is 10.5.1.0.282, 10.2.1.0.236,
-10.1.2.0.318, 9.13.3.0.164 and 9.10.2.0.130.
+`image/` (gitignored). The tested matrix is 10.5.1.0.282, 10.5.1.0.255,
+10.2.1.0.236, 10.1.2.0.318, 9.13.3.0.164 and 9.10.2.0.130.
 
-The archive layout differs between generations. The 10.2+/10.5 payloads carry
-the web `aidfs` tree and the `signing_cert.pem` / `digital_sig_*` files; the
-10.1.x and 9.x payloads carry neither (they serve the admin UI straight from
-the rootfs). `prepare-vendor-image.sh` therefore requires only what every
-release has (kernel, rootfs, boot menu, AP model list) and stages `aidfs` and
-the signing cert only when they are present. The rootfs patches adapt the same
-way: `20-signing-license.sh` applies the `check_sign_cert()` bypass only when
-the cert exists but always applies the `verify-upload-support` /
+The archive layout differs between releases, independently of the version: some
+payloads carry the web `aidfs` tree and the `signing_cert.pem` / `digital_sig_*`
+files (e.g. 10.2.1.0.236 and 10.5.1.0.282), while others carry neither (e.g.
+10.5.1.0.255, 10.1.x and 9.x all lack them; those releases serve the admin UI
+straight from the rootfs). `prepare-vendor-image.sh` therefore requires only
+what every release has (kernel, rootfs, boot menu, AP model list) and stages
+`aidfs` and the signing cert only when they are present. The rootfs patches adapt
+the same way: `20-signing-license.sh` applies the `check_sign_cert()` bypass only
+when the cert exists but always applies the `verify-upload-support` /
 `wget-support-entitlement` shortcuts, which need no cert.
 
 Pass the file to the build script, or set `ZD_ARCHIVE`. To pin the payload
@@ -366,16 +367,17 @@ are repaired only because they resolve to the identical vendor image, and an AP
 still running fully signed FSI firmware must first be moved to a compatible ISI
 release through its standalone upgrade page.
 
-This is the one repair that keys off a version string rather than sniffing for a
+This is the one repair that keys off a version number rather than sniffing for a
 feature: the helper reads the AP image's own BL7 version and applies the fix only
-when it starts with `10.5.1.` (the family that carries the bug), printing
-`ap-11n-scorpion payload <ver> is not a 10.5.1 build; mesh repair skipped`
-otherwise. `build-synthetic-cf.py` also skips it outright when the payload has no
-`r600/` directory. Every other rootfs patch decides from the files and patterns
-it finds (`sesame`/`sesame2`, `check_sign_cert`/entitlement cases,
-`/web/admin10` vs the 9.x consoles, …), and the kernel patcher matches byte
-signatures (with `rks_pkt_trace_init` optional because the 9.x kernels predate
-tif0).
+to a 10.5.1 build at or after **10.5.1.0.276** (the release that introduced the
+VLAN forwarding regression), printing `ap-11n-scorpion payload <ver> is not a
+10.5.1 build >= 276; mesh repair skipped` otherwise. Earlier 10.5.1 builds
+(.255 and before) are unaffected and are left alone, and the image is not
+touched at all when the payload has no `r600/` directory. Every other rootfs
+patch decides from the files and patterns it finds (`sesame`/`sesame2`,
+`check_sign_cert`/entitlement cases, `/web/admin10` vs the 9.x consoles, …), and
+the kernel patcher matches byte signatures (with `rks_pkt_trace_init` optional
+because the 9.x kernels predate tif0).
 
 ---
 
