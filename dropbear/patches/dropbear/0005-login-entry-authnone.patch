@@ -1,0 +1,37 @@
+--- a/src/svr-chansession.c	2026-09-05 14:54:20.838953143 +0000
++++ b/src/svr-chansession.c	2026-09-05 14:53:55.733576474 +0000
+@@ -290,7 +290,11 @@
+ static struct logininfo* 
+ chansess_login_alloc(const struct ChanSess *chansess) {
+ 	struct logininfo * li;
+-	li = login_alloc_entry(chansess->pid, ses.authstate.username,
++	/* Use pw_name (the user the session actually runs as) rather than the
++	 * client-requested username: for -A none the client may send a username
++	 * that is not a real system user, but we synthesize a root login, and
++	 * login_init_entry would dropbear_exit() if it couldn't getpwnam() it. */
++	li = login_alloc_entry(chansess->pid, ses.authstate.pw_name,
+ 			svr_ses.remotehost, chansess->tty);
+ 	return li;
+ }
+--- a/src/loginrec.c	2026-07-23 11:00:00.000000000 +0000
++++ b/src/loginrec.c	2026-09-05 14:54:03.004713389 +0000
+@@ -268,10 +268,15 @@
+ 	if (username) {
+ 		strlcpy(li->username, username, sizeof(li->username));
+ 		pw = getpwnam(li->username);
+-		if (pw == NULL)
+-			dropbear_exit("login_init_entry: Cannot find user \"%s\"",
+-					li->username);
+-		li->uid = pw->pw_uid;
++		if (pw == NULL) {
++			/* Non-fatal: utmp/wtmp accounting must not kill the session.
++			 * (Can happen with -A none when the client supplies a username
++			 * that is not a real system user.) */
++			dropbear_log(LOG_WARNING,
++					"login_init_entry: user \"%s\" not found", li->username);
++		} else {
++			li->uid = pw->pw_uid;
++		}
+ 	}
+ 
+ 	if (hostname)

@@ -1,0 +1,19 @@
+From: ms264556 <ms264556@ms264556.net>
+Subject: dropbear: point SFTPSERVER_PATH at the ZD1200 install location
+
+The stock value "/usr/libexec/sftp-server" does not exist on the Ruckus
+ZD1200 rootfs.  We install the bundled OpenSSH sftp-server at the same
+location as the replacement dropbear (/usr/sbin/sftp-server); dropbear
+execs this path when a client requests the "sftp" subsystem.
+
+--- a/src/default_options.h
++++ b/src/default_options.h
+@@ -356,7 +356,7 @@
+  * Homedir is prepended if path begins with ~/
+  */
+ #define DROPBEAR_SFTPSERVER 1
+-#define SFTPSERVER_PATH "/usr/libexec/sftp-server"
++#define SFTPSERVER_PATH "/usr/sbin/sftp-server"
+ 
+ /* This is used by the scp binary when used as a client binary. If you're
+  * not using the Dropbear client, you'll need to change it */

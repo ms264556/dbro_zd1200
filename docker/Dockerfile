@@ -3,7 +3,8 @@
 # The runtime stage is the one that ships: Debian + QEMU + the guest-image
 # tooling and the ordered rootfs patches.  It also carries the "Network
 # Monitor" analytics payload (analytics/), whose guest-side helpers are i386
-# binaries compiled by the two build stages below.
+# binaries compiled by the two build stages below, plus an optional static
+# dropbear replacement (dropbear/) that is only built when ZD_ROOT_SSH=1.
 #
 # The guest is an i386 Linux 2.6.32 system, so the helpers must be i386 and
 # statically linked even when Docker builds the surrounding image on ARM64.
@@ -80,6 +81,68 @@ RUN mkdir -p /out \
         -o /out/zd1200-local-getstat
 
 # ---------------------------------------------------------------------------
+# Optional: static ZD1200 dropbear replacement (public-key root SSH on 2222).
+#
+# Only built when ZD_ROOT_SSH=1 (build-container.sh --root-ssh-key), because it
+# downloads a ~110 MB musl.cc cross toolchain and builds zlib + dropbear +
+# OpenSSH from source.  That toolchain is a cross compiler, so these stages run
+# natively on the BUILD platform (amd64/arm64) and need no i386 container -
+# unlike the analytics helper above, which relies on Debian's native i386
+# musl-tools and therefore only runs where 32-bit code executes.
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM $DEBIAN_IMAGE AS dropbear-sources
+
+ARG ZD_ROOT_SSH=0
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ZLIB_VER=1.2.8
+ARG DROPBEAR_VER=2026.94
+ARG OPENSSH_VER=9.9p2
+ARG MUSL_TOOLCHAIN_TGZ=i486-linux-musl-cross.tgz
+
+RUN if [ "$ZD_ROOT_SSH" = "1" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+WORKDIR /src
+COPY dropbear/build-zd1200-dropbear.sh /src/zd_dropbear/
+COPY dropbear/patches/ /src/zd_dropbear/patches/
+COPY dropbear/SHA256SUMS /src/zd_dropbear/
+
+# Fetch the pinned sources into the layout build-zd1200-dropbear.sh reuses, and
+# verify them.  A no-op when the feature is disabled.
+RUN set -eux; \
+    mkdir -p /src/work/dl; \
+    if [ "$ZD_ROOT_SSH" != "1" ]; then exit 0; fi; \
+    curl -fL --retry 3 -o "/src/work/dl/zlib-${ZLIB_VER}.tar.gz" "https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz"; \
+    curl -fL --retry 3 -o "/src/work/dl/dropbear-${DROPBEAR_VER}.tar.bz2" "https://matt.ucc.asn.au/dropbear/releases/dropbear-${DROPBEAR_VER}.tar.bz2"; \
+    curl -fL --retry 3 -o "/src/work/dl/openssh-${OPENSSH_VER}.tar.gz" "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VER}.tar.gz"; \
+    curl -fL --retry 3 -o "/src/work/${MUSL_TOOLCHAIN_TGZ}" "https://github.com/musl-cc/musl.cc/releases/download/v0.0.1/${MUSL_TOOLCHAIN_TGZ}"; \
+    ( cd /src/work/dl && sha256sum -c /src/zd_dropbear/SHA256SUMS --ignore-missing ); \
+    ( cd /src/work && sha256sum -c /src/zd_dropbear/SHA256SUMS --ignore-missing )
+
+FROM --platform=$BUILDPLATFORM $DEBIAN_IMAGE AS zd-dropbear
+
+ARG ZD_ROOT_SSH=0
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN if [ "$ZD_ROOT_SSH" = "1" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends \
+             binutils bzip2 build-essential ca-certificates curl file patch xz-utils \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+COPY --from=dropbear-sources /src /src
+
+RUN if [ "$ZD_ROOT_SSH" = "1" ]; then \
+        /src/zd_dropbear/build-zd1200-dropbear.sh --work /src/work --out /out; \
+    else \
+        mkdir -p /out && : > /out/.disabled; \
+    fi
+
+# ---------------------------------------------------------------------------
 # Stage 3: the runtime image.
 # ---------------------------------------------------------------------------
 FROM $DEBIAN_IMAGE
@@ -125,6 +188,12 @@ COPY --from=analytics-helper \
      /out/zd1200-ping-export \
      /out/zd1200-local-getstat \
      /opt/zd1200/analytics/
+# Optional static dropbear replacement payload.  When ZD_ROOT_SSH=0 the stage
+# contributes only a .disabled marker, and the installer patch reverts/no-ops.
+COPY --from=zd-dropbear /out/ /opt/zd1200/dropbear/
+# The 2222 listener init script is part of the installed payload (the build
+# stage only emits the compiled binaries).
+COPY dropbear/zd1200-root-ssh-init.sh /opt/zd1200/dropbear/
 
 RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py /opt/zd1200/patches/*.sh \
         /opt/zd1200/analytics/*.sh \

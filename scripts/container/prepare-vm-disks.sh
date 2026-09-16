@@ -42,6 +42,11 @@ PATCHES_DIR="${PATCHES_DIR:-$BASE/patches}"
 # patch signature below so a rebuilt image with changed files re-customises the
 # roots instead of serving a stale page.
 ANALYTICS_DIR="${ANALYTICS_DIR:-$BASE/analytics}"
+# Optional static dropbear replacement payload (dropbear/) and the public key it
+# installs.  Both are folded into the signature so enabling/disabling the
+# feature or rotating the key re-customises the roots.
+DROPBEAR_DIR="${DROPBEAR_DIR:-$BASE/dropbear}"
+ZD_ROOT_SSH_AUTHORIZED_KEYS="${ZD_ROOT_SSH_AUTHORIZED_KEYS:-/opt/zd1200/dropbear-provision/authorized_keys}"
 MARKER="${MARKER:-$STATE_DIR/.disk-built}"
 SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
 SENTINEL=/etc/.zd-image
@@ -77,6 +82,17 @@ patch_sig="$( {
           done ) | sha256sum | awk '{print $1}'
     fi
     printf 'ZD_VIRTUAL_BUILD_ID=%s\n' "${ZD_VIRTUAL_BUILD_ID:-}"
+    if [ -d "$DROPBEAR_DIR" ]; then
+        ( cd "$DROPBEAR_DIR" && find . -type f -print | LC_ALL=C sort | while read -r f; do
+              printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'
+          done ) | sha256sum | awk '{print $1}'
+    fi
+    printf 'ZD_ROOT_SSH=%s\n' "${ZD_ROOT_SSH:-}"
+    if [ -r "$ZD_ROOT_SSH_AUTHORIZED_KEYS" ]; then
+        printf 'ZD_ROOT_SSH_KEY=%s\n' "$(sha256sum "$ZD_ROOT_SSH_AUTHORIZED_KEYS" | awk '{print $1}')"
+    else
+        printf 'ZD_ROOT_SSH_KEY=unreadable\n'
+    fi
 } | sha256sum | awk '{print $1}')"
 
 # --- (re)build the disk when missing or the base firmware changed ------------
@@ -102,6 +118,29 @@ if [ "$rebuild" = 1 ]; then
         --serial "${ZD_SERIAL:-123456000789}" --mac "${ZD_MAC1:-00:0c:e6:12:00:01}" \
         --model "${ZD_MODEL:-ZD1200}" --customer "${ZD_CUSTOMER:-ruckus}"
     printf 'rootfs=%s\nbootfs=%s\n' "$rootfs_sig" "$bootfs_sig" > "$MARKER"
+fi
+
+# --- repair the writable data partition if the last stop was not clean ------
+# The stock firmware mounts /writable (hda4, legacy ext2 with no journal)
+# read-write, and the container can be stopped without a clean guest shutdown.
+# The vendor's factory-restore path fsck'd that partition before mounting it;
+# this fork boots the stock kernel directly, so do it here, offline, before QEMU
+# starts.  Gated on the ext2 superblock clean flag (offset 1024+58, 1 = clean),
+# which the kernel sets to "errors" (2) when it detects damage, so a clean start
+# pays only a two-byte read.
+hda4_state="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 1024 + 58)) count=2 status=none 2>/dev/null \
+    | od -An -tu2 | tr -d ' ')"
+if [ "$hda4_state" != "1" ]; then
+    say "data partition (hda4) is not clean (superblock state=${hda4_state:-unknown}); running e2fsck"
+    hda4_tmp="$STATE_DIR/.hda4-fsck.img"
+    dd if="$DISK" of="$hda4_tmp" bs=$SECTOR skip="$HDA4_START" count="$HDA4_SECTORS" status=none
+    hda4_rc=0
+    e2fsck -fy "$hda4_tmp" || hda4_rc=$?
+    if [ "$hda4_rc" -ge 4 ]; then
+        echo "prepare-vm-disks: WARNING: e2fsck could not fully repair hda4 (rc=$hda4_rc)" >&2
+    fi
+    dd if="$hda4_tmp" of="$DISK" bs=$SECTOR seek="$HDA4_START" count="$HDA4_SECTORS" conv=notrunc status=none
+    rm -f "$hda4_tmp"
 fi
 
 # --- helpers ----------------------------------------------------------------
@@ -165,6 +204,9 @@ for patch in "$PATCHES_DIR"/*.sh; do
     [ -f "$patch" ] || continue
     say "running patch: $(basename "$patch")"
     QCOW="$DISK" WORK="$WORK" ANALYTICS_DIR="$ANALYTICS_DIR" \
+        DROPBEAR_DIR="$DROPBEAR_DIR" \
+        ZD_ROOT_SSH="${ZD_ROOT_SSH:-}" \
+        ZD_ROOT_SSH_AUTHORIZED_KEYS="$ZD_ROOT_SSH_AUTHORIZED_KEYS" \
         ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
         bash "$patch" "$SIGN_CERT_DIR"
 done
