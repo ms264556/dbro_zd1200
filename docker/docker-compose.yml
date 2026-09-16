@@ -56,6 +56,10 @@ services:
       ZD_BOARDDATA_FROM_MAC: ${ZD_BOARDDATA_FROM_MAC:-1}
       ZD_SERIAL: ${ZD_SERIAL:-123456000789}
       ZD_MAC1: ${ZD_MAC1:-00:0c:e6:12:00:01}
+      # Optional seven-character source revision appended to the ZoneDirector
+      # version on the admin console ("virtual <rev>").  build-container.sh
+      # derives it from the checked-out Git revision; leave empty to omit it.
+      ZD_VIRTUAL_BUILD_ID: ${ZD_VIRTUAL_BUILD_ID:-}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
       KERNEL_EXTRA: nohz=off
       WEB_WAIT_SECONDS: "600"

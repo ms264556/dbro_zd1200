@@ -37,6 +37,11 @@ IMAGE_DIR="${IMAGE_DIR:-$BASE/image}"
 ROOTFS="${ROOTFS:-$IMAGE_DIR/rootfs.ext2}"
 BOOTFS_SRC="${BOOTFS_SRC:-$IMAGE_DIR/restoreinitramfs.gz}"
 PATCHES_DIR="${PATCHES_DIR:-$BASE/patches}"
+# External payload installed by the ordered patches (the Network Monitor page,
+# its guest shell collectors and the compiled i386 helpers).  It is part of the
+# patch signature below so a rebuilt image with changed files re-customises the
+# roots instead of serving a stale page.
+ANALYTICS_DIR="${ANALYTICS_DIR:-$BASE/analytics}"
 MARKER="${MARKER:-$STATE_DIR/.disk-built}"
 SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
 SENTINEL=/etc/.zd-image
@@ -63,8 +68,16 @@ done
 rootfs_sig="$(sha256sum "$ROOTFS" | awk '{print $1}')"
 bootfs_sig="$( cd "$BASE" && { sha256sum "$BOOTFS_SRC" "$IMAGE_DIR/menu.lst" \
     "$IMAGE_DIR/restoreinitramfs.ver" build-bootfs.py; } | sha256sum | awk '{print $1}')"
-patch_sig="$( cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; \
-    printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}')"
+patch_sig="$( {
+    cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; \
+        printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}'
+    if [ -d "$ANALYTICS_DIR" ]; then
+        ( cd "$ANALYTICS_DIR" && find . -type f -print | LC_ALL=C sort | while read -r f; do
+              printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'
+          done ) | sha256sum | awk '{print $1}'
+    fi
+    printf 'ZD_VIRTUAL_BUILD_ID=%s\n' "${ZD_VIRTUAL_BUILD_ID:-}"
+} | sha256sum | awk '{print $1}')"
 
 # --- (re)build the disk when missing or the base firmware changed ------------
 rebuild=0; reason=""
@@ -151,7 +164,9 @@ done
 for patch in "$PATCHES_DIR"/*.sh; do
     [ -f "$patch" ] || continue
     say "running patch: $(basename "$patch")"
-    QCOW="$DISK" WORK="$WORK" bash "$patch" "$SIGN_CERT_DIR"
+    QCOW="$DISK" WORK="$WORK" ANALYTICS_DIR="$ANALYTICS_DIR" \
+        ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
+        bash "$patch" "$SIGN_CERT_DIR"
 done
 
 # --- stamp each customised root with the sentinel ---------------------------
