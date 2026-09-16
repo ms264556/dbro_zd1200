@@ -18,6 +18,19 @@
 
     [ -r "$key_src" ] || exit 0
 
+    # 9.x has no root account: uid 0 is "admin" (home "/").  The 2222 listener
+    # is documented as root@, and dropbear reads the account's
+    # $HOME/.ssh/authorized_keys, so synthesise a passwordless root when it is
+    # missing.  The "*" shadow entry keeps password logins impossible, so only
+    # the public-key 2222 listener can use it.  On 10.x root already exists.
+    if [ -r /etc/passwd ] && ! grep -q '^root:' /etc/passwd; then
+        echo 'root:x:0:0:root:/:/bin/sh' >> /etc/passwd 2>/dev/null || true
+        grep -q '^root:' /etc/shadow 2>/dev/null || \
+            echo 'root:*:0:0:99999:7:::' >> /etc/shadow 2>/dev/null || true
+        echo "added a passwordless root account for the 2222 listener" \
+            >> /writable/zd1200-ssh-recovery.log
+    fi
+
     # dropbear reads /.ssh/authorized_keys for root (the vendor passwd gives
     # root the home directory "/").  On the ZD1200 /.ssh is already a symlink to
     # /writable/data/dropbear, so the key lives on the writable partition and

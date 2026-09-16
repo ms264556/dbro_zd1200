@@ -23,8 +23,8 @@ authenticated preference mechanism.
 
 | file | built by | installed as (guest) |
 |---|---|---|
-| `ping-monitor.html` | – | `/web/admin10/zd1200-network-monitor.html` |
-| `ping-monitor-worker.js` | – | `/web/admin10/zd1200-network-monitor-worker.js` |
+| `ping-monitor.html` | – | `/web/admin10/zd1200-network-monitor.html` (10.x) or `/web/admin/zd1200-network-monitor.html` (9.x) |
+| `ping-monitor-worker.js` | – | `/web/admin10/zd1200-network-monitor-worker.js` (10.x) or `/web/admin/…` (9.x) |
 | `zd1200-ping-monitor.c` | `analytics-helper` Docker stage | `/usr/local/sbin/zd1200-ping-monitor` |
 | `zd1200-ping-export.c` | `analytics-helper` Docker stage | `/usr/local/sbin/zd1200-ping-export` |
 | `zd1200-local-getstat.c` | `analytics-helper` Docker stage | `/usr/local/sbin/zd1200-local-getstat` |
@@ -53,7 +53,8 @@ rootfs already provides:
 
 Runtime state lives on the writable partition under
 `/writable/zd1200-ping-monitor/` and is exposed to the browser through
-symlinks in `/web/admin10/`. Nothing is uploaded off the controller.
+symlinks in the console's web root (`/web/admin10/` on 10.x, `/web/admin/` on
+9.x). Nothing is uploaded off the controller.
 
 ## License
 

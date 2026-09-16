@@ -47,22 +47,19 @@ PARTITIONS=(
     "hda3|499720|415152"
 )
 
-# The signing/license patch is OPTIONAL from the coordinator's point of view:
-# if the signing-cert payload is absent (e.g. a bare firmware archive without a
-# cert, or ZD_SIGN_CERT_DIR not mounted) the guest can still boot, just without
-# the baked-in license/upgrade entitlement.  Warn and no-op instead of failing
-# so the coordinator does not abort the whole pipeline over it.  A patch that
-# DOES touch the rootfs (e.g. the ARM/nolog fix) is genuinely required and
-# still aborts on failure.
-missing=0
+# The cert payload (signing_cert.pem + the two digital-sig blobs +
+# all_checksums.txt) only ships in the 10.2+/10.5 archives.  Releases up to
+# 10.1.x/9.x have no check_sign_cert() at all -- they only expose
+# verify-upload-support / wget-support-entitlement -- so the cert is not needed
+# there.  Patch whatever the release has: the check_sign_cert() bypass only when
+# the cert exists, the entitlement shortcuts always.
+have_cert=1
 for c in signing_cert.pem digital_sig_sha256.bin digital_sig_sha384.bin all_checksums.txt; do
     if [ ! -f "$CERT_DIR/$c" ]; then
-        echo "WARNING: missing $CERT_DIR/$c; skipping the signing/license patch" >&2
-        echo "         (guest will boot WITHOUT the upgrade entitlement)" >&2
-        missing=1
+        echo "note: $CERT_DIR/$c missing; the check_sign_cert() bypass will be skipped" >&2
+        have_cert=0
     fi
 done
-[ "$missing" = 0 ] || exit 0
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
@@ -71,8 +68,11 @@ say() { printf '\n== %s\n' "$*"; }
 say "reading the flat disk $QCOW"
 ln -sf "$QCOW" "$WORK/flat.raw"
 
-# Pack the cert payload once (content identical on every partition).
-( cd "$CERT_DIR" && tar -czf "$WORK/cert.tgz" . )
+# Pack the cert payload once (content identical on every partition).  Only
+# meaningful when the release ships the cert (see above).
+if [ "$have_cert" = 1 ]; then
+    ( cd "$CERT_DIR" && tar -czf "$WORK/cert.tgz" . )
+fi
 
 # The sys_wrapper.sh injection, copied verbatim from persist.sh, minus the
 # restart() persistence hook.  The verify-upload-support / wget-support-
@@ -80,7 +80,7 @@ ln -sf "$QCOW" "$WORK/flat.raw"
 # /writable/etc/airespider/support-list.xml with status="1" and the serial
 # from /bin/SERIAL (symlink -> /proc/v54bsp/serial, i.e. the board-data /
 # MAC-derived serial).  `date +%s` keeps the start date fresh on each boot.
-cat > "$WORK/sys_wrapper.sed" <<'SEDEOF'
+cat > "$WORK/sys_wrapper-cert.sed" <<'SEDEOF'
 /check_sign_cert() {/a \
     if [ "$2" = "script" ] ; then\
        check_sign_cert_unpatched "$1" "$2" "$3"\
@@ -96,6 +96,8 @@ cat > "$WORK/sys_wrapper.sed" <<'SEDEOF'
     fi\
 }\
 check_sign_cert_unpatched() {
+SEDEOF
+cat > "$WORK/sys_wrapper-entitlement.sed" <<'SEDEOF'
 /verify-upload-support)/a \
         cd \/tmp\
         cat \/etc\/persistent-scripts\/patch-storage\/support > support\
@@ -120,6 +122,13 @@ SUPPORT_EOF\
         ;;\
     wget-support-entitlement-unpatched)
 SEDEOF
+# The check_sign_cert() bypass needs the cert payload; the entitlement
+# shortcuts do not, so keep them independent of a release that has no cert.
+: > "$WORK/sys_wrapper.sed"
+if [ "$have_cert" = 1 ]; then
+    cat "$WORK/sys_wrapper-cert.sed" >> "$WORK/sys_wrapper.sed"
+fi
+cat "$WORK/sys_wrapper-entitlement.sed" >> "$WORK/sys_wrapper.sed"
 
 patched_any=0
 for part in "${PARTITIONS[@]}"; do
@@ -164,7 +173,9 @@ for part in "${PARTITIONS[@]}"; do
         echo "  ! /bin/sys_wrapper.sh not present, skipping partition" >&2
         continue
     fi
-    if grep -q '^check_sign_cert_unpatched()' "$WORK/sys_wrapper.orig"; then
+    # The entitlement shortcuts always insert this marker, even on releases
+    # that have no check_sign_cert(); use it so the sed is never applied twice.
+    if grep -q '^verify-upload-support-unpatched)' "$WORK/sys_wrapper.orig"; then
         echo "  /bin/sys_wrapper.sh already patched (nothing to do)"
     else
         sed -f "$WORK/sys_wrapper.sed" "$WORK/sys_wrapper.orig" > "$WORK/sys_wrapper.new"
@@ -186,7 +197,9 @@ EOF
 
     debugfs -w -R "mkdir /etc/persistent-scripts/patch-storage" "$WORK/$name.img" 2>/dev/null || true
     : > "$WORK/cmds2.txt"
-    for f in cert.tgz support support.spt; do
+    storage_files=(support support.spt)
+    [ "$have_cert" = 1 ] && storage_files+=(cert.tgz)
+    for f in "${storage_files[@]}"; do
         debugfs -w -R "rm /etc/persistent-scripts/patch-storage/$f" "$WORK/$name.img" >/dev/null 2>&1 || true
         printf 'write %s /etc/persistent-scripts/patch-storage/%s\n' "$WORK/$f" "$f" >> "$WORK/cmds2.txt"
     done
