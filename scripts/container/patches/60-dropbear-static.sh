@@ -28,7 +28,7 @@
 # patches; only changed 512-byte blocks reach the disk.
 #
 # Usage:
-#   QCOW=<flat-disk> WORK=<workdir> ZD_ROOT_SSH=1 ./60-dropbear-static.sh
+#   QCOW=<flat-disk> WORK=<workdir> ./60-dropbear-static.sh
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,9 +55,10 @@ for b in "${PAYLOAD_BIN[@]}"; do
 done
 [ -f "$INIT_SRC" ] || enabled=0
 [ -s "$AUTHORIZED_KEYS" ] || enabled=0
-case "${ZD_ROOT_SSH:-auto}" in
-    0|false|no|off) enabled=0 ;;
-esac
+# Whether the feature is available is decided at image-build time (the
+# ZD_ROOT_SSH build arg controls whether the payload exists at all), so it must
+# not also depend on a runtime environment variable: a plain `docker compose
+# up` would otherwise re-disable a working install.
 
 key_line=""
 if [ "$enabled" = 1 ]; then

@@ -237,6 +237,18 @@ else
     console_args=( -nographic )
 fi
 
+# Container lifecycle control: a second serial port (ttyS1) is a private,
+# non-networked channel.  The entrypoint writes "reboot" on it when the
+# container is asked to stop; an in-guest init hook runs the stock reboot path,
+# which unmounts and flushes /writable before QEMU resets.  Set
+# ZD_CONTAINER_CONTROL=0 to disable (then stops fall back to killing QEMU).
+control_args=()
+control_sock="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
+if [ "${ZD_CONTAINER_CONTROL:-1}" != "0" ]; then
+    control_args=( -chardev "socket,id=ctl0,path=$control_sock,server=on,wait=off"
+                   -serial chardev:ctl0 )
+fi
+
 # The CF is on QEMU's AHCI controller, not the PIIX IDE controller, so the guest
 # enumerates it as /dev/sda (the vendor kernel's libata/ahci/sd drivers are built
 # in).  This matters: the firmware upgrade's own menu.lst template uses
@@ -261,6 +273,7 @@ qemu_args=(
     "${ipmi_args[@]}"
     "${debugcon_args[@]}"
     "${console_args[@]}"
+    "${control_args[@]}"
     "${pacing_args[@]}"
     "${debug_args[@]}"
 )
@@ -273,6 +286,14 @@ while :; do
     rc=$?
     if [ "$rc" -ne 10 ]; then
         exit "$rc"
+    fi
+    # A guest reboot normally means "relaunch QEMU".  If the entrypoint asked
+    # for an orderly stop, this reset is the tail of the guest's shutdown, so
+    # exit cleanly instead of booting again.
+    if [ -f "${STATE_DIR:-$work_dir}/.stop-after-reset" ]; then
+        rm -f "${STATE_DIR:-$work_dir}/.stop-after-reset"
+        echo "guest rebooted for an orderly stop; not relaunching QEMU" >&2
+        exit 0
     fi
     echo "guest requested a reboot; relaunching QEMU" >&2
 done

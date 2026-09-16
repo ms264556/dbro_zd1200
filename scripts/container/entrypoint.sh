@@ -7,6 +7,7 @@ set -euo pipefail
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
 log_file="${LOG_FILE:-/tmp/zd1200-console.log}"
+control_sock="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
 qemu_pid=""
 limiter_pid=""
 started_at=$SECONDS
@@ -32,11 +33,43 @@ else
 fi
 
 cleanup() {
+    # $1 = 1 for a signal (docker stop/down): try an orderly guest shutdown
+    # first so the guest unmounts and flushes /writable.  0 (normal exit) just
+    # tears QEMU down.
+    local graceful="${1:-0}"
     trap - EXIT INT TERM
+    if [[ "$limiter_pid" =~ ^[0-9]+$ ]] && (( limiter_pid > 1 )); then
+        kill "$limiter_pid" 2>/dev/null || true
+        wait "$limiter_pid" 2>/dev/null || true
+    fi
     if [[ "$qemu_pid" =~ ^[0-9]+$ ]] && (( qemu_pid > 1 )); then
-        if [[ "$limiter_pid" =~ ^[0-9]+$ ]] && (( limiter_pid > 1 )); then
-            kill "$limiter_pid" 2>/dev/null || true
-            wait "$limiter_pid" 2>/dev/null || true
+        if [ "$graceful" = 1 ] && [ "${ZD_CONTAINER_CONTROL:-1}" != "0" ] \
+           && kill -0 "$qemu_pid" 2>/dev/null; then
+            echo "Requesting an orderly guest shutdown (unmounts /writable)..."
+            # launch-vm.sh sees this and exits after the guest's reboot-reset
+            # instead of relaunching QEMU.
+            : > "$state_dir/.stop-after-reset" 2>/dev/null || true
+            if [ -S "$control_sock" ]; then
+                python3 - "$control_sock" <<'PY' 2>/dev/null || true
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall(b"reboot\n")
+s.close()
+PY
+            fi
+            # The guest's reboot path flushes the data partition; allow the same
+            # grace the appliance itself needs after an unclean stop.
+            for _ in $(seq 1 "${ZD_STOP_TIMEOUT:-240}"); do
+                kill -0 "$qemu_pid" 2>/dev/null || break
+                sleep 0.5
+            done
+            if kill -0 "$qemu_pid" 2>/dev/null; then
+                echo "Guest did not shut down in time; stopping QEMU." >&2
+            else
+                echo "Guest shut down cleanly."
+            fi
         fi
         kill -CONT -- "-$qemu_pid" 2>/dev/null || true
         kill -TERM -- "-$qemu_pid" 2>/dev/null || true
@@ -48,10 +81,13 @@ cleanup() {
         wait "$qemu_pid" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup 1' INT TERM
+trap 'cleanup 0' EXIT
 
 cd "$work_dir" || exit 1
 mkdir -p "$state_dir"
+# A stale orderly-stop marker from a previous run must not suppress a reboot.
+rm -f "$state_dir/.stop-after-reset" 2>/dev/null || true
 
 if [ ! -f image/bzImage ]; then
     echo "Missing image/bzImage" >&2

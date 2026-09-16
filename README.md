@@ -315,6 +315,15 @@ usual knobs:
   the QMP `guest-reset` event to exit 10: the loop re-applies the patches and
   relaunches QEMU. A guest poweroff maps to exit 0 and stops the container
   (compose `restart: on-failure`, so a clean exit is not restarted).
+- **Stopping the container is graceful.** On `docker compose stop`/`down`, the
+  entrypoint asks the guest to shut down over a private second serial port
+  (ttyS1) and `S98zd_container_control` runs the stock reboot path, so the
+  controller flushes and the kernel unmounts `/writable` before QEMU is torn
+  down. That is why `stop_grace_period` is 180s — do not lower it. If the guest
+  does not respond within `ZD_STOP_TIMEOUT` (half-seconds), QEMU is killed and
+  `prepare-vm-disks.sh` repairs the ext2 data partition on the next start.
+  (ACPI is deliberately off to match the cob7402; QMP `system_powerdown` would
+  need an ACPI power-button handler that this userspace does not have.)
 - **In-guest firmware upgrades work.** A web-UI upgrade writes the new firmware
   onto the spare root partition and reboots. That partition has no sentinel, so
   the next start applies the kernel patch (to *its* `/bzImage`) and the rootfs
