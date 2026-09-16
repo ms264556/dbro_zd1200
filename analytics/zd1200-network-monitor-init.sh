@@ -11,6 +11,7 @@
     current_ap_detail=/writable/zd1200-ping-monitor/current-ap-detail.xml
     configured_targets=/writable/zd1200-ping-monitor/client-targets.conf
     intervals=/writable/zd1200-ping-monitor/intervals.conf
+    seeded_defaults=/etc/zd1200-ping-monitor-defaults.conf
     settings_status=/writable/zd1200-ping-monitor/settings.json
     target_metadata=/writable/zd1200-ping-monitor/targets.json
     daily_manifest=/writable/zd1200-ping-monitor/daily-manifest.json
@@ -23,6 +24,25 @@
     last_collection=0
     settings_source=defaults
     mkdir -p /writable/zd1200-ping-monitor "$snapshot_dir"
+    # Operator defaults baked into the image by 50-network-monitor.sh (from the
+    # ZD_PING_* build/deploy settings).  Seed the writable configuration only
+    # while it is absent: an existing file means the administrator has already
+    # configured the monitor from the page, and that choice wins from then on.
+    if [ -r "$seeded_defaults" ]; then
+        if [ ! -e "$intervals" ]; then
+            seeded_interval=$(sed -n 's/^MONITOR_INTERVAL_SECONDS=//p' "$seeded_defaults" | head -n 1)
+            case "$seeded_interval" in
+                ''|*[!0-9]*) ;;
+                *) printf 'MONITOR_INTERVAL_SECONDS=%s\n' "$seeded_interval" > "$intervals" ;;
+            esac
+        fi
+        if [ ! -e "$configured_targets" ]; then
+            seeded_targets=$(sed -n 's/^CLIENT_TARGETS=//p' "$seeded_defaults" | head -n 1)
+            if [ -n "$seeded_targets" ]; then
+                printf '%s\n' "$seeded_targets" > "$configured_targets"
+            fi
+        fi
+    fi
     /usr/local/sbin/zd1200-snapshot-index-publish rebuild 2>/dev/null || true
     [ -r "$snapshot_manifest" ] || printf '{"version":1,"generated_at":0,"periods":[]}\n' > "$snapshot_manifest"
     [ -r "$target_metadata" ] || printf '{"status":"waiting","format_version":2,"targets":[]}\n' > "$target_metadata"

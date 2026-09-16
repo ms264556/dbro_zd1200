@@ -95,6 +95,8 @@ patch_sig="$( {
         printf 'ZD_ROOT_SSH_KEY=unreadable\n'
     fi
     printf 'ZD_ECDSA_SSH=%s\n' "$ZD_ECDSA_SSH"
+    printf 'ZD_PING_INTERVAL_SECONDS=%s\n' "${ZD_PING_INTERVAL_SECONDS:-}"
+    printf 'ZD_PING_CLIENT_TARGETS=%s\n' "${ZD_PING_CLIENT_TARGETS:-}"
 } | sha256sum | awk '{print $1}')"
 
 # --- (re)build the disk when missing or the base firmware changed ------------
@@ -210,6 +212,8 @@ for patch in "$PATCHES_DIR"/*.sh; do
         ZD_ROOT_SSH_AUTHORIZED_KEYS="$ZD_ROOT_SSH_AUTHORIZED_KEYS" \
         ZD_ECDSA_SSH="$ZD_ECDSA_SSH" \
         ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
+        ZD_PING_INTERVAL_SECONDS="${ZD_PING_INTERVAL_SECONDS:-}" \
+        ZD_PING_CLIENT_TARGETS="${ZD_PING_CLIENT_TARGETS:-}" \
         bash "$patch" "$SIGN_CERT_DIR"
 done
 
