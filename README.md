@@ -52,7 +52,18 @@ AP models list.
 Any ZD1200 release works — `scripts/build/prepare-vendor-image.sh` validates the
 `metadata` (`REQUIRE_PLATFORM=nar5520`, `REQUIRE_SUBPLATFORM=cob7402`) and the
 kernel/rootfs MD5s, and does not pin a version. The prepared artifacts land in
-`image/` (gitignored).
+`image/` (gitignored). The tested matrix is 10.5.1.0.282, 10.2.1.0.236,
+10.1.2.0.318, 9.13.3.0.164 and 9.10.2.0.130.
+
+The archive layout differs between generations. The 10.2+/10.5 payloads carry
+the web `aidfs` tree and the `signing_cert.pem` / `digital_sig_*` files; the
+10.1.x and 9.x payloads carry neither (they serve the admin UI straight from
+the rootfs). `prepare-vendor-image.sh` therefore requires only what every
+release has (kernel, rootfs, boot menu, AP model list) and stages `aidfs` and
+the signing cert only when they are present. The rootfs patches adapt the same
+way: `20-signing-license.sh` applies the `check_sign_cert()` bypass only when
+the cert exists but always applies the `verify-upload-support` /
+`wget-support-entitlement` shortcuts, which need no cert.
 
 Pass the file to the build script, or set `ZD_ARCHIVE`. To pin the payload
 integrity, set `EXPECTED_ARCHIVE_SHA256`; the 10.5.1.0.282 payload is
@@ -265,6 +276,17 @@ so the host still needs no compiler. Because the patch signature now includes
 this payload, rebuilding the image with a changed page or binary re-customises
 the roots on the next start.
 
+The menu integration is version-aware (`50-network-monitor.sh`). 10.x installs
+the page at `/web/admin10/` and appends the entry to the Troubleshooting node of
+the `app.js` / `ruckus.js` webpack bundles. 9.12/9.13 (the "Edison" console)
+installs it at `/web/admin/`, adds a **Network Monitor** item under the Monitor
+menu in `edison/js/common/systemMenu.js`, and loads a small module that iframes
+the page. 9.9–9.11 (the classic console, whose menu is compiled into
+`admin_template.mod`) appends a DOM hook to the plain `/web/scripts/util.js`.
+The page derives its `/admin10` vs `/admin` URL base from its own path, so its
+data-endpoint symlinks and its ZoneDirector preference (`_conf.jsp`) call follow
+the console it is served from.
+
 ---
 
 ## Root SSH on TCP 2222 (optional)
@@ -299,6 +321,12 @@ vendor binary is kept as `/usr/sbin/dropbear.vendor`, and port 22 keeps its
 stock `-A none` + `/bin/login.sh` behaviour untouched. Omitting
 `--root-ssh-key` on a later build turns the feature back off and restores the
 vendor binary — the patch reverts its own changes.
+
+The 9.x releases have no `root` account at all (uid 0 is `admin`, home `/`), so
+the `S61zd_root_ssh` boot hook synthesises a passwordless `root` before starting
+the listener; the shadow entry is `*`, so only the public-key 2222 listener can
+use it. On 10.x `root` already exists and the step is a no-op. Logging in as
+either `root` or `admin` yields a uid-0 shell on every release.
 
 ---
 
@@ -337,6 +365,17 @@ from pinned GPL-2.0 source. **R600 is the validated target**; the other models
 are repaired only because they resolve to the identical vendor image, and an AP
 still running fully signed FSI firmware must first be moved to a compatible ISI
 release through its standalone upgrade page.
+
+This is the one repair that keys off a version string rather than sniffing for a
+feature: the helper reads the AP image's own BL7 version and applies the fix only
+when it starts with `10.5.1.` (the family that carries the bug), printing
+`ap-11n-scorpion payload <ver> is not a 10.5.1 build; mesh repair skipped`
+otherwise. `build-synthetic-cf.py` also skips it outright when the payload has no
+`r600/` directory. Every other rootfs patch decides from the files and patterns
+it finds (`sesame`/`sesame2`, `check_sign_cert`/entitlement cases,
+`/web/admin10` vs the 9.x consoles, …), and the kernel patcher matches byte
+signatures (with `rks_pkt_trace_init` optional because the 9.x kernels predate
+tif0).
 
 ---
 

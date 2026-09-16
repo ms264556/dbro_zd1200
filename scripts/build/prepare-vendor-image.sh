@@ -52,10 +52,17 @@ source_dir="$(dirname "$metadata")"
 require_file() {
     [ -f "$source_dir/$1" ] || fail "vendor archive lacks $1"
 }
-for required in bzImage restoreinitramfs.gz restoreinitramfs.ver menu.lst rootfs.i386.ext2.director1200.img metadata aidfs/file_list.txt file_list.txt ap-models; do
+for required in bzImage restoreinitramfs.gz restoreinitramfs.ver menu.lst rootfs.i386.ext2.director1200.img metadata file_list.txt ap-models; do
     require_file "$required"
 done
 [ -d "$source_dir/firmwares" ] || fail "vendor archive lacks firmwares/"
+# The web-UI aidfs payload only exists in the 10.2+/10.5 archives; 10.1.x and
+# 9.x serve the admin UI straight from the rootfs, so it is optional.  When it
+# is absent the /writable tree is staged from firmwares/ alone
+# (build-synthetic-cf.py).
+if [ ! -f "$source_dir/aidfs/file_list.txt" ]; then
+    echo "prepare-vendor-image: note: no aidfs/file_list.txt (pre-10.2 release); /writable is staged without the web aidfs" >&2
+fi
 
 metadata_value() {
     awk -F= -v key="$1" '$1 == key { print $2; exit }' "$metadata"
@@ -150,8 +157,12 @@ else:
     raise SystemExit("could not locate an ELF kernel inside bzImage")
 PY
 
+# The web-UI aidfs is only present in newer archives; include it when it exists
+# so the payload tarball (and the /writable staged from it) matches the release.
+payload_members=(firmwares ap-models file_list.txt)
+[ -d "$source_dir/aidfs" ] && payload_members+=(aidfs)
 tar -C "$source_dir" -czf "$output_dir/zd1200-payload.tar.gz" \
-    firmwares aidfs ap-models file_list.txt
+    "${payload_members[@]}"
 
 echo "Prepared local vendor-derived artifacts in $output_dir"
 sha256sum "$output_dir/bzImage" "$output_dir/vmlinux" "$output_dir/rootfs.ext2" \

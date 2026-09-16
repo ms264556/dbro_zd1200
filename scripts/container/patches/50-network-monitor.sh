@@ -193,6 +193,111 @@ symlink_force() {
     debugfs -w -R "symlink $link $target" "$img" >/dev/null 2>&1
 }
 
+# ui_layout_of <img>  -> "<flavor>|<webroot>"
+#   10       : 10.x admin console, /web/admin10, webpack bundles in /web/build
+#   9edison  : 9.12/9.13 "Edison" console, /web/admin, menu in
+#              edison/js/common/systemMenu.js
+#   9classic : 9.9-9.11 classic console, /web/admin, menu compiled into
+#              admin_template.mod (patched through a DOM hook in scripts/util.js)
+ui_layout_of() {
+    if [ -n "$(stat_meta "$1" /web/admin10)" ]; then
+        echo "10|/web/admin10"
+    elif [ -n "$(stat_meta "$1" /web/admin/edison/js/common/systemMenu.js)" ]; then
+        echo "9edison|/web/admin"
+    elif [ -n "$(stat_meta "$1" /web/admin)" ]; then
+        echo "9classic|/web/admin"
+    else
+        echo "10|/web/admin10"
+    fi
+}
+
+# install_edison_menu <img> <webroot>
+# Adds a "Network Monitor" sub-item under the Edison "Monitor" menu and installs
+# the small module it loads, which renders the report page in a full-height
+# iframe (the Edison shell loads a JS class into #system_main_div, not a page).
+install_edison_menu() {
+    local img="$1" webroot="$2"
+    local menu="$WORK/systemMenu.js" module="$WORK/zd1200NetworkMonitor.js"
+    debugfs -R "dump $webroot/edison/js/common/systemMenu.js $menu" "$img" >/dev/null 2>&1 || {
+        echo "  !! systemMenu.js not readable" >&2
+        return 1
+    }
+    if ! grep -q 'zd1200NetworkMonitorControl' "$menu"; then
+        # Anchor on the Monitor menu's subItems array (the file is not minified,
+        # so this literal is stable across 9.12/9.13 builds).
+        sed -i 's@{menubar:R.monitor, subItems:\[@{menubar:R.monitor, subItems:[{name:"Network Monitor",action:"zd1200NetworkMonitorControl",jsPath:"mon/zd1200NetworkMonitor.js"},@' "$menu"
+    fi
+    if ! grep -q 'zd1200NetworkMonitorControl' "$menu"; then
+        echo "  !! Edison Monitor menu anchor not found in systemMenu.js" >&2
+        return 1
+    fi
+    cp "$menu" "$WORK/systemMenu.patched"
+    write_local "$img" "$webroot/edison/js/common/systemMenu.js" "$menu" 0644
+
+    cat > "$module" <<EOF
+// Network Monitor panel for the Edison (9.12/9.13) admin console.
+// Loaded by systemMenu.js via Common.load(); renders the report page in an
+// iframe so it reuses the 10.x page verbatim.
+var zd1200NetworkMonitorControl = Class.create({
+    initialize: function(el) {
+        el.update('<iframe id="zd1200-ping-monitor-frame" src="$UI_BASE/zd1200-network-monitor.html?ui=9" style="width:100%;height:100%;min-height:640px;border:0;display:block;"></iframe>');
+    }
+});
+EOF
+    mkdir_p "$img" "$webroot/edison/js/mon"
+    write_local "$img" "$webroot/edison/js/mon/zd1200NetworkMonitor.js" "$module" 0644
+    echo "  patched $webroot/edison/js/common/systemMenu.js + js/mon/zd1200NetworkMonitor.js"
+    return 0
+}
+
+# install_classic_menu <img> <webroot>
+# The classic (9.9-9.11) console builds its left menu inside the compiled
+# admin_template.mod, which cannot be regenerated offline.  Instead append a
+# small DOM hook to the plain /web/scripts/util.js that adds a "Network Monitor"
+# entry to the rendered menu once the page is up.
+install_classic_menu() {
+    local img="$1" webroot="$2"
+    local util="$WORK/util.js"
+    debugfs -R "dump /web/scripts/util.js $util" "$img" >/dev/null 2>&1 || {
+        echo "  !! scripts/util.js not readable" >&2
+        return 1
+    }
+    if ! grep -q 'zd1200NetworkMonitorControl' "$util"; then
+        cat >> "$util" <<EOF
+
+// --- Network Monitor menu hook (this fork) --------------------------------
+// The classic console menu lives in the compiled admin_template.mod; append the
+// entry client-side instead.  marker: zd1200NetworkMonitorControl
+(function () {
+    var URL = "$UI_BASE/zd1200-network-monitor.html";
+    var LABEL = "Network Monitor";
+    function addEntry() {
+        var menu = document.getElementById("mainmenu");
+        if (!menu || document.getElementById("zd1200_ping_monitor")) return;
+        var row = document.createElement("div");
+        row.id = "zd1200_ping_monitor";
+        row.className = "menu_item";
+        row.style.cssText = "padding:4px 6px;cursor:pointer;";
+        row.innerHTML = '<span>' + LABEL + '</span>';
+        row.onclick = function () { window.location.href = URL; };
+        menu.appendChild(row);
+    }
+    if (document.readyState === "complete") { addEntry(); }
+    else if (window.addEventListener) { window.addEventListener("load", addEntry, false); }
+    else if (window.attachEvent) { window.attachEvent("onload", addEntry); }
+})();
+EOF
+    fi
+    if ! grep -q 'zd1200NetworkMonitorControl' "$util"; then
+        echo "  !! classic menu hook could not be appended" >&2
+        return 1
+    fi
+    cp "$util" "$WORK/util.patched"
+    write_local "$img" /web/scripts/util.js "$util" 0644
+    echo "  patched /web/scripts/util.js with the Network Monitor menu hook"
+    return 0
+}
+
 # --- admin-console bundle patching -------------------------------------------
 # Port of dbro/zd1200's V4 menu patch (boot-initrd-handoff, upstream 10aeb90).
 # The menu link points at the stock "Network Connectivity" JSP, whose normal
@@ -217,15 +322,16 @@ arm_menu_bundle() {
 
     if ! grep -q "$MARKER" "$bundle"; then
         if [ "$bundle_name" = app ]; then
+            # Anchor on the Troubleshooting node rather than on its children:
+            # the child identifiers/order change between firmware builds
+            # (10.5.1: [a,n,r], 10.2.1: [n,r], 10.1.2: [n,a,r] / [a,r]).  The
+            # bundle is minified, so [^]]* walks to the end of that node's
+            # children array.
             sed -i \
-                -e 's|children:\[a,n,r\]})|children:[a,n,r,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})|g' \
-                -e 's|children:\[n,r\]})|children:[n,r,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})|g' \
+                -e 's@\(id:"Troubleshooting",title:Msg.CF_Troubleshooting||"Troubleshooting",children:\[[^]]*\)\]})@\1,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})@g' \
                 "$bundle"
         else
-            # Anchor on the Troubleshooting node rather than on its children:
-            # the child identifiers are renamed between firmware builds
-            # (10.5.1: [n,i,r], 10.2.1: [n,r,o]).  The bundle is minified, so
-            # [^]]* walks to the end of that node's children array.
+            # Same anchor for the legacy bundle.
             sed -i \
                 -e 's@\(id:"Troubleshooting",title:Msg.CF_Troubleshooting||"Troubleshooting",children:\[[^]]*\)\]})@\1,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})@g' \
                 "$bundle"
@@ -408,6 +514,15 @@ for part in "${PARTITIONS[@]}"; do
     say "[$name] installing the Network Monitor payload"
     mkdir_p "$WORK/$name.img" /usr/local/sbin
 
+    # Which admin console does this release ship?  See ui_layout_of().
+    IFS='|' read -r UI_FLAVOR WEB_ROOT <<< "$(ui_layout_of "$WORK/$name.img")"
+    case "$UI_FLAVOR" in
+        10) UI_BASE=/admin10 ;;
+        *)  UI_BASE=/admin ;;
+    esac
+    echo "  admin console: $UI_FLAVOR ($WEB_ROOT, url base $UI_BASE)"
+    mkdir_p "$WORK/$name.img" "$WEB_ROOT"
+
     # A private copy of the vendor busybox gives the collectors a stable
     # /usr/local/sbin/busybox with the applets they use (the stock root has no
     # standalone sed/awk utilities, only the multicall /bin/busybox).
@@ -426,11 +541,11 @@ for part in "${PARTITIONS[@]}"; do
         write_local "$WORK/$name.img" "/usr/local/sbin/$dst" "$ANALYTICS_DIR/$src" 0755
     done
 
-    write_local "$WORK/$name.img" /web/admin10/zd1200-network-monitor.html "$PING_HTML" 0644
-    write_local "$WORK/$name.img" /web/admin10/zd1200-network-monitor-worker.js "$PING_WORKER" 0644
+    write_local "$WORK/$name.img" "$WEB_ROOT/zd1200-network-monitor.html" "$PING_HTML" 0644
+    write_local "$WORK/$name.img" "$WEB_ROOT/zd1200-network-monitor-worker.js" "$PING_WORKER" 0644
     write_local "$WORK/$name.img" /etc/init.d/S99zd_ping_monitor "$INIT_SH" 0755
 
-    if [ -n "$VIRTUAL_BUILD_ID" ]; then
+    if [ -n "$VIRTUAL_BUILD_ID" ] && [ "$UI_FLAVOR" = 10 ]; then
         printf '%s\n' "$VIRTUAL_BUILD_ID" > "$WORK/virtual-build-id"
         write_local "$WORK/$name.img" /etc/zd1200-virtual-build-id "$WORK/virtual-build-id" 0444
     fi
@@ -446,7 +561,7 @@ for part in "${PARTITIONS[@]}"; do
             "$WORK/$name.img" >/dev/null 2>&1 || true
     fi
 
-    say "[$name] linking the monitor data endpoints into /web/admin10"
+    say "[$name] linking the monitor data endpoints into $WEB_ROOT"
     for spec in \
         "zd1200-ping-monitor-snapshot-manifest.json|snapshot-manifest.json" \
         "zd1200-ping-monitor-snapshot-index|snapshot-index" \
@@ -458,19 +573,37 @@ for part in "${PARTITIONS[@]}"; do
         "zd1200-ping-monitor-targets.json|targets.json" \
         "zd1200-ping-monitor-daily-manifest.json|daily-manifest.json" \
         "zd1200-ping-monitor-daily|daily" ; do
-        symlink_force "$WORK/$name.img" "/web/admin10/${spec%%|*}" \
+        symlink_force "$WORK/$name.img" "$WEB_ROOT/${spec%%|*}" \
             "/writable/zd1200-ping-monitor/${spec##*|}"
     done
 
-    say "[$name] adding the Troubleshooting menu entry"
-    process_bundle "$WORK/$name.img" /web/build/app.js app menu
-    process_bundle "$WORK/$name.img" /web/build/ruckus.js ruckus menu
-    process_bundle "$WORK/$name.img" /web/build/scripts.min.js scripts version
-    process_bundle "$WORK/$name.img" /web/scripts/utilOld.js utilold version
-    if ! grep -q "$MARKER" "$WORK/bundle-app.js" 2>/dev/null \
-       && ! grep -q "$MARKER" "$WORK/bundle-ruckus.js" 2>/dev/null; then
-        menu_missing=1
-    fi
+    case "$UI_FLAVOR" in
+        10)
+            say "[$name] adding the Troubleshooting menu entry"
+            process_bundle "$WORK/$name.img" /web/build/app.js app menu
+            process_bundle "$WORK/$name.img" /web/build/ruckus.js ruckus menu
+            process_bundle "$WORK/$name.img" /web/build/scripts.min.js scripts version
+            process_bundle "$WORK/$name.img" /web/scripts/utilOld.js utilold version
+            if ! grep -q "$MARKER" "$WORK/bundle-app.js" 2>/dev/null \
+               && ! grep -q "$MARKER" "$WORK/bundle-ruckus.js" 2>/dev/null; then
+                menu_missing=1
+            fi
+            ;;
+        9edison)
+            say "[$name] adding the Network Monitor menu entry (Edison console)"
+            if ! install_edison_menu "$WORK/$name.img" "$WEB_ROOT" \
+               || ! grep -q 'zd1200NetworkMonitorControl' "$WORK/systemMenu.patched" 2>/dev/null; then
+                menu_missing=1
+            fi
+            ;;
+        9classic)
+            say "[$name] adding the Network Monitor menu entry (classic console)"
+            if ! install_classic_menu "$WORK/$name.img" "$WEB_ROOT" \
+               || ! grep -q 'zd1200NetworkMonitorControl' "$WORK/util.patched" 2>/dev/null; then
+                menu_missing=1
+            fi
+            ;;
+    esac
 
     if write_deltas "$name" "$start"; then
         patched_any=1
@@ -502,21 +635,51 @@ for part in "${PARTITIONS[@]}"; do
         read -r t _ u g <<< "$(stat_meta "$WORK/$name.verify.img" "/usr/local/sbin/$bin")"
         [ "$t" = "regular" ] || { echo "FAIL $name: /usr/local/sbin/$bin missing" >&2; exit 1; }
     done
-    read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" /web/admin10/zd1200-network-monitor.html)"
+    IFS='|' read -r V_FLAVOR V_ROOT <<< "$(ui_layout_of "$WORK/$name.verify.img")"
+    for bin in zd1200-ping-monitor zd1200-ping-export zd1200-local-getstat \
+               zd1200-network-snapshot-collect zd1200-snapshot-index-publish \
+               zd1200-ping-daily-publish zd1200-ping-monitor-settings-sync; do
+        read -r t _ u g <<< "$(stat_meta "$WORK/$name.verify.img" "/usr/local/sbin/$bin")"
+        [ "$t" = "regular" ] || { echo "FAIL $name: /usr/local/sbin/$bin missing" >&2; exit 1; }
+    done
+    read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" "$V_ROOT/zd1200-network-monitor.html")"
     [ "$t" = "regular" ] || { echo "FAIL $name: monitor page missing" >&2; exit 1; }
     read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" /etc/init.d/S99zd_ping_monitor)"
     [ "$t" = "regular" ] || { echo "FAIL $name: collector init script missing" >&2; exit 1; }
-    if debugfs -R "dump /web/build/ruckus.js $WORK/ruckus.final" "$WORK/$name.verify.img" >/dev/null 2>&1 \
-       && grep -q "$PANEL_MARKER" "$WORK/ruckus.final"; then
-        echo "OK   $name: ruckus.js carries the Network Monitor panel"
-    else
-        echo "  ! $name: ruckus.js panel signature not found after patch" >&2
-    fi
+    case "$V_FLAVOR" in
+        10)
+            if debugfs -R "dump /web/build/ruckus.js $WORK/ruckus.final" "$WORK/$name.verify.img" >/dev/null 2>&1 \
+               && grep -q "$PANEL_MARKER" "$WORK/ruckus.final"; then
+                echo "OK   $name: ruckus.js carries the Network Monitor panel"
+            else
+                echo "  ! $name: ruckus.js panel signature not found after patch" >&2
+            fi
+            ;;
+        9edison)
+            debugfs -R "dump $V_ROOT/edison/js/common/systemMenu.js $WORK/systemMenu.final" "$WORK/$name.verify.img" >/dev/null 2>&1
+            if grep -q 'zd1200NetworkMonitorControl' "$WORK/systemMenu.final" 2>/dev/null; then
+                echo "OK   $name: Edison systemMenu.js carries the Network Monitor entry"
+            else
+                echo "  ! $name: Edison menu entry not found after patch" >&2
+            fi
+            read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" "$V_ROOT/edison/js/mon/zd1200NetworkMonitor.js")"
+            [ "$t" = "regular" ] || { echo "FAIL $name: Edison monitor module missing" >&2; exit 1; }
+            ;;
+        9classic)
+            debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$WORK/$name.verify.img" >/dev/null 2>&1
+            if grep -q 'zd1200NetworkMonitorControl' "$WORK/util.final" 2>/dev/null; then
+                echo "OK   $name: classic util.js carries the Network Monitor menu hook"
+            else
+                echo "  ! $name: classic menu hook not found after patch" >&2
+            fi
+            ;;
+    esac
 done
 
 if [ "$menu_missing" = 1 ]; then
-    echo "  ! Network Monitor menu entry was not found in either admin bundle;" >&2
-    echo "    the page is installed but not linked from the Troubleshooting menu." >&2
+    echo "  ! Network Monitor menu entry could not be added to this release's" >&2
+    echo "    admin console; the page and collectors are installed and reachable" >&2
+    echo "    directly, but not linked from the menu." >&2
 fi
 
 say "done — Network Monitor installed in $QCOW"

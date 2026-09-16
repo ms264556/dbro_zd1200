@@ -15,8 +15,10 @@ Patches are located by byte signature, not by address: the kernel is relinked
 for every release, so the same function moves.  Each patch carries the entry
 sequence of the function it targets, with `??` masking bytes that vary between
 releases (embedded absolute addresses and relative displacements).  A patch
-must match the kernel ELF exactly once; zero matches (the release lacks the
-function) or more than one (ambiguous) is a hard error.
+must match the kernel ELF exactly once; more than one match (ambiguous) is a
+hard error, and so is zero matches for a patch that every release carries.  A
+zero match for an entry in OPTIONAL_PATCHES is reported and skipped: the older
+9.x kernels simply predate that function.
 
 Board data (serial, MACs) is not patched here: it lives in the board-data
 records on the CompactFlash image (write-boarddata.py), which the kernel's
@@ -74,7 +76,10 @@ PATCHES = [
     # rks_pkt_trace_init() is the init-time hook that creates the Ruckus "tif0"
     # packet-trace/fastpath interface; it logs "<3>%s failed to create tif0." or
     # "<3>%s create tif0 successfully."  Returning 0 straight away leaves the
-    # interface uncreated, which is what the emulated box wants.
+    # interface uncreated, which is what the emulated box wants.  The 9.x
+    # kernels predate tif0 entirely, so this patch is optional (see
+    # OPTIONAL_PATCHES): when it matches nothing the release simply has no such
+    # interface to suppress.
     ("rks_pkt_trace_init",
      "83ec08e8????????85c0741fc7442404????????c70424????????e8????????e8????????31c083c408c3",
      0, bytes.fromhex("31c0c3"),
@@ -108,6 +113,11 @@ PATCHES = [
      9, bytes.fromhex("e9"),
      "nar5520_wdt_thread(): skip the u-watchdog timeout retry block", 41),
 ]
+
+# Patches that a release may legitimately not carry at all.  A zero match for
+# one of these is reported and skipped; a zero match for any other patch means
+# its signature changed and is still a hard error.
+OPTIONAL_PATCHES = {"rks_pkt_trace_init"}
 
 
 def find_elf_member(data: bytes):
@@ -237,7 +247,12 @@ def main():
             elf[fo:fo + len(patch)] = patch
 
     if missing:
-        raise SystemExit(f"missing patches for this release: {', '.join(missing)}")
+        required_missing = [m for m in missing if m not in OPTIONAL_PATCHES]
+        if required_missing:
+            raise SystemExit(
+                f"missing patches for this release: {', '.join(required_missing)}")
+        print(f"note: patches not applicable to this release (skipped): "
+              f"{', '.join(missing)}")
 
     # Recompress; keep the member region the same length (inflate stops at the
     # trailer, so zero padding after it is harmless).
