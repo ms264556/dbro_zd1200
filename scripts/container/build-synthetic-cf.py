@@ -26,6 +26,7 @@ import os
 from shutil import which
 import struct
 import subprocess
+import sys
 import tempfile
 
 base = Path(__file__).resolve().parent
@@ -158,6 +159,35 @@ with disk.open("r+b") as h:
         h.write(rfs)
 
 
+def patch_scorpion(stage: Path) -> None:
+    """Apply the ap-11n-scorpion (R600) mesh repair to the staged firmware tree.
+
+    ZoneDirector 10.5.1.0.276 introduced a mesh receive-path bug in the shared
+    ap-11n-scorpion AP image.  The vendored dbro/zd1200 tooling converts the
+    signed FSI image to unsigned UI, patches wlan.ko, and resizes the control
+    files of every model that aliases that image.  Non-R600 payloads (and
+    non-10.5.1 builds) are left alone by the helper.
+    """
+    firmware_root = stage / "firmwares"
+    if not (firmware_root / "r600").is_dir():
+        print("  no r600 firmware in payload; ap-11n-scorpion mesh repair skipped")
+        return
+    helper = base / "bl7" / "patch-scorpion-payload.py"
+    unsquashfs = base / "ruckus-squashfs" / "unsquashfs"
+    mksquashfs = base / "ruckus-squashfs" / "mksquashfs"
+    if not (helper.is_file() and unsquashfs.is_file() and mksquashfs.is_file()):
+        raise SystemExit(
+            "ap-11n-scorpion mesh repair tooling missing "
+            f"({helper}, {unsquashfs}, {mksquashfs})"
+        )
+    print("  applying the ap-11n-scorpion (R600) mesh repair")
+    subprocess.run(
+        [sys.executable, str(helper), str(stage),
+         "--unsquashfs", str(unsquashfs), "--mksquashfs", str(mksquashfs)],
+        check=True,
+    )
+
+
 def stage_payload(stage: Path) -> None:
     """Stage the vendor /writable content a firmware install leaves behind: the
     web-UI aidfs/ (ac_upg.sh _upg_aidfs) and the AP images under
@@ -175,6 +205,7 @@ def stage_payload(stage: Path) -> None:
             tar.extractall(path=str(stage), members=members, filter="data")
         except TypeError:          # Python < 3.12 has no extract filter
             tar.extractall(path=str(stage), members=members)
+    patch_scorpion(stage)
     made = stage / "firmwares"
     if made.is_dir():
         target = stage / "etc" / "airespider-images"
