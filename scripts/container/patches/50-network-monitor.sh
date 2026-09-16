@@ -89,6 +89,43 @@ case "$VIRTUAL_BUILD_ID" in
     *) VIRTUAL_BUILD_ID="";;
 esac
 
+# Optional: operator defaults for the monitor, seeded into /writable on the
+# first boot (analytics/zd1200-network-monitor-init.sh).  Collection is off by
+# default, so the interval only matters once monitoring is enabled from the page.
+# Both values are validated here so a typo cannot reach the appliance.
+MONITOR_DEFAULTS=""
+ping_interval="${ZD_PING_INTERVAL_SECONDS:-}"
+if [ -n "$ping_interval" ]; then
+    case "$ping_interval" in
+        *[!0-9]*)
+            echo "50-network-monitor: ignoring non-numeric ZD_PING_INTERVAL_SECONDS='$ping_interval'" >&2
+            ;;
+        *)
+            if [ "$ping_interval" -ge 30 ] && [ "$ping_interval" -le 3600 ]; then
+                MONITOR_DEFAULTS="MONITOR_INTERVAL_SECONDS=$ping_interval"
+            else
+                echo "50-network-monitor: ignoring ZD_PING_INTERVAL_SECONDS=$ping_interval (must be 30-3600)" >&2
+            fi
+            ;;
+    esac
+fi
+ping_targets="${ZD_PING_CLIENT_TARGETS:-}"
+if [ -n "$ping_targets" ]; then
+    # Same 'MAC|IP|NAME' records separated by ';' that the collector accepts.
+    if printf '%s\n' "$ping_targets" | awk -F';' '
+            { for (i = 1; i <= NF; i++) {
+                  if (split($i, f, "|") != 3) bad = 1
+                  for (j = 1; j <= 3; j++) if (f[j] == "") bad = 1
+              } }
+            END { exit bad ? 1 : 0 }'; then
+        MONITOR_DEFAULTS="${MONITOR_DEFAULTS:+$MONITOR_DEFAULTS
+}CLIENT_TARGETS=$ping_targets"
+    else
+        echo "50-network-monitor: ignoring ZD_PING_CLIENT_TARGETS" >&2
+        echo "  expected 'MAC|IP|NAME' records separated by ';'" >&2
+    fi
+fi
+
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 say() { printf '\n== %s\n' "$*"; }
@@ -393,6 +430,17 @@ for part in "${PARTITIONS[@]}"; do
     if [ -n "$VIRTUAL_BUILD_ID" ]; then
         printf '%s\n' "$VIRTUAL_BUILD_ID" > "$WORK/virtual-build-id"
         write_local "$WORK/$name.img" /etc/zd1200-virtual-build-id "$WORK/virtual-build-id" 0444
+    fi
+
+    if [ -n "$MONITOR_DEFAULTS" ]; then
+        printf '%s\n' "$MONITOR_DEFAULTS" > "$WORK/ping-monitor-defaults.conf"
+        write_local "$WORK/$name.img" /etc/zd1200-ping-monitor-defaults.conf \
+            "$WORK/ping-monitor-defaults.conf" 0644
+    else
+        # No defaults configured any more: drop a file an earlier build installed,
+        # so a fresh /writable is never seeded from a stale image.
+        debugfs -w -R "rm /etc/zd1200-ping-monitor-defaults.conf" \
+            "$WORK/$name.img" >/dev/null 2>&1 || true
     fi
 
     say "[$name] linking the monitor data endpoints into /web/admin10"

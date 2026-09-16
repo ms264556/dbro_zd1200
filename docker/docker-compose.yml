@@ -65,6 +65,13 @@ services:
       # version on the admin console ("virtual <rev>").  build-container.sh
       # derives it from the checked-out Git revision; leave empty to omit it.
       ZD_VIRTUAL_BUILD_ID: ${ZD_VIRTUAL_BUILD_ID:-}
+      # Optional Network Monitor defaults, seeded into /writable on the first
+      # boot by the collector's init script: the initial collection interval
+      # (30-3600 seconds) and extra static ping targets as "MAC|IP|NAME"
+      # records separated by ";".  Once an administrator enables monitoring
+      # from the page, that preference is authoritative and these are ignored.
+      ZD_PING_INTERVAL_SECONDS: ${ZD_PING_INTERVAL_SECONDS:-}
+      ZD_PING_CLIENT_TARGETS: ${ZD_PING_CLIENT_TARGETS:-}
       # Optional root SSH on TCP 2222 using the static dropbear replacement.
       # build-container.sh --root-ssh-key writes the public key here and sets
       # the ZD_ROOT_SSH build arg; the runtime only needs the mounted key —

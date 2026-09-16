@@ -239,6 +239,22 @@ through ZoneDirector's normal authenticated preference mechanism. Runtime state
 lives on the writable partition under `/writable/zd1200-ping-monitor/` and
 nothing is uploaded off the controller.
 
+Two optional settings in `.env` pre-seed a fresh appliance, so a new deployment
+need not be configured by hand. `ZD_PING_INTERVAL_SECONDS` sets the initial
+collection interval, and `ZD_PING_CLIENT_TARGETS` adds static ping targets for
+devices ZoneDirector does not manage (a gateway, an uplink, a server) as
+`MAC|IP|NAME` records separated by `;`:
+
+```sh
+ZD_PING_INTERVAL_SECONDS=60
+ZD_PING_CLIENT_TARGETS='00:11:22:33:44:55|192.168.1.1|Gateway;00:11:22:33:44:56|1.1.1.1|Internet'
+```
+
+`50-network-monitor.sh` validates both, writes `/etc/zd1200-ping-monitor-defaults.conf`
+into each root partition, and the collector's init script copies them into
+`/writable` **once**. If the file already exists — because an administrator has
+since changed the setting from the page — it is left untouched.
+
 Unlike the upstream project, this fork installs the page from the same offline
 patch pipeline as everything else
 (`scripts/container/patches/50-network-monitor.sh`): the patch writes the i386
@@ -299,6 +315,31 @@ upgrades. The 2222 root listener offers it too. Controlled by `ZD_ECDSA_SSH`
 
 ---
 
+## AP mesh repair (ap-11n-scorpion / R600 family)
+
+Firmware 10.5.1.0.276 introduced a receive-path bug in the shared
+`ap-11n-scorpion` AP image: a wired Root AP looks healthy, but a wireless Mesh
+AP shows as connected and passes no ordinary Layer-2 traffic. 10.5.1.0.282 — the
+release this project otherwise recommends — still carries it.
+
+The image therefore repairs the AP firmware as it is staged, so the controller
+delivers an already-fixed image and the appliance needs no in-guest tooling.
+`scripts/container/build-synthetic-cf.py` calls `bl7/patch-scorpion-payload.py`
+(ported from [`dbro/zd1200`](https://github.com/dbro/zd1200), see `bl7/README.md`)
+on the extracted `/writable` tree: it converts the signed FSI image to unsigned
+UI, `unsquashfs`/`mksquashfs`es the AP rootfs to patch `wlan.ko`, rebuilds the
+BL7, and rewrites the `*_cntrl.rcks` size fields of every model that aliases
+that one image (r600, r500, r310, t300, t300e, t301n, t301s).
+
+Because the AP rootfs is historical LZMA SquashFS, the Dockerfile carries a
+`ruckus-squashfs-tools` stage that builds the matching `unsquashfs`/`mksquashfs`
+from pinned GPL-2.0 source. **R600 is the validated target**; the other models
+are repaired only because they resolve to the identical vendor image, and an AP
+still running fully signed FSI firmware must first be moved to a compatible ISI
+release through its standalone upgrade page.
+
+---
+
 ## Configuration
 
 `build-container.sh` copies `docker/.env.example` to `.env` on first run. The
@@ -313,6 +354,8 @@ usual knobs:
 | `ZD_VIRTUAL_BUILD_ID` | seven-character source revision shown as `virtual <rev>` on the admin console; derived from Git unless pinned |
 | `ZD_ROOT_SSH_PUBLIC_KEY` | public key (or path to a `.pub` file) enabling the static-dropbear replacement and root SSH on TCP 2222; same as `--root-ssh-key` |
 | `ZD_ECDSA_SSH` | add an ECDSA host key alongside RSA on the administrative SSH service (default `1`; `0` reverts) |
+| `ZD_PING_INTERVAL_SECONDS` | initial Network Monitor collection interval, 30–3600 seconds; seeded into `/writable` on the first boot only |
+| `ZD_PING_CLIENT_TARGETS` | extra static ping targets as `MAC\|IP\|NAME` records separated by `;` |
 | `ZD_CONTAINER_NAME`, `ZD_STATE_VOLUME` | container and volume names |
 
 ## Gotchas
@@ -373,6 +416,8 @@ analytics/           Network Monitor payload (page, worker, collectors, helper
                      the i386 helpers from it
 dropbear/            vendored zd_dropbear build script + patches for the optional
                      static dropbear replacement (built only with --root-ssh-key)
+bl7/                 vendored BL7/SquashFS patch modules for the ap-11n-scorpion
+                     (R600) mesh repair, applied while staging /writable
 scripts/container/   entrypoint, guest-image prep, console helper, and the ordered
                      rootfs patches (its patches/ subdir) applied before each boot
 scripts/build/       host-side vendor-image prep (firmware decrypt + extract)
