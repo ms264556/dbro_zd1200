@@ -273,15 +273,29 @@ is slow. With a key set, `scripts/container/patches/60-dropbear-static.sh`
 installs the replacement and a public-key-only listener on TCP 2222:
 
 ```sh
-ssh -p 2222 -i ~/.ssh/id_ed25519 \
-    -o HostKeyAlgorithms=+ssh-rsa root@<guest-ip>
+ssh -p 2222 -i ~/.ssh/id_ed25519 root@<guest-ip>
 ```
 
-(`HostKeyAlgorithms=+ssh-rsa` is needed because the controller's host key is
-RSA/SHA-1.) The vendor binary is kept as `/usr/sbin/dropbear.vendor`, and port
-22 keeps its stock `-A none` + `/bin/login.sh` behaviour untouched. Omitting
+The controller's stock host key is RSA/SHA-1, which modern OpenSSH rejects by
+default; the **ECDSA host key** added by `scripts/container/patches/80-ecdsa-hostkey.sh`
+(see below) means no `-o HostKeyAlgorithms=+ssh-rsa` override is needed. The
+vendor binary is kept as `/usr/sbin/dropbear.vendor`, and port 22 keeps its
+stock `-A none` + `/bin/login.sh` behaviour untouched. Omitting
 `--root-ssh-key` on a later build turns the feature back off and restores the
 vendor binary — the patch reverts its own changes.
+
+---
+
+## ECDSA SSH host key
+
+The stock controller presents only an RSA/SHA-1 host key, so every client must
+pass `-o HostKeyAlgorithms=+ssh-rsa`. `scripts/container/patches/80-ecdsa-hostkey.sh`
+installs `S59zd_ecdsa_hostkey`, which generates a nistp256 key before
+`S60dropbear` starts, and adds a second `-r` to `/etc/init.d/dropbear`. RSA is
+retained, so legacy clients are unaffected, and the key lives on the writable
+partition (`/etc/airespider` → `/writable/etc/airespider`) so it survives
+upgrades. The 2222 root listener offers it too. Controlled by `ZD_ECDSA_SSH`
+(default `1`); set it to `0` to revert.
 
 ---
 
@@ -298,6 +312,7 @@ usual knobs:
 | `ZD_SERIAL`, `ZD_MAC1` | only used if you pin the identity (`ZD_BOARDDATA_FROM_MAC=0`) |
 | `ZD_VIRTUAL_BUILD_ID` | seven-character source revision shown as `virtual <rev>` on the admin console; derived from Git unless pinned |
 | `ZD_ROOT_SSH_PUBLIC_KEY` | public key (or path to a `.pub` file) enabling the static-dropbear replacement and root SSH on TCP 2222; same as `--root-ssh-key` |
+| `ZD_ECDSA_SSH` | add an ECDSA host key alongside RSA on the administrative SSH service (default `1`; `0` reverts) |
 | `ZD_CONTAINER_NAME`, `ZD_STATE_VOLUME` | container and volume names |
 
 ## Gotchas

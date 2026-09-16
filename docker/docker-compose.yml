@@ -71,6 +71,10 @@ services:
       # whether it is installed is decided by the image payload, not by a
       # runtime variable (so a plain `docker compose up` keeps it enabled).
       ZD_ROOT_SSH_AUTHORIZED_KEYS: /opt/zd1200/dropbear-provision/authorized_keys
+      # Add an ECDSA host key to the administrative SSH service (RSA is kept),
+      # so modern clients do not need -o HostKeyAlgorithms=+ssh-rsa.  Set to 0
+      # to revert.
+      ZD_ECDSA_SSH: ${ZD_ECDSA_SSH:-1}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
       KERNEL_EXTRA: nohz=off
       WEB_WAIT_SECONDS: "600"

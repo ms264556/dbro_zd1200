@@ -47,6 +47,8 @@ ANALYTICS_DIR="${ANALYTICS_DIR:-$BASE/analytics}"
 # feature or rotating the key re-customises the roots.
 DROPBEAR_DIR="${DROPBEAR_DIR:-$BASE/dropbear}"
 ZD_ROOT_SSH_AUTHORIZED_KEYS="${ZD_ROOT_SSH_AUTHORIZED_KEYS:-/opt/zd1200/dropbear-provision/authorized_keys}"
+# Optional ECDSA host key for the administrative SSH service (patch 80).
+ZD_ECDSA_SSH="${ZD_ECDSA_SSH:-1}"
 MARKER="${MARKER:-$STATE_DIR/.disk-built}"
 SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
 SENTINEL=/etc/.zd-image
@@ -92,6 +94,7 @@ patch_sig="$( {
     else
         printf 'ZD_ROOT_SSH_KEY=unreadable\n'
     fi
+    printf 'ZD_ECDSA_SSH=%s\n' "$ZD_ECDSA_SSH"
 } | sha256sum | awk '{print $1}')"
 
 # --- (re)build the disk when missing or the base firmware changed ------------
@@ -205,6 +208,7 @@ for patch in "$PATCHES_DIR"/*.sh; do
     QCOW="$DISK" WORK="$WORK" ANALYTICS_DIR="$ANALYTICS_DIR" \
         DROPBEAR_DIR="$DROPBEAR_DIR" \
         ZD_ROOT_SSH_AUTHORIZED_KEYS="$ZD_ROOT_SSH_AUTHORIZED_KEYS" \
+        ZD_ECDSA_SSH="$ZD_ECDSA_SSH" \
         ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
         bash "$patch" "$SIGN_CERT_DIR"
 done

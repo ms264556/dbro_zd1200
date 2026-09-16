@@ -45,7 +45,14 @@
     done
     [ -r "$hostkey" ] || exit 0
 
+    # Offer the ECDSA host key as well when the optional ECDSA patch generated
+    # it, so modern clients do not need -o HostKeyAlgorithms=+ssh-rsa.  RSA is
+    # always retained.
+    set -- -r "$hostkey"
+    ecdsa_hostkey=/etc/airespider/dropbear/dropbear_host_ecdsa_key
+    [ -s "$ecdsa_hostkey" ] && set -- "$@" -r "$ecdsa_hostkey"
+
     exec /usr/sbin/dropbear -p 2222 -P /var/run/zd1200-root-dropbear.pid \
-        -s -j -k -e /bin/sh -r "$hostkey"
+        -s -j -k -e /bin/sh "$@"
 ) &
 exit 0
