@@ -36,9 +36,26 @@ from patch_r600_bl7 import patch_image  # noqa: E402
 from ruckus_bl7 import HEADER_SIZE, MAGIC  # noqa: E402
 
 SCORPION_IMAGE_NAMES = frozenset({"rcks_fw.bl7", "rcks_fw.bl7.bkup"})
-# The receive-path bug exists only in the 10.5.1 family; older releases ship a
-# different (signed FSI) payload and must not be rewritten.
-MESH_REPAIR_PREFIX = "10.5.1."
+# The receive-path regression was introduced by 10.5.1.0.276 ("Resolved a VLAN
+# packet forwarding issue", ER-12565, 2024-03-26) and is still present in
+# 10.5.1.0.282.  Earlier 10.5.1 builds, and every other family, ship a
+# different payload that must not be rewritten -- and whose wlan.ko does not
+# carry the buggy instruction the patch targets.  Gate on the build number, not
+# just the 10.5.1 prefix.
+MESH_REPAIR_FAMILY = ("10", "5", "1")
+MESH_REPAIR_MIN_BUILD = 276
+
+
+def mesh_repair_needed(version: str) -> bool:
+    """True when `version` is a 10.5.1 build at or after the regression."""
+    parts = version.split(".")
+    if len(parts) < 4 or tuple(parts[:3]) != MESH_REPAIR_FAMILY:
+        return False
+    try:
+        build = int(parts[-1])
+    except ValueError:
+        return False
+    return build >= MESH_REPAIR_MIN_BUILD
 
 
 def bl7_version(path: Path) -> str:
@@ -104,8 +121,11 @@ def main() -> int:
 
     targets, aliases = scorpion_payload_paths(args.source_dir)
     version = bl7_version(targets[0])
-    if not version.startswith(MESH_REPAIR_PREFIX):
-        print(f"ap-11n-scorpion payload {version} is not a 10.5.1 build; mesh repair skipped")
+    if not mesh_repair_needed(version):
+        print(
+            f"ap-11n-scorpion payload {version} is not a 10.5.1 build >= "
+            f"{MESH_REPAIR_MIN_BUILD}; mesh repair skipped"
+        )
         return 0
 
     messages = [f"ap-11n-scorpion payload {version}; models: {', '.join(sorted(aliases))}"]
