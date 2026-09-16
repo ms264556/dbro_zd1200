@@ -87,7 +87,6 @@ patch_sig="$( {
               printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'
           done ) | sha256sum | awk '{print $1}'
     fi
-    printf 'ZD_ROOT_SSH=%s\n' "${ZD_ROOT_SSH:-}"
     if [ -r "$ZD_ROOT_SSH_AUTHORIZED_KEYS" ]; then
         printf 'ZD_ROOT_SSH_KEY=%s\n' "$(sha256sum "$ZD_ROOT_SSH_AUTHORIZED_KEYS" | awk '{print $1}')"
     else
@@ -205,7 +204,6 @@ for patch in "$PATCHES_DIR"/*.sh; do
     say "running patch: $(basename "$patch")"
     QCOW="$DISK" WORK="$WORK" ANALYTICS_DIR="$ANALYTICS_DIR" \
         DROPBEAR_DIR="$DROPBEAR_DIR" \
-        ZD_ROOT_SSH="${ZD_ROOT_SSH:-}" \
         ZD_ROOT_SSH_AUTHORIZED_KEYS="$ZD_ROOT_SSH_AUTHORIZED_KEYS" \
         ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
         bash "$patch" "$SIGN_CERT_DIR"

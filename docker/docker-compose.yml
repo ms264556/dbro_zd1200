@@ -66,14 +66,19 @@ services:
       # derives it from the checked-out Git revision; leave empty to omit it.
       ZD_VIRTUAL_BUILD_ID: ${ZD_VIRTUAL_BUILD_ID:-}
       # Optional root SSH on TCP 2222 using the static dropbear replacement.
-      # build-container.sh --root-ssh-key writes the public key to
-      # ./dropbear-provision/authorized_keys and sets ZD_ROOT_SSH=1.
-      ZD_ROOT_SSH: ${ZD_ROOT_SSH:-0}
+      # build-container.sh --root-ssh-key writes the public key here and sets
+      # the ZD_ROOT_SSH build arg; the runtime only needs the mounted key —
+      # whether it is installed is decided by the image payload, not by a
+      # runtime variable (so a plain `docker compose up` keeps it enabled).
       ZD_ROOT_SSH_AUTHORIZED_KEYS: /opt/zd1200/dropbear-provision/authorized_keys
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
       KERNEL_EXTRA: nohz=off
       WEB_WAIT_SECONDS: "600"
       VM_SNAPSHOT: "0"
+      # On stop, ask the guest to run its stock reboot path (unmount + flush
+      # /writable) over the ttyS1 control channel before QEMU is torn down.
+      ZD_CONTAINER_CONTROL: "1"
+      ZD_STOP_TIMEOUT: "240"
 
     volumes:
       # Vendor-derived artifacts extracted from the firmware archive by
@@ -91,7 +96,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    stop_grace_period: 20s
+    # Long enough for the guest's orderly shutdown to finish (the vendor
+    # controller can take a minute or two to flush).  The entrypoint's own
+    # ZD_STOP_TIMEOUT bounds how long it waits before killing QEMU anyway.
+    stop_grace_period: 180s
 
     healthcheck:
       # macvlan isolates the container from its own macvtap guest, so the
