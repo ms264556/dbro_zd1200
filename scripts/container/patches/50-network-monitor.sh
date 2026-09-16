@@ -222,9 +222,12 @@ arm_menu_bundle() {
                 -e 's|children:\[n,r\]})|children:[n,r,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})|g' \
                 "$bundle"
         else
+            # Anchor on the Troubleshooting node rather than on its children:
+            # the child identifiers are renamed between firmware builds
+            # (10.5.1: [n,i,r], 10.2.1: [n,r,o]).  The bundle is minified, so
+            # [^]]* walks to the end of that node's children array.
             sed -i \
-                -e 's|children:\[n,i,r\]})|children:[n,i,r,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})|g' \
-                -e 's|children:\[i,r\]})|children:[i,r,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})|g' \
+                -e 's@\(id:"Troubleshooting",title:Msg.CF_Troubleshooting||"Troubleshooting",children:\[[^]]*\)\]})@\1,{id:"zd1200_ping_monitor",title:"Network Monitor",url:"'"$MENU_URL"'"}]})@g' \
                 "$bundle"
         fi
     fi

@@ -180,7 +180,7 @@ def patch_scorpion(stage: Path) -> None:
             "ap-11n-scorpion mesh repair tooling missing "
             f"({helper}, {unsquashfs}, {mksquashfs})"
         )
-    print("  applying the ap-11n-scorpion (R600) mesh repair")
+    print("  checking the ap-11n-scorpion (R600) mesh repair")
     subprocess.run(
         [sys.executable, str(helper), str(stage),
          "--unsquashfs", str(unsquashfs), "--mksquashfs", str(mksquashfs)],
