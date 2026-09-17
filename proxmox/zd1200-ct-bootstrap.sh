@@ -83,11 +83,11 @@ INSTALL_LOG="${ZD_INSTALL_LOG:-$STATE_DIR/install.log}"
 run_logged() {
     local description="$1"; shift
     printf '  %s...\n' "$description"
-    "$@" >>"$INSTALL_LOG" 2> >(tee -a "$INSTALL_LOG" >&2) || {
+    if ! "$@" >>"$INSTALL_LOG" 2>&1; then
         warn "$description failed; last lines of $INSTALL_LOG:"
         tail -25 "$INSTALL_LOG" >&2 || true
         exit 1
-    }
+    fi
 }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -283,12 +283,17 @@ if [ "$DO_PAYLOADS" = 1 ]; then
               python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall()" sqlite.zip )
         fi
         A="$REPO_DIR/analytics"
-        musl-gcc -std=c99 -Os -static -s -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC" \
-            "$A/zd1200-ping-monitor.c" "$SRC/sqlite3.c" -o "$A/zd1200-ping-monitor"
-        musl-gcc -std=c99 -Os -static -s -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC" \
-            "$A/zd1200-ping-export.c" "$SRC/sqlite3.c" -lm -o "$A/zd1200-ping-export"
-        musl-gcc -std=c99 -Os -static -s \
-            "$A/zd1200-local-getstat.c" -o "$A/zd1200-local-getstat"
+        # -w: SQLite's amalgamation produces warnings that are not ours to fix.
+        # The build is logged; only a failure prints anything.
+        build_helpers() {
+            musl-gcc -w -std=c99 -Os -static -s -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC" \
+                "$A/zd1200-ping-monitor.c" "$SRC/sqlite3.c" -o "$A/zd1200-ping-monitor" || return 1
+            musl-gcc -w -std=c99 -Os -static -s -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC" \
+                "$A/zd1200-ping-export.c" "$SRC/sqlite3.c" -lm -o "$A/zd1200-ping-export" || return 1
+            musl-gcc -w -std=c99 -Os -static -s \
+                "$A/zd1200-local-getstat.c" -o "$A/zd1200-local-getstat" || return 1
+        }
+        run_logged "compiling the Network Monitor helpers (log: $INSTALL_LOG)" build_helpers
     fi
 
     # 3c. optional static dropbear (public-key root SSH on TCP 2222).  The

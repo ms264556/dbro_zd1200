@@ -144,7 +144,9 @@ fi
 #               has reiserfs built in) replays the journal on mount.
 hda4_ext2_magic="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 1080)) count=2 status=none 2>/dev/null \
     | od -An -tx1 | tr -d ' ')"
-hda4_reiser_magic="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 0x10034)) count=9 status=none 2>/dev/null)"
+# 'tr -d "\0"' keeps bash from warning that it dropped null bytes from the
+# command substitution; only the ASCII magic is compared.
+hda4_reiser_magic="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 0x10034)) count=9 status=none 2>/dev/null | tr -d '\0')"
 if [ "$hda4_ext2_magic" = "53ef" ]; then
     hda4_state="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 1024 + 58)) count=2 status=none 2>/dev/null \
         | od -An -tu2 | tr -d ' ')"
