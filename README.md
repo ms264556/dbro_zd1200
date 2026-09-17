@@ -12,16 +12,16 @@ redistributed.
 
 ## What you need
 
-- **Linux** with Docker Engine and **Compose v2** (`docker compose`).
+- **Linux** with Docker Engine and **Compose v2** (`docker compose`). That is the
+  only runtime dependency: the firmware and card-dump preparation runs inside the
+  container image, so the host needs no `e2fsprogs`, Python, `tar`, `gzip` or
+  compiler.
 - A **LAN interface that can pass foreign MAC addresses** (MAC spoofing, or a
   bridge port that does not filter MACs). The guest is a macvtap on the host NIC
   and must be a real L2 device on the LAN. There is no NAT/user-mode fallback;
   WSL2 is not supported.
 - `/dev/kvm` — optional. With it the guest boots in ~1–2 minutes; without it QEMU
   uses TCG and takes several minutes.
-- Host tools for the prepare step: `bash`, `tar`, `gzip`, `python3`, `md5sum`,
-  `sha256sum`, and (`debugfs`/`e2fsprogs`, only for card dumps). **No compiler** —
-  guest helpers are built inside Docker.
 - One of the inputs below.
 
 ## Inputs
@@ -31,9 +31,8 @@ You can build from any of:
 1. **A ZD1200 firmware upgrade file** downloaded from Ruckus/CommScope support,
    e.g. `zd1200_10.5.1.0.282.ap_10.5.1.0.282.img`. The download is TAC-encrypted
    and is decrypted while preparing the image.
-2. **A CompactFlash card dump** from a real appliance: a raw `dd` `.img`, a
-   Windows ImageUSB `.bin` (its 512-byte header is handled automatically), or a
-   `.7z` containing either.
+2. **A CompactFlash card dump** from a real appliance: a raw `dd` `.img`, or a
+   Windows ImageUSB `.bin` (its 512-byte header is handled automatically).
 3. **Both** — a firmware file for the kernel/rootfs, plus `--writable-from` to
    take `/writable` (the appliance's configuration and AP payloads) and the board
    serial from a card dump. This revives, for example, a ZD1100 or ZD3000 card on
@@ -47,8 +46,8 @@ The prepared artifacts land in `image/` (gitignored) and are reused on later run
 # 1. from a firmware upgrade file
 ./build-container.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
 
-# 2. from a CompactFlash card dump (dd .img, ImageUSB .bin, or .7z)
-./build-container.sh /path/to/zd1200_10.5.1.0.240_cfcard_dump.7z
+# 2. from a CompactFlash card dump (dd .img or ImageUSB .bin)
+./build-container.sh /path/to/cfcard_dump.img
 
 # 3. firmware kernel/rootfs + a foreign card's /writable and serial
 ./build-container.sh /path/to/zd1200_9.10.2.0.130.ap_9.10.2.0.130.img \
@@ -58,8 +57,9 @@ The prepared artifacts land in `image/` (gitignored) and are reused on later run
 ./build-container.sh --root-ssh-key ~/.ssh/id_ed25519.pub /path/to/zd1200_*.img
 ```
 
-The first run prepares `image/`, creates `.env`, builds the container image and
-starts it. Later runs can omit the input: `./build-container.sh`.
+The first run builds the container image, prepares `image/` inside it, creates
+`.env` and starts the container. Later runs can omit the input:
+`./build-container.sh`.
 
 | flag | effect |
 |---|---|

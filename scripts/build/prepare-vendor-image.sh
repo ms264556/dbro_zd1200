@@ -2,11 +2,14 @@
 # Build the locally ignored runtime image/ directory from either:
 #   * a ZD1200 firmware upgrade file downloaded from Ruckus/CommScope (any
 #     version/build of the ZD1200 platform) -- TAC-encrypted, decrypted here; or
-#   * a CompactFlash card dump: a raw dd .img/.bin, a Windows ImageUSB .bin (its
-#     512-byte header is detected and skipped), or a .7z holding either.  The
-#     dump's boot files, rootfs, board serial and reiserfs /writable are taken
-#     from the image as-is.
+#   * a CompactFlash card dump: a raw dd .img, or a Windows ImageUSB .bin (its
+#     512-byte header is detected and skipped).  The dump's boot files, rootfs,
+#     board serial and reiserfs /writable are taken from the image as-is.
 # No vendor material is redistributed.
+#
+# This runs inside the image built from docker/Dockerfile (which carries
+# e2fsprogs/debugfs, python3, tar and gzip), so the host needs no filesystem
+# tooling.  build-container.sh invokes it there.
 set -euo pipefail
 
 work_dir="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root: image/ lives there
@@ -130,20 +133,6 @@ extract_writable_from_dump() {
 staging="$(mktemp -d "${TMPDIR:-/tmp}/zd1200-vendor.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 output_dir="$work_dir/image"
-
-# A 7-Zip archive (as published for CF-card dumps) can hold both dump flavours;
-# prefer the plain dd .img, else the ImageUSB .bin.
-case "$archive_path" in
-    *.7z|*.7Z)
-        command -v 7z >/dev/null || fail "7z is required to read $archive_path"
-        member="$(7z l -ba "$archive_path" | awk '{print $NF}' | grep -iE '\.img$' | head -n1 || true)"
-        [ -n "$member" ] || member="$(7z l -ba "$archive_path" | awk '{print $NF}' | grep -iE '\.bin$' | head -n1 || true)"
-        [ -n "$member" ] || fail "no .img/.bin member in $archive_path"
-        echo "== Extracting $member from $archive_path =="
-        7z e -y -o"$staging" "$archive_path" "$member" >/dev/null || fail "7z extraction failed"
-        archive_path="$staging/$member"
-        ;;
-esac
 
 # ---- CompactFlash dump input ---------------------------------------------
 # A CF dump is a complete appliance (rootfs + /writable + board data).  The

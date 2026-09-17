@@ -6,16 +6,16 @@
 # container from docker/docker-compose.yml (GRUB is compiled in the image build).
 #
 # Usage:
-#   ./build-container.sh /path/to/zd1200_*.img       # first run: extract + build + start
-#   ./build-container.sh /path/to/*cfcard_dump*      # a CF dump: dd .img, ImageUSB
-#                                                    # .bin or a .7z holding either
+#   ./build-container.sh /path/to/zd1200_*.img       # first run: build + prepare + start
+#   ./build-container.sh /path/to/*cfcard_dump*      # a CF dump: raw dd .img or
+#                                                    # ImageUSB .bin
 #   ./build-container.sh /path/to/zd1200_*.img \
 #       --writable-from /path/to/cfcard_dump         # firmware rootfs/boot, but
 #                                                    # /writable + serial from a dump
 #                                                    # (e.g. a ZD1100/ZD3000 card)
 #       [--writable-partition START:COUNT]           # override the dump geometry
-#   ./build-container.sh                             # already extracted: build + start
-#   ./build-container.sh --no-up /path/to/*.img      # only build the image (no boot)
+#   ./build-container.sh                             # already prepared: start
+#   ./build-container.sh --no-up /path/to/*.img      # only build/prepare (no boot)
 #   ./build-container.sh --root-ssh-key ~/.ssh/id_ed25519.pub
 #                                                    # also build the static dropbear
 #                                                    # replacement and enable public-key
@@ -74,28 +74,48 @@ fi
 # ./image volume mount and the build context rooted at the repo root.
 compose_cmd=("${docker_cmd[@]}" compose --project-directory . -f docker/docker-compose.yml)
 
-# --- 1. extract the vendor image (once) --------------------------------------
-# prepare-vendor-image.sh decrypts the download and unpacks it into image/ (gitignored),
-# the vendor-derived artifacts the container mounts read-only at /opt/zd1200/image.
+# --- 1. build the container image --------------------------------------------
+# The image doubles as the prepare helper: it carries e2fsprogs (debugfs),
+# python3, tar and gzip, so the host needs no filesystem tooling to unpack a
+# firmware archive or a card dump.  Built from docker/Dockerfile alone; it does
+# not need image/ to exist yet.
+echo "== Building the ZD1200 container image =="
+"${compose_cmd[@]}" build
+
+# --- 2. prepare image/ (once), inside that image -----------------------------
+# prepare-vendor-image.sh decrypts the firmware / parses the dump and writes the
+# vendor-derived artifacts into image/ (gitignored), which the container mounts
+# read-only at /opt/zd1200/image.
+image_name="local/zd1200-qemu"
 if [ ! -f image/rootfs.ext2 ]; then
     if [ -z "$archive" ]; then
-        echo "First run needs the ZD1200 firmware upgrade file (downloaded .img):" >&2
-        echo "  $0 /path/to/zd1200_<version>.img" >&2
+        echo "First run needs a ZD1200 firmware upgrade file or a CF card dump:" >&2
+        echo "  $0 /path/to/zd1200_<version>.img     # firmware upgrade" >&2
+        echo "  $0 /path/to/cfcard_dump.img          # dd or ImageUSB card dump" >&2
         exit 1
     fi
-    echo "== Extracting the firmware image from $archive =="
+    [ -f "$archive" ] || { echo "Input not found: $archive" >&2; exit 1; }
+    mkdir -p image
+    prepare_args=("/input/$(basename "$archive")")
+    run_mounts=(-v "$PWD:/repo" -v "$(cd "$(dirname "$archive")" && pwd):/input:ro")
     if [ -n "$writable_from" ]; then
-        ./scripts/build/prepare-vendor-image.sh "$archive" \
-            --writable-from "$writable_from" \
-            ${writable_partition:+--writable-partition "$writable_partition"}
-    else
-        ./scripts/build/prepare-vendor-image.sh "$archive"
+        [ -f "$writable_from" ] || { echo "--writable-from not found: $writable_from" >&2; exit 1; }
+        run_mounts+=(-v "$(cd "$(dirname "$writable_from")" && pwd):/writable-input:ro")
+        prepare_args+=(--writable-from "/writable-input/$(basename "$writable_from")")
     fi
+    [ -n "$writable_partition" ] && prepare_args+=(--writable-partition "$writable_partition")
+    echo "== Preparing image/ from $archive (inside the container image) =="
+    "${docker_cmd[@]}" run --rm \
+        --user "$(id -u):$(id -g)" \
+        "${run_mounts[@]}" \
+        -e TMPDIR=/repo/image \
+        -e EXPECTED_ARCHIVE_SHA256="${EXPECTED_ARCHIVE_SHA256:-}" \
+        "$image_name" /bin/bash /repo/scripts/build/prepare-vendor-image.sh "${prepare_args[@]}"
 else
-    echo "== Reusing image/ (delete it to re-extract, or run scripts/build/prepare-vendor-image.sh) =="
+    echo "== Reusing image/ (delete it to re-prepare) =="
 fi
 
-# --- 2. .env + a unique container MAC ----------------------------------------
+# --- 3. .env + a unique container MAC ----------------------------------------
 if [ ! -f .env ]; then
     cp docker/.env.example .env
     echo "== Created .env from docker/.env.example =="
@@ -124,7 +144,7 @@ if ! grep -qE '^ZD_CONTAINER_MAC=([0-9a-f]{2}:){5}[0-9a-f]{2}$' .env; then
     echo "== Generated a unique container MAC: $container_mac (guest MAC1 = this) =="
 fi
 
-# --- 2b. optional source revision shown on the admin console ----------------
+# --- 3b. optional source revision shown on the admin console ----------------
 # The Network Monitor patch appends " virtual <rev>" to the ZoneDirector version
 # so the running controller identifies the source it was built from.  Derive it
 # from the checked-out revision unless .env pins one explicitly; Compose passes
@@ -137,7 +157,7 @@ if ! grep -qE '^ZD_VIRTUAL_BUILD_ID=..*' .env 2>/dev/null \
         && echo "== Admin console will report source revision: virtual $ZD_VIRTUAL_BUILD_ID =="
 fi
 
-# --- 2c. optional public-key root SSH on TCP 2222 ---------------------------
+# --- 3c. optional public-key root SSH on TCP 2222 ---------------------------
 # Supplying a public key enables the static-dropbear replacement build and
 # installs a public-key-only root listener on 2222.  The key is staged in
 # dropbear-provision/ (gitignored) for the container, and its content is part
@@ -175,13 +195,13 @@ else
     export ZD_ROOT_SSH=0
 fi
 
-# --- 3. build / start -------------------------------------------------------
+# --- 4. start ---------------------------------------------------------------
+# The image was built in step 1; compose up only creates/starts the container.
 if [ "$no_up" = 1 ]; then
-    echo "== Building the ZD1200 container image (no boot) =="
-    "${compose_cmd[@]}" build
+    echo "== Image built (not started). =="
 else
-    echo "== Building and starting the ZD1200 container =="
-    "${compose_cmd[@]}" up -d --build
+    echo "== Starting the ZD1200 container =="
+    "${compose_cmd[@]}" up -d
     echo
     echo "Started. Follow boot:  ${docker_cmd[*]} logs -f zd1200"
     echo "Guest console:         ${docker_cmd[*]} exec zd1200 tail -f /tmp/zd1200-console.log"

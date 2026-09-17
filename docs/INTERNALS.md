@@ -43,11 +43,11 @@ is compiled and nothing is committed.
 
 A CF dump is a raw 1872 MiB disk (`3931200` × 512-byte sectors) for the ZD1200,
 or a larger/smaller disk for other platforms. A Windows ImageUSB dump is the same
-image with a 512-byte `imageUSB` header; it is detected and skipped. A `.7z`
-holding either is accepted (the plain `dd` `.img` is preferred over the ImageUSB
-`.bin`).
+image with a 512-byte `imageUSB` header; it is detected and skipped.
 
-From a dump, `prepare-vendor-image.sh` takes the boot files
+Preparation runs inside the container image (which carries e2fsprogs/`debugfs`,
+Python, `tar` and `gzip`), so the host needs only Docker. From a dump,
+`prepare-vendor-image.sh` takes the boot files
 (`/bzImage`, `/restoreinitramfs.gz`, `/restoreinitramfs.ver`,
 `/lib/grub/i386-pc/menu.lst`), the rootfs (hda2) and `/writable` (hda4) straight
 from the image, plus the board serial from the board-data record. The prepared
@@ -84,7 +84,8 @@ smaller one is zero-padded into the partition (the reiserfs filesystem keeps its
 own size).
 
 Verified: a ZD1200 10.5.1.0.240 dump boots on its own rootfs and reiserfs
-`/writable` (serial `REDACTED-SERIAL`), and ZD1200 9.10.2.0.130 firmware paired with
+`/writable` (using the serial from its board-data record), and ZD1200 9.10.2.0.130
+firmware paired with
 a ZD1100 9.10.2.0.84 dump's `/writable` (detected at sectors `1909056 + 2021944`,
 zero-padded into the ZD1200 data partition) boots with the ZD1100 AP payloads and
 configuration in place.
