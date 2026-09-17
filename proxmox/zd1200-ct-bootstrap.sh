@@ -73,6 +73,22 @@ DO_DISKS=1
 CONF=/etc/zd1200.conf
 
 log()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+
+# Verbose step output goes to a log file rather than the console: the rootfs patch
+# pipeline narrates every changed 512-byte block and every debugfs command, which
+# buries the progress in hundreds of lines.  stderr stays on the console so a real
+# failure is visible immediately, and the log is named in the summary and in
+# docs/TROUBLESHOOTING.md.
+INSTALL_LOG="${ZD_INSTALL_LOG:-$STATE_DIR/install.log}"
+run_logged() {
+    local description="$1"; shift
+    printf '  %s...\n' "$description"
+    "$@" >>"$INSTALL_LOG" 2> >(tee -a "$INSTALL_LOG" >&2) || {
+        warn "$description failed; last lines of $INSTALL_LOG:"
+        tail -25 "$INSTALL_LOG" >&2 || true
+        exit 1
+    }
+}
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -103,6 +119,8 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = 0 ] || die "run as root inside the container"
+mkdir -p "$STATE_DIR"
+: >"$INSTALL_LOG" 2>/dev/null || true
 # Everything the pipeline shells out to.  A wrong (tiny) template is the usual
 # cause when one is missing; --skip-packages still needs python3/bash/ip.
 for cmd in bash python3 sha256sum tar gzip dd ip debugfs e2fsck; do
@@ -305,6 +323,7 @@ if [ "$DO_IMAGE" = 1 ] && [ ! -f "$IMAGE_DIR/rootfs.ext2" ]; then
     mkdir -p "$STATE_DIR/tmp"
     TMPDIR="$STATE_DIR/tmp" \
     IMAGE_DIR="$IMAGE_DIR" \
+        run_logged "decrypting/parsing the input (log: $INSTALL_LOG)" \
         bash "$REPO_DIR/scripts/build/prepare-vendor-image.sh" "${prepare_args[@]}"
     rm -rf "$STATE_DIR/tmp"
 fi
@@ -555,6 +574,7 @@ if [ "$DO_DISKS" = 1 ]; then
     ZD_R600_REPAIR="$R600_REPAIR" \
     ZD_ROOT_SSH_AUTHORIZED_KEYS="$STATE_DIR/provision/authorized_keys" \
     ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
+        run_logged "building and patching the guest disk (several minutes; log: $INSTALL_LOG)" \
         "$CC/prepare-vm-disks.sh"
 fi
 

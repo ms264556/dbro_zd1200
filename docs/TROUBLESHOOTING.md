@@ -19,6 +19,16 @@ The container reports healthy only once the guest answers on the network, so a
 container that stays `health: starting` (Docker) or a guest that never leases is
 the common shape of a problem.
 
+On Proxmox the installer's own console output is deliberately short: the rootfs
+patch pipeline narrates every changed block, so it is written to a log instead.
+
+```sh
+pct exec <id> -- tail -50 /var/lib/zd1200/install.log    # the whole install, in detail
+```
+
+A step that fails prints the end of that log to the console, and the install stops
+there rather than continuing.
+
 ## Problems starting
 
 | symptom | cause and fix |
