@@ -266,25 +266,44 @@ install_classic_menu() {
         cat >> "$util" <<EOF
 
 // --- Network Monitor menu hook (this fork) --------------------------------
-// The classic console menu lives in the compiled admin_template.mod; append the
-// entry client-side instead.  marker: zd1200NetworkMonitorControl
+// The classic console renders its menu from the compiled admin_template.mod as
+// <td id="mainmenu">...<ul><li><span id="monitor_aps">Access Points</span></li>
+// ...</ul>...</td>.  Append a real Monitor-section row client-side.
+// marker: zd1200NetworkMonitorControl
 (function () {
     var URL = "$UI_BASE/zd1200-network-monitor.html";
     var LABEL = "Network Monitor";
+    function tag(node, name) {
+        return node && node.tagName && node.tagName.toLowerCase() === name;
+    }
     function addEntry() {
-        var menu = document.getElementById("mainmenu");
-        if (!menu || document.getElementById("zd1200_ping_monitor")) return;
-        var row = document.createElement("div");
-        row.id = "zd1200_ping_monitor";
-        row.className = "menu_item";
-        row.style.cssText = "padding:4px 6px;cursor:pointer;";
-        row.innerHTML = '<span>' + LABEL + '</span>';
-        row.onclick = function () { window.location.href = URL; };
-        menu.appendChild(row);
+        if (document.getElementById("zd1200_ping_monitor")) return;
+        var anchor = document.getElementById("monitor_aps")
+                  || document.getElementById("monitor_map");
+        if (!anchor) return;
+        var ul = anchor;
+        while (ul && !tag(ul, "ul")) ul = ul.parentNode;
+        if (!ul) return;
+        var anchorLi = anchor;
+        while (anchorLi && !tag(anchorLi, "li")) anchorLi = anchorLi.parentNode;
+        var li = document.createElement("li");
+        var span = document.createElement("span");
+        span.id = "zd1200_ping_monitor";
+        span.style.cursor = "pointer";
+        span.appendChild(document.createTextNode(LABEL));
+        li.appendChild(span);
+        span.onclick = function () { window.location.href = URL; };
+        if (anchorLi && anchorLi.parentNode === ul) {
+            ul.insertBefore(li, anchorLi.nextSibling);
+        } else {
+            ul.appendChild(li);
+        }
     }
     if (document.readyState === "complete") { addEntry(); }
-    else if (window.addEventListener) { window.addEventListener("load", addEntry, false); }
-    else if (window.attachEvent) { window.attachEvent("onload", addEntry); }
+    else if (window.addEventListener) {
+        window.addEventListener("DOMContentLoaded", addEntry, false);
+        window.addEventListener("load", addEntry, false);
+    } else if (window.attachEvent) { window.attachEvent("onload", addEntry); }
 })();
 EOF
     fi
@@ -595,6 +614,15 @@ for part in "${PARTITIONS[@]}"; do
                || ! grep -q 'zd1200NetworkMonitorControl' "$WORK/systemMenu.patched" 2>/dev/null; then
                 menu_missing=1
             fi
+            # 9.13 also ships the classic console, and that is what login.jsp
+            # lands on (dashboard.jsp), so add the classic menu hook as well.
+            if [ -n "$(stat_meta "$WORK/$name.img" /web/admin/admin_template.mod)" ]; then
+                say "[$name] adding the Network Monitor menu entry (classic console)"
+                if ! install_classic_menu "$WORK/$name.img" "$WEB_ROOT" \
+                   || ! grep -q 'zd1200NetworkMonitorControl' "$WORK/util.patched" 2>/dev/null; then
+                    menu_missing=1
+                fi
+            fi
             ;;
         9classic)
             say "[$name] adding the Network Monitor menu entry (classic console)"
@@ -629,12 +657,6 @@ for part in "${PARTITIONS[@]}"; do
         echo "FAIL $name: disk does not match the patched partition image" >&2
         exit 1
     fi
-    for bin in zd1200-ping-monitor zd1200-ping-export zd1200-local-getstat \
-               zd1200-network-snapshot-collect zd1200-snapshot-index-publish \
-               zd1200-ping-daily-publish zd1200-ping-monitor-settings-sync; do
-        read -r t _ u g <<< "$(stat_meta "$WORK/$name.verify.img" "/usr/local/sbin/$bin")"
-        [ "$t" = "regular" ] || { echo "FAIL $name: /usr/local/sbin/$bin missing" >&2; exit 1; }
-    done
     IFS='|' read -r V_FLAVOR V_ROOT <<< "$(ui_layout_of "$WORK/$name.verify.img")"
     for bin in zd1200-ping-monitor zd1200-ping-export zd1200-local-getstat \
                zd1200-network-snapshot-collect zd1200-snapshot-index-publish \
@@ -664,6 +686,14 @@ for part in "${PARTITIONS[@]}"; do
             fi
             read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" "$V_ROOT/edison/js/mon/zd1200NetworkMonitor.js")"
             [ "$t" = "regular" ] || { echo "FAIL $name: Edison monitor module missing" >&2; exit 1; }
+            if [ -n "$(stat_meta "$WORK/$name.verify.img" /web/admin/admin_template.mod)" ]; then
+                debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$WORK/$name.verify.img" >/dev/null 2>&1
+                if grep -q 'zd1200NetworkMonitorControl' "$WORK/util.final" 2>/dev/null; then
+                    echo "OK   $name: classic util.js carries the Network Monitor menu hook"
+                else
+                    echo "  ! $name: classic menu hook not found after patch" >&2
+                fi
+            fi
             ;;
         9classic)
             debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$WORK/$name.verify.img" >/dev/null 2>&1
