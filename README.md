@@ -137,7 +137,7 @@ pct exec <id> -- python3 /opt/zd1200/scripts/container/attach-console.py
 - **First boot is a factory appliance**: complete the wizard, reboot once, then
   `ssh admin@<ip>` works.
 - **Applying the R600 mesh repair needs Solo 104 or 106 on the APs first.** The
-  repair delivers an unsigned AP image, and older AP firmware will not accept it —
+  repair delivers an unsigned AP image, and newer AP firmware will not accept it —
   so the APs will not join. Upgrade them through their own standalone upgrade page
   before pointing them at the controller, or build with `--no-r600-repair`.
 
