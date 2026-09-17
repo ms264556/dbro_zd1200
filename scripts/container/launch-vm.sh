@@ -244,7 +244,12 @@ fi
 # stdio -> the entrypoint's log only, not interactive).
 console_args=()
 if [ "${ZD_CONSOLE:-1}" != "0" ]; then
-    console_sock="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}"
+    # QEMU's socket chardev answers exactly one client, and this QEMU has no
+    # option to raise that.  The LXC flavour therefore puts the chardev on a
+    # private path (ZD_CONSOLE_QEMU_SOCK) owned by the console bridge, which
+    # in turn serves the public ZD_CONSOLE_SOCK that attach-console.py uses.
+    # Docker sets neither, so it binds ZD_CONSOLE_SOCK directly as before.
+    console_sock="${ZD_CONSOLE_QEMU_SOCK:-${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}}"
     console_log="${ZD_CONSOLE_LOG:-/tmp/zd1200-console.log}"
     # 'path=' for a unix socket (default); 'host='/'port=' for a TCP listener
     # when ZD_CONSOLE_SOCK looks like host:port (e.g. 127.0.0.1:5555).

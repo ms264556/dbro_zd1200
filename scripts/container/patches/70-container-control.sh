@@ -42,13 +42,20 @@ say() { printf '\n== %s\n' "$*"; }
 cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
 #!/bin/sh
 # Container lifecycle control over the second serial port (ttyS1), a private
-# non-networked channel.  Two commands are understood:
+# non-networked channel.  Three commands are understood:
 #
 #   reboot   the container is stopping: run the stock reboot path so the
 #            controller flushes its databases and the kernel unmounts /writable.
 #   address  report this guest's own address.  The guest is the authority on its
 #            lease -- asking it avoids the container having to sniff DHCP or
 #            sweep the LAN for a matching MAC.
+#   diag     report interfaces, addresses and bound drivers (a NIC experiment
+#            made observable without console credentials).
+#   ready    report whether the management HTTPS port is bound.  The guest is
+#            also the authority on its own service: asking it here means the
+#            container never has to reach the guest over IP, which matters
+#            because the container's own address can move and the guest's
+#            address may be held locally for display (see the LXC flow).
 #
 # Replies are written back on the same port as "ZD-<KEY>=<value>".
 # Runs in the background and never blocks init.
@@ -73,6 +80,12 @@ cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
                 echo "ZD-MODULE=$m loaded" > /dev/ttyS1
             fi
         done
+        if service_up; then
+            echo "ZD-SERVICE-443=listening" > /dev/ttyS1
+        else
+            echo "ZD-SERVICE-443=-" > /dev/ttyS1
+        fi
+        service_detail
         echo "ZD-END=diag" > /dev/ttyS1
     }
 
@@ -84,6 +97,63 @@ cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
                    | awk '{print $4}' | cut -d/ -f1 | head -n1)
             [ -n "$addr" ] && { echo "$addr"; return; }
         done
+    }
+
+    # Is the management HTTPS service answering?  A real local request, not a
+    # socket-table read.
+    #
+    # An earlier version matched port 443 in /proc/net/tcp.  That was wrong, and
+    # wrong in the dangerous direction: it reported "not listening" on a guest
+    # whose wizard was demonstrably serving (the container's host got a 302 to
+    # /admin10/wizard.jsp, and the guest's /proc/net/tcp showed no 443 listener
+    # at all).  A table read also cannot see a listener bound to a specific
+    # address rather than the wildcard, an IPv6-only listener, or one in another
+    # network namespace -- all of which look identical to "down".
+    #
+    # So ask the guest's own stack instead.  curl is on the appliance
+    # (/bin/curl).  Exit status decides; any HTTP reply counts, because the
+    # question is whether the service is up, not what it says.
+    service_ready() {
+        for url in https://127.0.0.1:443/ https://localhost:443/; do
+            if curl -ksS -o /dev/null --max-time 6 "$url" 2>/dev/null; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    # Fallback for a guest without curl: the old table read, widened to IPv6 and
+    # to a listener bound anywhere.  Kept separate so it is clear which answer
+    # was used.
+    service_listening_any() {
+        port="$1"
+        awk -v p="$port" 'NR > 1 && $4 == "0A" {
+                split($2, a, ":")
+                if (toupper(a[2]) == sprintf("%04X", p)) { found = 1; exit }
+            }
+            END { exit(found ? 0 : 1) }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+    }
+
+    service_up() {
+        if command -v curl >/dev/null 2>&1; then
+            service_ready && return 0 || return 1
+        fi
+        service_listening_any 443
+    }
+
+    # What this script can actually see of the listening sockets.  The raw
+    # evidence is reported next to the verdict so a "down" answer can be told
+    # apart from a view that simply cannot see the listener.
+    service_detail() {
+        n4=0; n6=0; ports=""
+        if [ -r /proc/net/tcp ]; then
+            n4=$(awk 'NR > 1' /proc/net/tcp 2>/dev/null | wc -l)
+            ports=$(awk 'NR > 1 && $4 == "0A" { split($2, a, ":"); print a[2] }' /proc/net/tcp 2>/dev/null | tr '\n' ',')
+        fi
+        [ -r /proc/net/tcp6 ] && n6=$(awk 'NR > 1' /proc/net/tcp6 2>/dev/null | wc -l)
+        printf 'ZD-NET-TCP-ENTRIES=%s\n' "${n4:-0}"
+        printf 'ZD-NET-TCP6-ENTRIES=%s\n' "${n6:-0}"
+        printf 'ZD-NET-TCP-LISTEN=%s\n' "${ports%,}"
     }
 
     while IFS= read -r command; do
@@ -102,6 +172,13 @@ cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
                     echo "ZD-GUEST-IP=$addr" > /dev/ttyS1
                 else
                     echo "ZD-GUEST-IP=" > /dev/ttyS1
+                fi
+                ;;
+            ready)
+                if service_up; then
+                    echo "ZD-SERVICE-443=listening" > /dev/ttyS1
+                else
+                    echo "ZD-SERVICE-443=-" > /dev/ttyS1
                 fi
                 ;;
         esac

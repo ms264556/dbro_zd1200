@@ -21,6 +21,11 @@ set -euo pipefail
 
 HOST_IF="${ZD_HOST_IF:-eth0}"
 BRIDGE_IF="${ZD_BRIDGE_IF:-br-zd}"
+# The display interface carries the guest's address so Proxmox can show it (see
+# "Displaying the guest's address" below).  It is created here, before the
+# bridge, because that is what puts it in front of the bridge in the enumeration
+# Proxmox reads.
+DISPLAY_IF="${ZD_DISPLAY_IF:-zd0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -90,11 +95,64 @@ else
     fi
 fi
 
+# --------------------------------------------------------------------------
+# Displaying the guest's address in the Proxmox GUI
+# --------------------------------------------------------------------------
+# Proxmox reads the container's addresses from this network namespace (the
+# "interfaces" endpoint behind the Summary and Network views) and shows the first
+# two it finds, in interface order.  The guest is the appliance the operator
+# cares about, so its address should be one of those two -- which means the
+# container's own lease on the bridge must not fill both slots with its IPv4 and
+# IPv6 addresses.
+#
+# Two things make that work:
+#   * this interface is created BEFORE the bridge, so it enumerates first; and
+#   * IPv6 is disabled, so no link-local address competes for a slot.
+#
+# The address itself is not known here -- the guest leases it from the LAN later
+# -- so this only creates the interface.  zd1200-guest-display fills it in and
+# keeps it current as the lease changes.
+if [ -e "/sys/class/net/$DISPLAY_IF" ]; then
+    log "display interface $DISPLAY_IF already exists; reusing it"
+else
+    ip link add name "$DISPLAY_IF" type dummy
+    log "created display interface $DISPLAY_IF"
+fi
+ip link set "$DISPLAY_IF" up
+# The guest must remain the only thing that answers ARP for its own address.
+# zd1200-guest-display sets the arp_ignore/arp_announce sysctls that enforce
+# that; `arp off` here is not enough on its own (it only sets the NOARP flag).
+ip link set "$DISPLAY_IF" arp off 2>/dev/null || true
+
+# One address per family is enough for a display interface, and the container
+# needs no IPv6: a link-local address there is noise in the Summary, and the
+# appliance is reached over IPv4.  Disabling it here also keeps the container's
+# IPv4 address in the second displayed slot.  Persist the same settings through
+# /etc/sysctl.d so a re-run of Proxmox's own network setup cannot bring the
+# link-local addresses back behind our back.
+if [ "${ZD_DISPLAY_IPV6:-0}" != "1" ]; then
+    sysctl -qw net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+    sysctl -qw net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+fi
+
 if [ -e "/sys/class/net/$BRIDGE_IF" ]; then
     log "bridge $BRIDGE_IF already exists; reusing it"
 else
     ip link add name "$BRIDGE_IF" type bridge
     log "created bridge $BRIDGE_IF"
+fi
+
+# The interface-scoped half of the IPv6 decision above.  `all.disable_ipv6` only
+# affects interfaces created after it is set, so the ones that already exist (the
+# uplink Proxmox made, the display interface and the bridge) need it named
+# explicitly.  This runs before the container's address moves onto the bridge;
+# disabling IPv6 does not disturb IPv4 addresses.
+if [ "${ZD_DISPLAY_IPV6:-0}" != "1" ]; then
+    for dev in lo "$HOST_IF" "$DISPLAY_IF" "$BRIDGE_IF"; do
+        [ -e "/proc/sys/net/ipv6/conf/$dev/disable_ipv6" ] || continue
+        sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1" 2>/dev/null || true
+    done
+    log "IPv6 disabled on the container interfaces (keeps the Summary tidy)"
 fi
 
 ip link set "$HOST_IF" master "$BRIDGE_IF" 2>/dev/null || true
@@ -141,6 +199,39 @@ if [ "${ZD_BRIDGE_MAC:-1}" != "0" ]; then
         log "bridge MAC $current -> $want (keeps the guest's board MAC unique)"
     fi
 fi
+
+# ARP policy for the display address.  The guest's address is held locally on
+# $DISPLAY_IF so Proxmox can display it, and a Linux host answers ARP for any
+# address it holds locally.  Left alone, this container would therefore answer
+# ARP for the appliance's own address and race the guest for its traffic -- the
+# failure Gemini's recipe warns about, except that `ip link set ... arp off` does
+# NOT prevent it (it only sets the NOARP flag; verified: the container still
+# replied, presenting the bridge MAC).
+#
+# arp_ignore=1 is what actually prevents it: reply only when the target address
+# is on the interface the request arrived on.  The request arrives on the uplink,
+# the address lives on the display interface, so no reply is sent, while the
+# bridge keeps answering for the container's own address (its own subnet).
+# announce=2 keeps the container from advertising the display address as a source
+# when it talks on the LAN.
+#
+# Written to /etc/sysctl.d as well, so the policy survives reboots and Proxmox's
+# own network re-application.  This is required, not optional: without it the
+# install creates exactly the duplicate-ARP outage it is trying to avoid.
+{
+    printf '# ZD1200 LXC: the guest must be the only thing answering for its own\n'
+    printf '# address (see proxmox/zd1200-ct-net.sh).  Do not remove.\n'
+    printf 'net.ipv4.conf.all.arp_ignore = 1\n'
+    printf 'net.ipv4.conf.all.arp_announce = 2\n'
+    if [ "${ZD_DISPLAY_IPV6:-0}" != "1" ]; then
+        printf '# Container interfaces carry IPv4 only; IPv6 link-locals are noise in\n'
+        printf '# the Proxmox Summary and consume one of its two address slots.\n'
+        printf 'net.ipv6.conf.all.disable_ipv6 = 1\n'
+        printf 'net.ipv6.conf.default.disable_ipv6 = 1\n'
+    fi
+} > /etc/sysctl.d/99-zd1200-display.conf 2>/dev/null || true
+sysctl -qw net.ipv4.conf.all.arp_ignore=1 2>/dev/null || true
+sysctl -qw net.ipv4.conf.all.arp_announce=2 2>/dev/null || true
 
 # Address-collision guard.  The container's own lease and the guest's are handed
 # out by the same LAN DHCP server, and Proxmox re-applies the CT configuration
