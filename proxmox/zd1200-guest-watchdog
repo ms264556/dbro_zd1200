@@ -30,6 +30,7 @@ FAILURES="${ZD_GUEST_WATCHDOG_FAILURES:-5}"
 COOLDOWN="${ZD_GUEST_WATCHDOG_COOLDOWN:-900}"
 HEALTHCHECK="${ZD_HEALTHCHECK_HELPER:-/usr/local/sbin/zd1200-guest-healthcheck}"
 CONTROL_SOCK="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
+BRIDGE="${ZD_BRIDGE_IF:-br-zd}"
 
 log() {
     printf 'zd1200-watchdog: %s\n' "$*"
@@ -77,6 +78,34 @@ PY
     return 1
 }
 
+# Whether the failure is the silent wedge this watchdog exists for.  A wedged
+# guest has gone quiet at L2 as well: QEMU keeps running but the guest kernel
+# stops answering and its NIC stops transmitting, so the bridge ages its MAC
+# out.  A guest that is merely unreachable -- its address moved while the
+# control channel was unavailable, or its web service is down -- still has its
+# MAC learned, and rebooting it would reboot a healthy appliance.  Returns 0
+# only when a reboot is warranted, and says which case it found.
+wedge_suspected() {
+    if [ ! -e "/sys/class/net/$BRIDGE" ]; then
+        # Without the bridge the container's own LAN path is broken; a guest
+        # reboot cannot repair that, and the healthcheck already reports it.
+        log "bridge $BRIDGE is missing: the container-side LAN is down, not the guest; not rebooting"
+        return 1
+    fi
+    if [ -z "${ZD_MAC1:-}" ] || ! command -v bridge >/dev/null 2>&1; then
+        # Cannot inspect L2.  A watchdog that silently stops recovering a wedged
+        # guest is the worse outcome, so proceed and say so.
+        log "cannot tell whether the guest is still on the LAN (no ZD_MAC1 or bridge tool); rebooting anyway"
+        return 0
+    fi
+    if bridge fdb show br "$BRIDGE" 2>/dev/null | grep -qi "^${ZD_MAC1}[[:space:]]"; then
+        log "the guest's MAC ($ZD_MAC1) is still learned on $BRIDGE: it is on the LAN, not wedged; not rebooting"
+        return 1
+    fi
+    log "the guest's MAC ($ZD_MAC1) is gone from $BRIDGE: it is silent at L2 as well; rebooting"
+    return 0
+}
+
 log "starting (interval ${INTERVAL}s, ${FAILURES} failures before recovery, warmup)"
 while :; do
     if "$HEALTHCHECK" >/dev/null 2>&1; then
@@ -103,13 +132,15 @@ while :; do
                 fails=$(( fails + 1 ))
                 log "guest did not answer (failure $fails/$FAILURES)"
                 if [ "$fails" -ge "$FAILURES" ]; then
-                    log "guest has not answered for $(( FAILURES * INTERVAL ))s; rebooting it"
-                    if reboot_guest; then
+                    log "guest has not answered for $(( FAILURES * INTERVAL ))s"
+                    if wedge_suspected && reboot_guest; then
                         phase="cooldown"
                         cooldown_until=$(( $(date +%s) + COOLDOWN ))
                         log "cooldown for ${COOLDOWN}s"
                     else
-                        # No control channel: keep trying, but do not spam.
+                        # Not a wedge (the guest is still on the LAN), or there is
+                        # no control channel to ask.  Wait instead of spamming,
+                        # and let the next interval re-evaluate.
                         fails=0
                     fi
                 fi

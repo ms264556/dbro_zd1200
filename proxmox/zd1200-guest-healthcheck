@@ -40,8 +40,15 @@ note() { [ "$VERBOSE" = 1 ] && say "$*" || true; }
 helper="${ZD_ADDRESS_HELPER:-/usr/local/sbin/zd1200-guest-address}"
 guest_ip="${ZD_GUEST_IP:-}"
 discovered=""
+helper_err=""
 if [ -x "$helper" ]; then
-    discovered="$("$helper" --timeout "${ZD_ADDRESS_TIMEOUT:-6}" 2>/dev/null || true)"
+    # Keep the helper's stderr.  Discarding it turned a broken helper interface
+    # into "the guest does not answer", which sends an operator to inspect a
+    # perfectly healthy appliance instead of the two scripts that disagree.
+    err_file="$(mktemp 2>/dev/null || echo /dev/null)"
+    discovered="$("$helper" --timeout "${ZD_ADDRESS_TIMEOUT:-6}" 2>"$err_file" || true)"
+    helper_err="$(head -n1 "$err_file" 2>/dev/null || true)"
+    [ "$err_file" = "/dev/null" ] || rm -f "$err_file"
 fi
 if [ -n "$discovered" ]; then
     guest_ip="$discovered"
@@ -53,6 +60,7 @@ elif [ -z "$guest_ip" ] && [ -r "$GUEST_IP_FILE" ]; then
 fi
 if [ -z "$guest_ip" ]; then
     say "the guest does not answer on the LAN: no address found for its board MAC"
+    [ -n "$helper_err" ] && say "the address helper reported: $helper_err"
     exit 1
 fi
 case "$guest_ip" in
