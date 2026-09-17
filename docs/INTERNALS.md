@@ -1,6 +1,7 @@
 # ZD1200 container internals
 
-Technical detail behind `build-container.sh`. For the quick start, see
+Technical detail behind `install-zd1200-docker.sh` (Docker) and
+`install-zd1200-lxc.sh` (Proxmox LXC). For the quick start, see
 [../README.md](../README.md).
 
 ## Firmware archive handling
@@ -69,7 +70,7 @@ paired with a ZD1200 firmware rootfs of the same version, e.g. to revive a
 ZD1100 or ZD3000 card on a ZD1200 container:
 
 ```sh
-./build-container.sh ~/images/zd1200_9.10.2.0.130.ap_*.img \
+./install-zd1200-docker.sh ~/images/zd1200_9.10.2.0.130.ap_*.img \
     --writable-from ~/images/zd1112_9.10.2.0.84.bin
 ```
 
@@ -92,7 +93,7 @@ configuration in place.
 
 ## The `image/` directory
 
-`build-container.sh` runs `scripts/build/prepare-vendor-image.sh` once to build
+`install-zd1200-docker.sh` runs `scripts/build/prepare-vendor-image.sh` once to build
 `image/` at the repo root (gitignored). It holds the vendor-derived
 `rootfs.ext2`, `bzImage`, `restoreinitramfs.gz`, the signing-cert payload, the AP
 firmware payload, and (for a dump or `--writable-from`) `writable.raw` and
@@ -100,11 +101,34 @@ firmware payload, and (for a dump or `--writable-from`) `writable.raw` and
 `/opt/zd1200/image`. Later runs reuse it; delete the directory (or re-run
 `prepare-vendor-image.sh <input>`) to extract again.
 
+The script writes wherever `IMAGE_DIR` points (default: the repo's `image/`), so
+the LXC flow keeps the same contents under `/var/lib/zd1200/image` instead.
+
 ## Disk model
 
 `docker/Dockerfile` builds a Debian image with QEMU and the guest-image tooling;
 `docker/docker-compose.yml` runs it with `network_mode: host`, the
 `NET_ADMIN`/`MKNOD`/`NET_RAW` capabilities and the `zd1200-state` volume.
+
+The **Proxmox LXC** flavour runs the same guest-image tooling directly in a
+Debian 13 container (`proxmox/`, see its README): no Docker image, no
+`NET_ADMIN`-capable privileged CT, and the guest's tap is a port of a bridge
+inside the CT rather than a macvtap. The differences are only in the launcher and
+the layout:
+
+| | Docker | Proxmox LXC |
+|---|---|---|
+| toolchain | inside the image | apt packages in the CT |
+| `scripts/container/` | copied to `/opt/zd1200/` | stays a checkout at `/opt/zd1200/` |
+| derived artifacts | bind-mounted `image/` + `zd1200-state` volume | `/var/lib/zd1200/` (image, disk, scratch) |
+| guest NIC | macvtap on the host NIC (`NETWORK_MODE=macvtap`) | tap on a bridge inside the CT (`NETWORK_MODE=bridge`) |
+| supervisor | the container entrypoint (compose restart policy) | `zd1200.service` (systemd) |
+| host can reach guest | no (macvlan sibling isolation) | yes (ordinary bridge port) |
+
+`scripts/container/build-synthetic-cf.py` takes its artifact directory from
+`RUNTIME_DIR` and `scripts/build/prepare-vendor-image.sh` from `IMAGE_DIR`, both
+defaulting to the Docker layout; the LXC bootstrap points them at the state
+directory, which is why `scripts/container/` needs no copies in the LXC flow.
 
 The synthetic CompactFlash is a flat raw image (there is no qcow2 overlay):
 
@@ -247,9 +271,11 @@ historical LZMA SquashFS, the Dockerfile carries a `ruckus-squashfs-tools` stage
 that builds the matching `unsquashfs`/`mksquashfs` from pinned GPL-2.0 source.
 
 **R600 is the validated target**; the other models are repaired only because they
-resolve to the identical vendor image, and an AP still running fully signed FSI
-firmware must first be moved to a compatible ISI release through its standalone
-upgrade page.
+resolve to the identical vendor image. **A repaired image requires the AP to
+already run Solo 104 or 106 firmware**: the repair produces an unsigned image, and
+an AP on anything older will not accept it, so the APs must be moved to Solo
+104/106 through their own standalone upgrade page first. An AP still on fully
+signed FSI firmware has the same prerequisite.
 
 This is the one repair that keys off a version number: the helper reads the AP
 image's own BL7 version and applies the fix only to a 10.5.1 build at or after
@@ -289,6 +315,17 @@ QEMU also exposes an IPMI BMC (`ipmi-bmc-sim` + `isa-ipmi-kcs`), which the
 firmware uses for watchdog and power handling, and a debug console
 (`isa-debugcon`) on port 0x402, where pre-console output (SeaBIOS) is captured to
 `/tmp/zd1200-debugcon.log`.
+
+The LXC flow reuses the same entrypoint and launcher under systemd
+(`zd1200.service` runs `scripts/container/entrypoint.sh` with `/etc/zd1200.conf`
+in the environment). `systemctl stop zd1200` therefore takes the identical
+orderly-shutdown path, and `TimeoutStopSec=300` gives the guest the same grace the
+compose file's `stop_grace_period` does. The `NETWORK_MODE=bridge` case in
+`launch-vm.sh` creates `tap-zd`, enslaves it to the bridge `zd1200-net.service`
+built (`br-zd`), and hands it to QEMU; because the guest's tap and the CT's
+uplink are ports of the same bridge, the CT can `curl` the guest directly and the
+DHCP sniffer is not needed for reachability (it still records the lease for
+`/var/lib/zd1200/guest-ip`).
 
 ## Boot test without the container
 

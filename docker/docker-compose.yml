@@ -6,7 +6,7 @@ services:
       args:
         # 1 builds the static dropbear replacement in the image (slow: downloads
         # a musl.cc cross toolchain and builds dropbear + OpenSSH).  Set by
-        # build-container.sh --root-ssh-key; 0 leaves the vendor dropbear alone.
+        # install-zd1200-docker.sh --root-ssh-key; 0 leaves the vendor dropbear alone.
         ZD_ROOT_SSH: ${ZD_ROOT_SSH:-0}
     image: local/zd1200-qemu
     container_name: ${ZD_CONTAINER_NAME:-zd1200}
@@ -53,7 +53,7 @@ services:
       GUEST_IP: ${ZD_GUEST_IP:-192.168.50.10}
       # Board data written into the CF image: serial + base MAC (MAC2=MAC1+1).
       # By default the identity is derived from ZD_CONTAINER_MAC (a unique,
-      # locally-administered MAC generated into .env by build-container.sh):
+      # locally-administered MAC generated into .env by install-zd1200-docker.sh):
       # MAC1 = ZD_CONTAINER_MAC, serial hashed from MAC1.  Set
       # ZD_BOARDDATA_FROM_MAC=0 to pin the fixed ZD_SERIAL/ZD_MAC1 below instead
       # (that serial is the known-good one for the firmware's support check).
@@ -62,7 +62,7 @@ services:
       ZD_SERIAL: ${ZD_SERIAL:-123456000789}
       ZD_MAC1: ${ZD_MAC1:-00:0c:e6:12:00:01}
       # Optional seven-character source revision appended to the ZoneDirector
-      # version on the admin console ("virtual <rev>").  build-container.sh
+      # version on the admin console ("virtual <rev>").  install-zd1200-docker.sh
       # derives it from the checked-out Git revision; leave empty to omit it.
       ZD_VIRTUAL_BUILD_ID: ${ZD_VIRTUAL_BUILD_ID:-}
       # Optional Network Monitor defaults, seeded into /writable on the first
@@ -73,7 +73,7 @@ services:
       ZD_PING_INTERVAL_SECONDS: ${ZD_PING_INTERVAL_SECONDS:-}
       ZD_PING_CLIENT_TARGETS: ${ZD_PING_CLIENT_TARGETS:-}
       # Optional root SSH on TCP 2222 using the static dropbear replacement.
-      # build-container.sh --root-ssh-key writes the public key here and sets
+      # install-zd1200-docker.sh --root-ssh-key writes the public key here and sets
       # the ZD_ROOT_SSH build arg; the runtime only needs the mounted key —
       # whether it is installed is decided by the image payload, not by a
       # runtime variable (so a plain `docker compose up` keeps it enabled).
@@ -82,6 +82,10 @@ services:
       # so modern clients do not need -o HostKeyAlgorithms=+ssh-rsa.  Set to 0
       # to revert.
       ZD_ECDSA_SSH: ${ZD_ECDSA_SSH:-1}
+      # Patch the ap-11n-scorpion (R600) mesh bug out of the AP image the guest
+      # delivers.  Set to 0 to ship the vendor AP images unmodified
+      # (install-zd1200-docker.sh --no-r600-repair).
+      ZD_R600_REPAIR: ${ZD_R600_REPAIR:-1}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
       KERNEL_EXTRA: nohz=off
       WEB_WAIT_SECONDS: "600"

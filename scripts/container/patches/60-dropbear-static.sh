@@ -13,7 +13,7 @@
 # This patch is a no-op unless the image carries the built payload
 # (/opt/zd1200/dropbear/dropbear, only present when ZD_ROOT_SSH=1) and a public
 # key is supplied.  When the payload is absent it REVERTS an earlier install, so
-# turning the feature off in build-container.sh restores the vendor binary.
+# turning the feature off in install-zd1200-docker.sh restores the vendor binary.
 #
 # Per partition it installs:
 #   * /usr/sbin/dropbear          (vendor saved as /usr/sbin/dropbear.vendor)

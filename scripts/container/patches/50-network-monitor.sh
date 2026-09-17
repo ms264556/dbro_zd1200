@@ -43,7 +43,17 @@ BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
 WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ANALYTICS_DIR="${ANALYTICS_DIR:-$(dirname "$BASE")/analytics}"
+# Set ZD_NETWORK_MONITOR=0 to install nothing (the LXC installer's
+# --no-network-monitor): the fresh image then has no page and no collectors, as
+# if the feature did not exist.  Its value is part of the patch signature, so
+# changing it re-customises the roots.
+ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
 ALIGN=512
+
+if [ "$ZD_NETWORK_MONITOR" = "0" ]; then
+    echo "50-network-monitor: disabled (ZD_NETWORK_MONITOR=0); nothing to install"
+    exit 0
+fi
 
 # name|start_sector|sector_count  (mirrors build-synthetic-cf.py)
 PARTITIONS=(
@@ -79,7 +89,7 @@ done
 [ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
 
 # Optional: label the admin console version with a source revision.  Disabled
-# unless a 7-character lowercase-hex value is supplied (build-container.sh
+# unless a 7-character lowercase-hex value is supplied (install-zd1200-docker.sh
 # derives one from the checked-out Git revision).
 VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}"
 case "$VIRTUAL_BUILD_ID" in

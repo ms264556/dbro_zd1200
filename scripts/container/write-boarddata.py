@@ -230,8 +230,13 @@ def main():
     print(f"  serial: {args.serial!r}")
     print(f"  MAC1:   {mac1_s}   (wlan0/enet0/enetxMac[0]/MACbase)")
     print(f"  MAC2:   {mac2_s}   (= MAC1 + 1; wlan1/enet1/enetxMac[1])")
-    print(f"  serialNumber @ +0x08: {rbd[0x08:0x18].rstrip(b'\\x00')!r}")
-    print(f"  serialNumber32 @ +0x9c: {rbd[0x9c:0xbc].rstrip(b'\\x00')!r}")
+    # rstrip(b"\x00") in a separate expression: a backslash inside an f-string
+    # replacement field is only legal from Python 3.12, and the LXC/CT path
+    # runs this on the distribution's python3 (3.11 on Debian 12).
+    serial_rb = rbd[0x08:0x18].rstrip(b"\x00")
+    serial32_rb = rbd[0x9c:0xbc].rstrip(b"\x00")
+    print(f"  serialNumber @ +0x08: {serial_rb!r}")
+    print(f"  serialNumber32 @ +0x9c: {serial32_rb!r}")
 
 
 if __name__ == "__main__":

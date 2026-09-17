@@ -5,7 +5,7 @@
 # loaded the kernel, and the guest's init got as far as the requested stage.
 #
 # Steps:
-#   1. build the container image with build-container.sh --no-up (which also
+#   1. build the container image with install-zd1200-docker.sh --no-up (which also
 #      prepares image/ from the firmware on first run);
 #   2. build/patch the synthetic CompactFlash disk in an isolated state dir,
 #      using the container's own prepare-vm-disks.sh (never the running
@@ -17,7 +17,7 @@
 #      ready and stop at the requested one.
 #
 # Usage: ./scripts/test/boot-test.sh [options]
-#   --firmware PATH   ZD1200 firmware .img (passed to build-container.sh; only
+#   --firmware PATH   ZD1200 firmware .img (passed to install-zd1200-docker.sh; only
 #                     needed when image/ has not been prepared yet)
 #   --expect LEVEL    grub | kernel | init | controller | ready  (default: init)
 #   --timeout SEC     boot deadline (default: 420)
@@ -114,11 +114,11 @@ docker info >/dev/null 2>&1 || die "cannot reach the Docker daemon"
 
 # --- 1. build the container image (and image/ on first run) ------------------
 if [ "$do_build" = 1 ]; then
-  say "building the container image (build-container.sh --no-up)"
+  say "building the container image (install-zd1200-docker.sh --no-up)"
   if [ -n "$firmware" ]; then
-    ./build-container.sh --no-up "$firmware"
+    ./install-zd1200-docker.sh --no-up "$firmware"
   else
-    ./build-container.sh --no-up
+    ./install-zd1200-docker.sh --no-up
   fi
 fi
 
@@ -134,7 +134,7 @@ cert_dir="${ZD_SIGN_CERT_HOST:-$repo/image/signing-cert}"
 
 if [ "$do_prepare" = 1 ]; then
   [ -f "$repo/image/rootfs.ext2" ] \
-    || die "image/rootfs.ext2 missing — pass --firmware to build-container.sh"
+    || die "image/rootfs.ext2 missing — pass --firmware to install-zd1200-docker.sh"
   [ -d "$cert_dir" ] || die "signing cert dir missing: $cert_dir (set ZD_SIGN_CERT_HOST)"
 
   say "building/patching the synthetic CF disk in $state_dir (container)"

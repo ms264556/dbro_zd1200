@@ -2,7 +2,7 @@
 # Derive the ZD1200 guest's board-data identity from ZD_CONTAINER_MAC.
 #
 # ZD_CONTAINER_MAC is a unique, locally-administered MAC generated into .env by
-# build-container.sh when the container is first created.  The guest base MAC
+# install-zd1200-docker.sh when the container is first created.  The guest base MAC
 # (MAC1) is that value, so the guest identity is unique per instance and
 # stable across container recreates; MAC2 = MAC1 + 1.  The serial is hashed from
 # MAC1, so each instance presents its own appliance identity on the LAN.

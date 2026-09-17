@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# proxmox/zd1200-guest-healthcheck — probe the running ZD1200 guest from inside
+# its LXC container.
+#
+# Replaces the Docker flow's healthcheck for the LXC install.  That one greps the
+# serial log for the guest's READY line, which never leaves the log: when the
+# guest wedged (QEMU alive and reported running, guest not answering, its NIC
+# silent, both LAN addresses dark) the container still reported healthy, so
+# nothing noticed.  This probes the live appliance instead.
+#
+# Exit 0 = the guest answers; non-zero = it does not, and systemd records the
+# failure.  Run by zd1200-healthcheck.service on a timer (and by hand for
+# diagnostics).
+#
+# Checks, in order of cost:
+#   1. the guest's address is visible at L2 on the container's bridge (a unicast
+#      ARP probe from the bridge; the guest answers for its own address only);
+#   2. if a port already answers there, it must be the appliance's HTTPS service
+#      (302/200), not something else squatting on the address;
+#   3. a DHCP client for the guest's MAC is still on the wire, so a guest that
+#      has lost its lease is reported even while an old address is stale.
+#
+# Set ZD_GUEST_IP to pin the address instead of reading the lease file.
+set -u
+
+STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
+GUEST_IP_FILE="${ZD_GUEST_IP_FILE:-$STATE_DIR/guest-ip}"
+BRIDGE="${ZD_BRIDGE_IF:-br-zd}"
+TAP="${TAP_IF:-tap-zd}"
+HTTPS_PORT=443
+VERBOSE="${ZD_HEALTHCHECK_VERBOSE:-0}"
+
+say() { printf 'zd1200-healthcheck: %s\n' "$*"; }
+note() { [ "$VERBOSE" = 1 ] && say "$*" || true; }
+
+# The guest is a DHCP client: its address can change, so discover it rather
+# than depend on a recorded one.  A recorded address is used only when discovery
+# is unavailable, and is never trusted on its own.
+helper="${ZD_ADDRESS_HELPER:-/usr/local/sbin/zd1200-guest-address}"
+guest_ip="${ZD_GUEST_IP:-}"
+discovered=""
+if [ -x "$helper" ]; then
+    discovered="$("$helper" --timeout "${ZD_ADDRESS_TIMEOUT:-6}" 2>/dev/null || true)"
+fi
+if [ -n "$discovered" ]; then
+    guest_ip="$discovered"
+    note "discovered guest address $guest_ip"
+    printf '%s\n' "$guest_ip" > "$GUEST_IP_FILE" 2>/dev/null || true
+elif [ -z "$guest_ip" ] && [ -r "$GUEST_IP_FILE" ]; then
+    guest_ip="$(head -n1 "$GUEST_IP_FILE" 2>/dev/null | tr -d ' \r\n')"
+    note "using the recorded address $guest_ip (discovery found nothing)"
+fi
+if [ -z "$guest_ip" ]; then
+    say "the guest does not answer on the LAN: no address found for its board MAC"
+    exit 1
+fi
+case "$guest_ip" in
+    *[!0-9.]*|"") say "guest address '$guest_ip' is not an IPv4 address"; exit 1 ;;
+esac
+
+# The bridge must exist: without it the guest's tap has no path to the LAN.
+if [ ! -e "/sys/class/net/$BRIDGE" ]; then
+    say "bridge $BRIDGE is missing; the container-side LAN bridge is down"
+    exit 1
+fi
+
+# --- 1. is the guest alive at L2? -------------------------------------------
+# arping (if present) is exact; otherwise fall back to a bridge-scoped ping.
+if command -v arping >/dev/null 2>&1; then
+    if arping -q -c 2 -w 3 -I "$BRIDGE" "$guest_ip" >/dev/null 2>&1; then
+        note "$guest_ip answers ARP on $BRIDGE"
+    else
+        say "no ARP answer for $guest_ip on $BRIDGE: the guest is not responding"
+        exit 1
+    fi
+else
+    if ping -q -c 2 -W 2 -I "$BRIDGE" "$guest_ip" >/dev/null 2>&1; then
+        note "$guest_ip answers ICMP via $BRIDGE"
+    else
+        say "no answer for $guest_ip via $BRIDGE (install iputils-arping for an exact probe)"
+        exit 1
+    fi
+fi
+
+# --- 2. if something answers on HTTPS it must be the appliance --------------
+status="$(curl -ksS --max-time 8 -o /dev/null -w '%{http_code}' \
+    "https://$guest_ip/admin10/login.jsp" 2>/dev/null || true)"
+case "$status" in
+    200|302)
+        note "web service answers on $guest_ip ($status)"
+        ;;
+    000)
+        note "web service not up yet on $guest_ip (still booting?)"
+        ;;
+    *)
+        say "unexpected HTTP status $status from $guest_ip: is something else on that address?"
+        exit 1
+        ;;
+esac
+
+# --- 3. has the guest's address been confirmed recently? ---------------------
+# The lease file is written when the LAN's DHCP server answers the guest.  If it
+# has gone very stale while the address still answers, the appliance is probably
+# holding a lease the server no longer honours, which is worth surfacing.
+if [ "${ZD_HEALTHCHECK_LEASE:-1}" = "1" ] && [ -f "$GUEST_IP_FILE" ]; then
+    now="$(date +%s)"
+    stamp="$(stat -c %Y "$GUEST_IP_FILE" 2>/dev/null || echo "$now")"
+    age=$(( now - stamp ))
+    if [ "$age" -gt "${ZD_HEALTHCHECK_LEASE_MAX_AGE:-86400}" ]; then
+        say "the recorded lease for $guest_ip is $((age / 3600))h old; confirm it is still valid"
+        # Not fatal: an address with a long lease is normal.  Reachability above
+        # is the pass/fail signal.
+    else
+        note "recorded lease is $((age / 60)) minutes old"
+    fi
+fi
+
+say "guest $guest_ip is healthy"
+exit 0

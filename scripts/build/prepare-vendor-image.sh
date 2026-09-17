@@ -9,10 +9,14 @@
 #
 # This runs inside the image built from docker/Dockerfile (which carries
 # e2fsprogs/debugfs, python3, tar and gzip), so the host needs no filesystem
-# tooling.  build-container.sh invokes it there.
+# tooling.  install-zd1200-docker.sh invokes it there.
 set -euo pipefail
 
-work_dir="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root: image/ lives there
+work_dir="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root
+# Where the prepared artifacts land.  Defaults to the repo's image/ (the Docker
+# flow mounts it read-only into the container); the LXC flow sets IMAGE_DIR to a
+# state directory.  Both the early setup and the extraction below must agree.
+IMAGE_DIR="${IMAGE_DIR:-$work_dir/image}"
 archive_path=""
 writable_from=""
 writable_partition=""
@@ -132,7 +136,7 @@ extract_writable_from_dump() {
 
 staging="$(mktemp -d "${TMPDIR:-/tmp}/zd1200-vendor.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
-output_dir="$work_dir/image"
+output_dir="$IMAGE_DIR"
 
 # ---- CompactFlash dump input ---------------------------------------------
 # A CF dump is a complete appliance (rootfs + /writable + board data).  The
@@ -242,7 +246,7 @@ rootfs_md5="$(md5sum "$source_dir/rootfs.i386.ext2.director1200.img" | awk '{pri
 [ "$kernel_md5" = "$(metadata_value KERNEL_MD5SUM)" ] || fail "bzImage MD5 mismatch"
 [ "$rootfs_md5" = "$(metadata_value ROOTFS_MD5SUM)" ] || fail "rootfs MD5 mismatch"
 
-output_dir="$work_dir/image"
+output_dir="$IMAGE_DIR"
 mkdir -p "$output_dir"
 cp -f "$source_dir/bzImage" "$output_dir/bzImage"
 cp -f "$source_dir/restoreinitramfs.gz" "$output_dir/restoreinitramfs.gz"

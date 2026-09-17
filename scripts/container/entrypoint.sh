@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NOTE: This is the container's ENTRYPOINT. It is run by Docker Compose as the
 # zd1200 container command — do NOT run it directly on the host as a standalone
-# flow. The supported way to run this project is `sudo ./build-container.sh`
+# flow. The supported way to run this project is `sudo ./install-zd1200-docker.sh`
 # (= docker compose up -d --build). See README.md.
 set -euo pipefail
 
@@ -110,11 +110,12 @@ fi
 # (see prepare-vm-disks.sh below); on every start the board data is read
 # back afterwards and takes precedence.
 # By default the identity is derived from ZD_CONTAINER_MAC, a unique
-# locally-administered MAC generated into .env by build-container.sh
+# locally-administered MAC generated into .env by install-zd1200-docker.sh
 # (scripts/container/boarddata-from-mac.sh: MAC1 = ZD_CONTAINER_MAC, serial hashed
 # from MAC1); MAC2 = MAC1 + 1.  Set ZD_BOARDDATA_FROM_MAC=0 to pin the fixed
 # ZD_SERIAL/ZD_MAC1 instead.
-if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_BOARDDATA_FROM_MAC:-1}" != "0" ]; then
+if { [ "${NETWORK_MODE:-user}" = macvtap ] || [ "${NETWORK_MODE:-user}" = bridge ]; } \
+   && [ "${ZD_BOARDDATA_FROM_MAC:-1}" != "0" ]; then
     eval "$("$work_dir/boarddata-from-mac.sh")"
     zd_serial="$SERIAL"
     zd_mac1="$MAC"
@@ -171,11 +172,16 @@ fi
 # vestigial subnet; udhcpc's deconfig flushes it), so udhcpc keeps retrying
 # in the background until the LAN grants a lease - which also gives mDNS
 # multicast a real L2 path.
-if [ "${NETWORK_MODE:-user}" = macvtap ]; then
+#
+# The lease sniffer below matters in bridge mode too: the LXC guest is a normal
+# bridge port with its own MAC and still takes its address from the LAN's DHCP
+# server, so the same broadcast-reply observation is how the container learns
+# the guest's dynamic address.
+if [ "${NETWORK_MODE:-user}" = macvtap ] || [ "${NETWORK_MODE:-user}" = bridge ]; then
     # In host-netns mode eth0 is the host's own interface and already carries
     # the host's IP; running udhcpc on it would try to re-lease and could
     # disturb the host's connectivity.  Skip it unless explicitly asked.
-    if [ "${ZD_HOST_NET:-0}" != "1" ]; then
+    if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_HOST_NET:-0}" != "1" ]; then
         udhcpc -i eth0 -b -q -p /var/run/udhcpc.pid >>"$log_file" 2>&1 || true
     fi
     # The macvlan bridge isolates this container from its macvtap guest, so the
@@ -257,7 +263,7 @@ if [ -n "$cpu_limit" ]; then
 else
     echo "Startup runs at full speed and has a ${wait_seconds}s readiness deadline."
 fi
-if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
+if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ] || [ "$network_mode" = bridge ]; then
     probe_base="https://$guest_ip"
 else
     probe_base="https://127.0.0.1:$https_port"
@@ -343,7 +349,7 @@ while (( SECONDS < deadline )); do
                 ready_kind="login page"
             fi
             echo "ZD1200 $ready_kind is ready:"
-            if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ]; then
+            if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ] || [ "$network_mode" = bridge ]; then
                 echo "HTTP:  http://$guest_ip/"
             else
                 echo "HTTP:  http://127.0.0.1:$http_port/"

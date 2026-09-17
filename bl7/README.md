@@ -1,5 +1,10 @@
 # ap-11n-scorpion (R600) mesh repair
 
+**The APs must already be running Solo 104 or 106 firmware before they will join a
+controller delivering a repaired image** — the repair yields an unsigned image and
+older AP firmware rejects it. Upgrade the APs through their own standalone upgrade
+page first.
+
 ZoneDirector 10.5.1.0.276 introduced a mesh receive-path bug in the shared
 `ap-11n-scorpion` AP firmware. A wired Root AP looks healthy while a wireless
 Mesh AP shows as connected but does not pass ordinary Layer-2 traffic. 10.5.1.0.282

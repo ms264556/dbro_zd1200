@@ -35,7 +35,7 @@ Only built when explicitly requested, because it downloads a ~110 MB musl.cc
 cross toolchain and builds three source trees:
 
 ```sh
-./build-container.sh --root-ssh-key ~/.ssh/id_ed25519.pub
+./install-zd1200-docker.sh --root-ssh-key ~/.ssh/id_ed25519.pub
 ```
 
 `docker/Dockerfile` then runs the vendored `build-zd1200-dropbear.sh` in the

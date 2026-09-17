@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NOTE: This is the container's GUEST LAUNCHER. It is invoked by
 # entrypoint.sh (the container entrypoint) — do NOT run it directly on the
-# host. The supported way to run this project is `sudo ./build-container.sh`
+# host. The supported way to run this project is `sudo ./install-zd1200-docker.sh`
 # (= docker compose up -d --build). See README.md.
 set -u
 
@@ -74,6 +74,29 @@ case "${NETWORK_MODE:-user}" in
         fi
         net_args=( -net "tap,ifname=$tap_if,script=no,downscript=no" )
         ;;
+    bridge)
+        # LXC/CT mode: the container's eth0 is already a port of the LAN bridge
+        # (br-zd, created by the container's network setup), so attach a tap to
+        # that bridge and hand it to QEMU.  Unlike macvtap this is an ordinary
+        # bridge port: the guest is a real L2 neighbour of the container, so the
+        # container (and the Proxmox host behind the bridge) can reach it by IP,
+        # and no DHCP sniffing is needed.
+        tap_if="${TAP_IF:-tap-zd}"
+        bridge_if="${ZD_BRIDGE_IF:-br-zd}"
+        host_if="${ZD_HOST_IF:-eth0}"
+        if [ ! -e "/sys/class/net/$bridge_if" ]; then
+            echo "Missing bridge interface: $bridge_if (is the LXC network setup run?)" >&2
+            exit 1
+        fi
+        if [ ! -e "/sys/class/net/$tap_if" ]; then
+            ip tuntap add dev "$tap_if" mode tap || exit 1
+        fi
+        ip link set "$tap_if" master "$bridge_if" || exit 1
+        ip link set "$tap_if" up || exit 1
+        ip link set "$host_if" master "$bridge_if" 2>/dev/null || true
+        ip link set "$bridge_if" up 2>/dev/null || true
+        net_args=( -net "tap,ifname=$tap_if,script=no,downscript=no" )
+        ;;
     macvtap)
         # Inside the macvlan-networked container: create a macvtap in bridge
         # mode on eth0 so the guest shares the LAN L2 with the container
@@ -113,7 +136,7 @@ case "${NETWORK_MODE:-user}" in
         nic_args=()
         ;;
     *)
-        echo "NETWORK_MODE must be user, tap, macvtap or none" >&2
+        echo "NETWORK_MODE must be user, tap, bridge, macvtap or none" >&2
         exit 2
         ;;
 esac
@@ -123,7 +146,8 @@ if [ "${NETWORK_MODE:-user}" != none ]; then
     # the igb2 driver.  QEMU's `igb` model emulates the Intel 82576 (PCI
     # 0x10C9) which igb2.ko supports, so the stock driver binds and brings up
     # eth0/br0 exactly like real hardware.
-    if [ "${NETWORK_MODE:-user}" = macvtap ] && [ -n "${ZD_MAC1:-}" ]; then
+    if { [ "${NETWORK_MODE:-user}" = macvtap ] || [ "${NETWORK_MODE:-user}" = bridge ]; } \
+       && [ -n "${ZD_MAC1:-}" ]; then
         # The QEMU NIC must carry the guest's base MAC (board-data MAC1, the
         # one the vendor v54bsp driver forces onto NIC[0]).  This is derived
         # FROM the container's eth0 MAC but is a distinct value (eth0 + 1), so

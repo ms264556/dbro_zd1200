@@ -30,9 +30,16 @@ import sys
 import tempfile
 
 base = Path(__file__).resolve().parent
-rootfs = base / "image" / "rootfs.ext2"
-kernel_src = base / "image" / "bzImage"     # raw; patch below for QEMU
-disk = Path(os.environ.get("SYNTHETIC_DISK", base / "synthetic-cf.img"))
+# Where the produced artifacts live: the vendor-derived image/, the BL7 repair
+# tooling and the ruckus-squashfs tools.  Defaults to the script's own directory,
+# which is the layout of the Docker image (/opt/zd1200).  The LXC install keeps
+# the scripts in the repository checkout and the artifacts under a state
+# directory, so it sets RUNTIME_DIR (e.g. /opt/zd1200); image/ then resolves to
+# $RUNTIME_DIR/image, bl7 to $RUNTIME_DIR/bl7, and so on.
+runtime = Path(os.environ.get("RUNTIME_DIR") or base)
+rootfs = runtime / "image" / "rootfs.ext2"
+kernel_src = runtime / "image" / "bzImage"   # raw; patch below for QEMU
+disk = Path(os.environ.get("SYNTHETIC_DISK", runtime / "synthetic-cf.img"))
 disk.parent.mkdir(parents=True, exist_ok=True)
 
 SECTOR = 512
@@ -73,8 +80,8 @@ with tempfile.TemporaryDirectory() as _kp:
 
 
 def seed_writable_config(ext2_path):
-    passwd_src = base / "dropbear-provision" / "passwd"
-    shadow_src = base / "dropbear-provision" / "shadow"
+    passwd_src = runtime / "dropbear-provision" / "passwd"
+    shadow_src = runtime / "dropbear-provision" / "shadow"
     if not passwd_src.exists() or not shadow_src.exists():
         print("  dropbear-provision/passwd/shadow missing; leaving /writable unseeded")
         return
@@ -113,7 +120,7 @@ with tempfile.TemporaryDirectory() as td:
     cmds = [f"write {kernel_file} /bzImage"]
     # The vendor /boot also carried the rescue initrd; menu.lst's "System rescue
     # from image" entry needs it at (hd0,0)/restoreinitramfs.gz.
-    rescue = base / "image" / "restoreinitramfs.gz"
+    rescue = runtime / "image" / "restoreinitramfs.gz"
     if rescue.exists():
         cmds.append(f"write {rescue} /restoreinitramfs.gz")
     # The vendor upgrade compares /boot/restoreinitramfs.ver with the payload's
@@ -121,7 +128,7 @@ with tempfile.TemporaryDirectory() as td:
     # /boot/lib/grub/i386-pc/menu.lst with the vendor template (root=/dev/sda*,
     # wrong for our IDE guest).  Ship the version so a same-version upgrade skips
     # that rewrite.
-    ver = base / "image" / "restoreinitramfs.ver"
+    ver = runtime / "image" / "restoreinitramfs.ver"
     if not ver.exists():
         raise SystemExit(f"missing {ver} — run scripts/build/prepare-vendor-image.sh")
     cmds.append(f"write {ver} /restoreinitramfs.ver")
@@ -174,13 +181,18 @@ def patch_scorpion(stage: Path) -> None:
     files of every model that aliases that image.  Non-R600 payloads (and
     non-10.5.1 builds) are left alone by the helper.
     """
+    # ZD_R600_REPAIR=0 delivers the vendor AP images unmodified (the LXC
+    # installer's --no-r600-repair and the Docker entry point's equivalent).
+    if (os.environ.get("ZD_R600_REPAIR") or "").strip() == "0":
+        print("  ap-11n-scorpion mesh repair disabled (ZD_R600_REPAIR=0)")
+        return
     firmware_root = stage / "firmwares"
     if not (firmware_root / "r600").is_dir():
         print("  no r600 firmware in payload; ap-11n-scorpion mesh repair skipped")
         return
-    helper = base / "bl7" / "patch-scorpion-payload.py"
-    unsquashfs = base / "ruckus-squashfs" / "unsquashfs"
-    mksquashfs = base / "ruckus-squashfs" / "mksquashfs"
+    helper = runtime / "bl7" / "patch-scorpion-payload.py"
+    unsquashfs = runtime / "ruckus-squashfs" / "unsquashfs"
+    mksquashfs = runtime / "ruckus-squashfs" / "mksquashfs"
     if not (helper.is_file() and unsquashfs.is_file() and mksquashfs.is_file()):
         raise SystemExit(
             "ap-11n-scorpion mesh repair tooling missing "
@@ -199,7 +211,7 @@ def stage_payload(stage: Path) -> None:
     web-UI aidfs/ (ac_upg.sh _upg_aidfs) and the AP images under
     etc/airespider-images/firmwares/ (_upg_apimg), sourced from the payload
     tarball prepare-vendor-image.sh builds."""
-    payloads = sorted((base / "image").glob("*-payload.tar.gz"))
+    payloads = sorted((runtime / "image").glob("*-payload.tar.gz"))
     if not payloads:
         print("  payload tarball (*-payload.tar.gz) missing; /writable left without AP images/aidfs")
         return
@@ -227,7 +239,7 @@ def stage_payload(stage: Path) -> None:
 # leaves behind: the web-UI aidfs (_upg_aidfs) and the AP images + manifest
 # under etc/airespider-images/firmwares (_upg_apimg), staged from the payload
 # tarball, with mke2fs -d seeding the ext2 filesystem.
-writable_raw = base / "image" / "writable.raw"
+writable_raw = runtime / "image" / "writable.raw"
 if writable_raw.exists():
     data = writable_raw.read_bytes()
     if len(data) > C4 * SECTOR:

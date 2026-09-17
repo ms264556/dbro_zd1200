@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 #
-# build-container.sh — build and start the ZD1200 Docker container (host-netns,
-# macvtap on the host's physical NIC).  This is the one entry point: it prepares
-# the vendor image (once), creates .env if absent, then builds and starts the
+# install-zd1200-docker.sh — build and start the ZD1200 Docker container
+# (host-netns, macvtap on the host's physical NIC).  This is the Docker entry
+# point, pairing with install-zd1200-lxc.sh for Proxmox: it prepares the
+# vendor image (once), creates .env if absent, then builds and starts the
 # container from docker/docker-compose.yml (GRUB is compiled in the image build).
 #
 # Usage:
-#   ./build-container.sh /path/to/zd1200_*.img       # first run: build + prepare + start
-#   ./build-container.sh /path/to/*cfcard_dump*      # a CF dump: raw dd .img or
+#   ./install-zd1200-docker.sh /path/to/zd1200_*.img  # first run: build+prepare+start
+#   ./install-zd1200-docker.sh /path/to/*cfcard_dump*  # a CF dump: raw dd .img or
 #                                                    # ImageUSB .bin
-#   ./build-container.sh /path/to/zd1200_*.img \
+#   ./install-zd1200-docker.sh /path/to/zd1200_*.img \
 #       --writable-from /path/to/cfcard_dump         # firmware rootfs/boot, but
 #                                                    # /writable + serial from a dump
 #                                                    # (e.g. a ZD1100/ZD3000 card)
 #       [--writable-partition START:COUNT]           # override the dump geometry
-#   ./build-container.sh                             # already prepared: start
-#   ./build-container.sh --no-up /path/to/*.img      # only build/prepare (no boot)
-#   ./build-container.sh --root-ssh-key ~/.ssh/id_ed25519.pub
+#   ./install-zd1200-docker.sh                        # already prepared: start
+#   ./install-zd1200-docker.sh --no-up /path/to/*.img # only build/prepare (no boot)
+#   ./install-zd1200-docker.sh --root-ssh-key ~/.ssh/id_ed25519.pub
 #                                                    # also build the static dropbear
 #                                                    # replacement and enable public-key
 #                                                    # root SSH on TCP 2222 (slow build)
@@ -26,8 +27,13 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+# Shared with the Proxmox entry point: console wording, MAC rules, input
+# classification and SSH-key validation must behave identically on both.
+# shellcheck source=scripts/install-common.sh
+. ./scripts/install-common.sh
 
 no_up=0
+r600_repair="${ZD_R600_REPAIR:-1}"
 archive="${ZD_ARCHIVE:-}"
 root_ssh_key=""
 writable_from=""
@@ -47,8 +53,9 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "--writable-partition needs START:COUNT" >&2; exit 2; }
             writable_partition="$2"; shift 2 ;;
         --writable-partition=*) writable_partition="${1#*=}"; shift ;;
+        --no-r600-repair) r600_repair=0; shift ;;
         -h|--help)
-            sed -n '2,17p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *) archive="${1:-}"; shift ;;
@@ -69,6 +76,11 @@ if ! docker info >/dev/null 2>&1; then
         exit 1
     fi
 fi
+
+# The ap-11n-scorpion (R600) mesh repair patches the AP firmware the image
+# delivers.  Disable it for a build that must keep the vendor AP images exactly
+# as shipped.
+export ZD_R600_REPAIR="$r600_repair"
 
 # The compose file lives in docker/; --project-directory . keeps .env, the
 # ./image volume mount and the build context rooted at the repo root.
@@ -126,16 +138,7 @@ fi
 # unique, locally-administered MAC once (host NIC OUI + random device part) and
 # keep it in .env, so the identity is stable across container recreates.
 if ! grep -qE '^ZD_CONTAINER_MAC=([0-9a-f]{2}:){5}[0-9a-f]{2}$' .env; then
-    base_mac="$(cat /sys/class/net/eth0/address 2>/dev/null || true)"
-    if printf '%s' "$base_mac" | grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then
-        first_octet=$(( 0x${base_mac:0:2} | 0x02 ))          # locally administered
-        oui_mid="${base_mac:3:5}"                            # xx:xx
-        first_octet="$(printf '%02x' "$first_octet")"
-    else
-        first_octet="02"; oui_mid="00:00"
-    fi
-    rand_lo="$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n' | sed 's/\(..\)/\1:/g;s/:$//')"
-    container_mac="$first_octet:$oui_mid:$rand_lo"
+    container_mac="$(random_mac)"
     if grep -q '^ZD_CONTAINER_MAC=' .env; then
         sed -i "s/^ZD_CONTAINER_MAC=.*/ZD_CONTAINER_MAC=$container_mac/" .env
     else
@@ -177,10 +180,8 @@ elif [ -n "${ZD_ROOT_SSH_PUBLIC_KEY:-}" ]; then
     fi
 fi
 if [ -n "$key_line" ]; then
-    case "$key_line" in
-        ssh-rsa\ *|ssh-ed25519\ *|ecdsa-sha2-nistp256\ *|ecdsa-sha2-nistp384\ *|ecdsa-sha2-nistp521\ *) ;;
-        *) echo "--root-ssh-key is not an SSH public key: $key_line" >&2; exit 2 ;;
-    esac
+    key_line="$(read_public_key "$key_line")" \
+        || { echo "--root-ssh-key is not an SSH public key: $key_line" >&2; exit 2; }
     mkdir -p dropbear-provision
     printf '%s\n' "$key_line" > dropbear-provision/authorized_keys
     # 0644, not 0600: it is a public key, and the container drops

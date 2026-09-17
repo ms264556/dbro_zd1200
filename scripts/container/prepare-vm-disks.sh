@@ -49,6 +49,8 @@ DROPBEAR_DIR="${DROPBEAR_DIR:-$BASE/dropbear}"
 ZD_ROOT_SSH_AUTHORIZED_KEYS="${ZD_ROOT_SSH_AUTHORIZED_KEYS:-/opt/zd1200/dropbear-provision/authorized_keys}"
 # Optional ECDSA host key for the administrative SSH service (patch 80).
 ZD_ECDSA_SSH="${ZD_ECDSA_SSH:-1}"
+# Optional Network Monitor page + collectors (patch 50); 0 installs nothing.
+ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
 MARKER="${MARKER:-$STATE_DIR/.disk-built}"
 SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
 SENTINEL=/etc/.zd-image
@@ -95,6 +97,7 @@ patch_sig="$( {
         printf 'ZD_ROOT_SSH_KEY=unreadable\n'
     fi
     printf 'ZD_ECDSA_SSH=%s\n' "$ZD_ECDSA_SSH"
+    printf 'ZD_NETWORK_MONITOR=%s\n' "$ZD_NETWORK_MONITOR"
     printf 'ZD_PING_INTERVAL_SECONDS=%s\n' "${ZD_PING_INTERVAL_SECONDS:-}"
     printf 'ZD_PING_CLIENT_TARGETS=%s\n' "${ZD_PING_CLIENT_TARGETS:-}"
 } | sha256sum | awk '{print $1}')"
@@ -116,7 +119,8 @@ fi
 if [ "$rebuild" = 1 ]; then
     say "Building the synthetic CF disk — $reason"
     rm -f "$DISK"
-    SYNTHETIC_DISK="$DISK" python3 "$BASE/build-synthetic-cf.py"
+    SYNTHETIC_DISK="$DISK" ZD_R600_REPAIR="${ZD_R600_REPAIR:-1}" \
+        python3 "$BASE/build-synthetic-cf.py"
     say "Writing board data (serial=${ZD_SERIAL:-123456000789}, MAC1=${ZD_MAC1:-00:0c:e6:12:00:01})"
     python3 "$BASE/write-boarddata.py" --disk "$DISK" \
         --serial "${ZD_SERIAL:-123456000789}" --mac "${ZD_MAC1:-00:0c:e6:12:00:01}" \
@@ -226,6 +230,7 @@ for patch in "$PATCHES_DIR"/*.sh; do
         DROPBEAR_DIR="$DROPBEAR_DIR" \
         ZD_ROOT_SSH_AUTHORIZED_KEYS="$ZD_ROOT_SSH_AUTHORIZED_KEYS" \
         ZD_ECDSA_SSH="$ZD_ECDSA_SSH" \
+        ZD_NETWORK_MONITOR="$ZD_NETWORK_MONITOR" \
         ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
         ZD_PING_INTERVAL_SECONDS="${ZD_PING_INTERVAL_SECONDS:-}" \
         ZD_PING_CLIENT_TARGETS="${ZD_PING_CLIENT_TARGETS:-}" \

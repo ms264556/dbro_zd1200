@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+#
+# proxmox/zd1200-guest-watchdog — recover a ZD1200 guest that has stopped
+# answering.
+#
+# The appliance can wedge inside QEMU: QEMU keeps running (so Proxmox reports
+# the VM as up) while the guest kernel stops answering, its NIC goes silent and
+# every LAN address for it goes dark.  Nothing in the container noticed, and it
+# stayed that way until a human hard-reset it.  This watchdog probes the guest on
+# a timer and, after a run of consecutive failures, asks QEMU to reboot it.
+#
+# Safety, so it cannot turn a slow boot into a reboot loop:
+#   * it first waits until the guest HAS answered once (a booting guest is never
+#     counted as failed);
+#   * it only counts failures, so one flaky probe does nothing;
+#   * after a reboot it waits out a long cooldown, and it stops counting until
+#     the guest is healthy again;
+#   * ZD_GUEST_WATCHDOG=0 disables the whole thing.
+#
+# Every action is logged to the journal (and to the console log), so an operator
+# can see exactly why a reboot happened.
+set -u
+
+STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
+RUN_DIR="${ZD_WATCHDOG_RUN_DIR:-/run}"
+STATE_FILE="$RUN_DIR/zd1200-watchdog.state"
+LOG_FILE="${ZD_WATCHDOG_LOG:-/tmp/zd1200-console.log}"
+INTERVAL="${ZD_GUEST_WATCHDOG_INTERVAL:-60}"
+FAILURES="${ZD_GUEST_WATCHDOG_FAILURES:-5}"
+COOLDOWN="${ZD_GUEST_WATCHDOG_COOLDOWN:-900}"
+HEALTHCHECK="${ZD_HEALTHCHECK_HELPER:-/usr/local/sbin/zd1200-guest-healthcheck}"
+CONTROL_SOCK="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
+
+log() {
+    printf 'zd1200-watchdog: %s\n' "$*"
+    if [ -w "$LOG_FILE" ]; then
+        printf 'zd1200-watchdog: %s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+[ "${ZD_GUEST_WATCHDOG:-1}" = "0" ] && { log "disabled (ZD_GUEST_WATCHDOG=0)"; exit 0; }
+
+# --- run state: warmup | running | cooldown ---------------------------------
+phase="warmup"
+fails=0
+cooldown_until=0
+if [ -r "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE" 2>/dev/null || true
+fi
+
+save_state() {
+    {
+        printf 'phase=%s\n' "$phase"
+        printf 'fails=%s\n' "$fails"
+        printf 'cooldown_until=%s\n' "$cooldown_until"
+    } >"$STATE_FILE" 2>/dev/null || true
+}
+
+# Ask QEMU to reboot the guest.  The control channel is the same ttyS1 path the
+# entrypoint uses for an orderly stop, so this is a guest-visible reboot rather
+# than a power cut when the guest can still take it.
+reboot_guest() {
+    if [ -S "$CONTROL_SOCK" ]; then
+        log "requesting a guest reboot over the control channel"
+        python3 - "$CONTROL_SOCK" <<'PY' 2>/dev/null || return 1
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(sys.argv[1])
+s.sendall(b"reboot\n")
+s.close()
+PY
+        return 0
+    fi
+    log "control channel $CONTROL_SOCK is missing; cannot request a guest reboot"
+    return 1
+}
+
+log "starting (interval ${INTERVAL}s, ${FAILURES} failures before recovery, warmup)"
+while :; do
+    if "$HEALTHCHECK" >/dev/null 2>&1; then
+        if [ "$phase" != "running" ]; then
+            log "guest is answering; watching"
+        fi
+        phase="running"
+        fails=0
+    else
+        case "$phase" in
+            warmup)
+                # Never blame a guest that has not been up yet.
+                :
+                ;;
+            cooldown)
+                if [ "$(date +%s)" -ge "$cooldown_until" ]; then
+                    log "cooldown over; resuming checks"
+                    phase="running"
+                    fails=0
+                fi
+                # No counting during cooldown: a reboot needs time to boot.
+                ;;
+            running)
+                fails=$(( fails + 1 ))
+                log "guest did not answer (failure $fails/$FAILURES)"
+                if [ "$fails" -ge "$FAILURES" ]; then
+                    log "guest has not answered for $(( FAILURES * INTERVAL ))s; rebooting it"
+                    if reboot_guest; then
+                        phase="cooldown"
+                        cooldown_until=$(( $(date +%s) + COOLDOWN ))
+                        log "cooldown for ${COOLDOWN}s"
+                    else
+                        # No control channel: keep trying, but do not spam.
+                        fails=0
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    save_state
+    sleep "$INTERVAL"
+done
