@@ -22,7 +22,7 @@ the symptom-by-symptom fixes.
 
 ```sh
 # Linux host with Docker Engine + Compose v2, and a NIC that can pass foreign
-# MACs. /dev/kvm optional (fast boots).
+# MACs.
 git clone https://github.com/ms264556/dbro_zd1200 && cd dbro_zd1200
 
 ./install-zd1200-docker.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
@@ -36,8 +36,7 @@ Open `https://<guest-ip>/` from another LAN machine.
 ## Recipe: Proxmox VE (LXC)
 
 ```sh
-# As root on the PVE host (8.2+). The installer fetches a Debian 13 template
-# itself; /dev/kvm gives sensible boot times.
+# As root on the PVE host (8.2+).
 git clone https://github.com/ms264556/dbro_zd1200 && cd dbro_zd1200
 
 ./install-zd1200-lxc.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
@@ -88,14 +87,13 @@ Both take the same flags.
 | firmware + a foreign card's data | `--writable-from <dump>` | reuses another card's `/writable` + serial (e.g. a ZD1100 card) |
 
 Any ZD1200 release works; the tested matrix is 9.10.2.0.130, 9.13.3.0.164,
-10.1.2.0.318, 10.2.1.0.236, 10.5.1.0.255 and 10.5.1.0.282. Prepared artifacts land
-in `image/` (Docker) or `/var/lib/zd1200/image` (LXC) and are reused.
+10.1.2.0.318, 10.2.1.0.236, 10.5.1.0.255 and 10.5.1.0.282.
 
 ## Optional features
 
 | flag (both entry points) | effect |
 |---|---|
-| `--root-ssh-key <key\|file>` | static-dropbear replacement + public-key root SSH on 2222 (first build is slow) |
+| `--root-ssh-key <key\|file>` | static-dropbear replacement + public-key root SSH on 2222 |
 | `--writable-from <dump>` | take `/writable` + serial from a CF dump |
 | `--writable-partition START:COUNT` | override the detected dump geometry |
 | `--no-up` (Docker) / `--no-*` (LXC) | build without booting / skip individual pieces |
@@ -111,9 +109,8 @@ docker exec zd1200 cat /var/lib/zd1200/guest-ip     # Docker
 pct exec <id> -- cat /var/lib/zd1200/guest-ip       # Proxmox
 ```
 
-Open `https://<guest-ip>/`. The first boot runs the factory setup wizard; finish
-it, reboot the guest once so it generates its SSH host key, then `ssh admin@<ip>`.
-At the ZD CLI, `!v54! <any word>` drops to a root shell.
+Open `https://<guest-ip>/`. At the ZD CLI, `!v54! <any word>` drops to a root
+shell.
 
 Serial console (the same prompt as on the physical box):
 
@@ -129,13 +126,6 @@ pct exec <id> -- python3 /opt/zd1200/scripts/container/attach-console.py
   has no such limitation: the PVE host can reach its guest.
 - **The LAN interface must pass foreign MACs** (MAC spoofing, or an unfiltered
   bridge port). There is no NAT/user-mode fallback; WSL2 is not supported.
-- **Proxmox needs a Debian 13 template.** The installer fetches one if you have
-  none, and refuses a template that cannot run the guest.
-- **`/dev/kvm` matters**: ~1–2 minutes to boot with it, several minutes without.
-- **Do not lower the stop grace period** (Docker 180s, systemd `TimeoutStopSec`):
-  the guest needs it to flush `/writable`.
-- **First boot is a factory appliance**: complete the wizard, reboot once, then
-  `ssh admin@<ip>` works.
 - **Applying the R600 mesh repair needs Solo 104 or 106 on the APs first.** The
   repair delivers an unsigned AP image, and newer AP firmware will not accept it —
   so the APs will not join. Upgrade them through their own standalone upgrade page

@@ -329,6 +329,22 @@ control serial channel (the same private port used for the orderly shutdown) and
 caches the answer in `/var/lib/zd1200/guest-ip` for display and health checks.
 The guest's lease is authoritative, so nothing is sniffed or guessed.
 
+The LXC flow also puts the guest's ttyS0 — the console the stock inittab runs
+`/bin/login.sh` on — on the container's `/dev/tty1`, through
+`proxmox/zd1200-console-bridge.py` (unit `zd1200-console-tty.service`), so the
+Proxmox Console tab lands on the appliance's serial console. QEMU's console
+chardev answers a single client, so the bridge owns that socket and re-serves
+the public one that `attach-console.py` uses; it writes the tty non-blockingly
+so an unattached tab cannot stall the guest. See "The Console tab" in
+`docs/PROXMOX.md`.
+
+The container's own address is likewise maintenance-only: the patch pipeline is
+local and the periodic healthchecks use the guest's serial control channel, so
+`zd1200.service` releases the bridge's address with `proxmox/zd1200-ct-address`
+just before QEMU starts and takes a fresh DHCP lease when QEMU exits. The
+appliance is then the only thing on the LAN with an address while it runs; see
+"The container's own address" in `docs/PROXMOX.md`.
+
 ## Boot test without the container
 
 `scripts/test/boot-test.sh` boots the prepared disk under a direct QEMU (KVM, a

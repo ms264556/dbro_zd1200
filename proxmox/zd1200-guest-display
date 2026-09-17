@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+#
+# proxmox/zd1200-guest-display — put the guest's address on the container's
+# display interface so Proxmox shows it in the Summary.
+#
+# The appliance's address is a DHCP lease, so it is not known once and forgotten:
+# it can move on renewal, and the displayed value has to move with it.  This
+# reconciles the display interface to whatever the guest currently reports, and
+# is safe to run on every healthcheck tick.
+#
+#   * the authority is the guest, asked over the control channel (or its cached
+#     answer) by proxmox/zd1200-guest-address -- never an ARP sweep or a guess;
+#   * the interface is created ahead of the bridge by zd1200-ct-net.sh, because
+#     Proxmox shows the first two addresses it finds in interface order and the
+#     guest's must be one of them;
+#   * the address is added as /32 and `replace`d atomically, so a lease change
+#     never leaves the interface holding two addresses (which would briefly push
+#     the container's own address out of the Summary) and never leaves a stale
+#     one behind.
+#
+# While the address is held here, the guest's address is local to the container,
+# so the container itself can no longer reach the guest at that address.  That is
+# why the container no longer probes the guest over IP, and why the ARP policy in
+# zd1200-ct-net.sh matters: without it this container would answer ARP for the
+# appliance's address and race the guest for its traffic.
+#
+# Options:
+#   --if IFACE    display interface (default $ZD_DISPLAY_IF, else zd0)
+#   --clear       remove the displayed address
+#   --quiet       say nothing on success
+#   --check       report what is displayed, change nothing
+#
+# Exit 0 on success, 1 if the address is unknown (and --clear was not given).
+set -u
+
+IFACE="${ZD_DISPLAY_IF:-zd0}"
+STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
+GUEST_IP_FILE="${ZD_GUEST_IP_FILE:-$STATE_DIR/guest-ip}"
+HELPER="${ZD_ADDRESS_HELPER:-/usr/local/sbin/zd1200-guest-address}"
+QUIET=0
+CHECK=0
+CLEAR=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --if)    IFACE="${2:?--if needs an interface}"; shift 2 ;;
+        --clear) CLEAR=1; shift ;;
+        --quiet) QUIET=1; shift ;;
+        --check) CHECK=1; shift ;;
+        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+log() { [ "$QUIET" = 1 ] && return 0; printf 'zd1200-display: %s\n' "$*"; }
+say() { printf 'zd1200-display: %s\n' "$*" >&2; }
+
+# Addresses this script manages on the display interface.  It only ever owns a
+# /32, so anything else on the interface was put there by something else and is
+# left alone.
+displayed_addresses() {
+    ip -4 -o addr show dev "$IFACE" 2>/dev/null \
+        | awk '$4 ~ /\/32$/ { split($4, a, "/"); print a[1] }'
+}
+
+if [ ! -e "/sys/class/net/$IFACE" ]; then
+    say "display interface $IFACE is missing; the container's network unit has not run"
+    exit 1
+fi
+
+if [ "$CHECK" = 1 ]; then
+    printf '%s\n' "$(displayed_addresses)"
+    exit 0
+fi
+
+if [ "$CLEAR" = 1 ]; then
+    if [ -n "$(displayed_addresses)" ]; then
+        for a in $(displayed_addresses); do
+            ip addr del "$a/32" dev "$IFACE" 2>/dev/null || true
+        done
+        log "cleared the displayed address on $IFACE"
+    fi
+    exit 0
+fi
+
+# The guest's current address.  Prefer the cached answer -- it was written by the
+# last successful ask -- and only go to the control channel when there is none,
+# so a tick that changes nothing stays cheap.  --ask is used when the cache is
+# absent, which is the normal case on the first tick after boot.
+guest_ip=""
+if [ -r "$GUEST_IP_FILE" ]; then
+    guest_ip="$(head -n1 "$GUEST_IP_FILE" 2>/dev/null | tr -d ' \r\n')"
+fi
+if [ -z "$guest_ip" ] && [ -x "$HELPER" ]; then
+    guest_ip="$("$HELPER" --ask 2>/dev/null || true)"
+fi
+case "$guest_ip" in
+    ""|*[!0-9.]*)
+        say "no guest address to display yet (the guest has not reported one)"
+        exit 1
+        ;;
+esac
+
+# Guard the exact failure this project has already hit: the container's own
+# lease and the guest's come from the same DHCP server, and if the bridge holds
+# the guest's address every packet for the appliance is delivered to the
+# container.  The bridge must win that contest -- it is the container's real
+# address -- so the display copy is dropped rather than shown.
+container_ip=""
+for bridge in "${ZD_BRIDGE_IF:-br-zd}" "$IFACE"; do
+    [ "$bridge" = "$IFACE" ] && continue
+    candidate="$(ip -4 -o addr show dev "$bridge" scope global 2>/dev/null \
+        | awk 'NR == 1 { split($4, a, "/"); print a[1] }')"
+    [ -n "$candidate" ] && { container_ip="$candidate"; break; }
+done
+if [ -n "$container_ip" ] && [ "$container_ip" = "$guest_ip" ]; then
+    say "the container itself holds $guest_ip; not displaying it (address conflict)"
+    exit 1
+fi
+
+current="$(displayed_addresses)"
+if [ "$current" = "$guest_ip" ]; then
+    log "$IFACE already shows $guest_ip"
+    exit 0
+fi
+
+# Drop any stale /32 before adding the new one.  `ip addr replace` would then be
+# enough on its own, but Proxmox reads this namespace on its own schedule and a
+# window with two /32s is a window where the container's own address can fall out
+# of the Summary's two slots.
+for a in $current; do
+    [ "$a" = "$guest_ip" ] && continue
+    ip addr del "$a/32" dev "$IFACE" 2>/dev/null || true
+done
+ip addr replace "$guest_ip/32" dev "$IFACE"
+
+if [ -n "$current" ]; then
+    log "displayed address $current -> $guest_ip on $IFACE"
+else
+    log "displaying $guest_ip on $IFACE"
+fi
+
+# The display address is only cosmetic: if IPv6 is somehow enabled on the
+# interface a link-local address would compete with the container's own address
+# for one of the two slots Proxmox shows, so say so rather than let the Summary
+# look wrong for reasons nobody can see.
+if [ -r "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6" ] \
+   && [ "$(cat "/proc/sys/net/ipv6/conf/$IFACE/disable_ipv6" 2>/dev/null)" != "1" ]; then
+    log "note: IPv6 is enabled on $IFACE; its link-local address may take a Summary slot"
+fi
+
+exit 0

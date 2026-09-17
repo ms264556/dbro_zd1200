@@ -16,6 +16,12 @@
 #
 # Options:
 #   --ask         ask the guest now even if a cached value exists
+#   --probe       ask for the address AND whether the guest's management service
+#                 is bound, as "ZD-GUEST-IP=<addr>" / "ZD-SERVICE-443=<state>"
+#                 (state is "listening" or "-").  Used by the healthcheck: the
+#                 container cannot probe the guest over IP once the guest's
+#                 address is held locally for display, so the guest is asked
+#                 directly over the control channel instead.
 #   --timeout SEC budget for the guest's answer (default 10)
 #   --file PATH   cache file (default $ZD_GUEST_IP_FILE)
 #   --sock PATH   control socket (default $ZD_CONTROL_SOCK)
@@ -32,15 +38,17 @@ CONTROL_SOCK="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
 TIMEOUT="${ZD_ADDRESS_TIMEOUT:-10}"
 ASK=0
 DIAG=0
+PROBE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --ask)  ASK=1; shift ;;
+        --probe) PROBE=1; shift ;;
         --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
         --diag) DIAG=1; shift ;;
         --file) LEASE_FILE="${2:?}"; shift 2 ;;
         --sock) CONTROL_SOCK="${2:?}"; shift 2 ;;
-        -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -101,22 +109,27 @@ if [ "$ASK" = 0 ] && [ -r "$LEASE_FILE" ]; then
 fi
 
 # Ask the guest.  It answers on the same serial port; QEMU's chardev echoes what
-# is sent, so the reply is identified by its marker rather than by order.
-[ -S "$CONTROL_SOCK" ] || exit 1
-# Read whole lines: the reply arrives in fragments (the serial chardev splits it),
-# and matching a partial buffer yields a truncated address such as "10".
-reply="$(python3 - "$CONTROL_SOCK" "$TIMEOUT" <<'PY' 2>/dev/null || true
+# is sent, so the reply is identified by its marker rather than by order.  Reads
+# whole lines: the reply arrives in fragments (the serial chardev splits it), and
+# matching a partial buffer yields a truncated address such as "10".
+query_guest() { # query_guest <command> <marker>...
+    [ -S "$CONTROL_SOCK" ] || return 1
+    python3 - "$CONTROL_SOCK" "$TIMEOUT" "$@" <<'PY' 2>/dev/null || true
 import socket, sys, time
+
+sock_path, timeout, command = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+markers = tuple(m.encode() for m in sys.argv[4:])
+
 try:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
-    s.connect(sys.argv[1])
-    s.sendall(b"address\n")
+    s.connect(sock_path)
+    s.sendall(command.encode() + b"\n")
     buf = b""
-    deadline = time.time() + int(sys.argv[2])
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            chunk = s.recv(256)
+            chunk = s.recv(512)
         except socket.timeout:
             break
         if not chunk:
@@ -124,8 +137,8 @@ try:
         buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if line.startswith(b"ZD-GUEST-IP="):
+            line = line.strip().replace(b"\r", b"")
+            if line.startswith(markers):
                 value = line.split(b"=", 1)[1].decode("ascii", "replace").strip()
                 if value:
                     print(value)
@@ -134,6 +147,20 @@ try:
 except OSError:
     pass
 PY
-)"
+}
+
+# One round trip for both facts health wants: the address and whether the guest's
+# management service is bound.  Asking together keeps a healthcheck tick to a
+# single serial query.
+if [ "$PROBE" = 1 ]; then
+    addr="$(query_guest address ZD-GUEST-IP= || true)"
+    svc="$(query_guest ready ZD-SERVICE-443= || true)"
+    [ -n "$addr" ] && printf 'ZD-GUEST-IP=%s\n' "$addr"
+    [ -n "$svc" ] && printf 'ZD-SERVICE-443=%s\n' "$svc"
+    [ -n "$addr" ] && exit 0
+    exit 1
+fi
+
+reply="$(query_guest address ZD-GUEST-IP= || true)"
 [ -n "$reply" ] && emit "$reply" && exit 0
 exit 1

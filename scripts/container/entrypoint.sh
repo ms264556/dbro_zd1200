@@ -38,6 +38,23 @@ else
     vm_accel=tcg
 fi
 
+# The container's own LAN address is maintenance-only: the patch pipeline is
+# local, and the healthcheck/watchdog/address helpers use the guest's serial
+# control channel rather than IP.  With ZD_CT_ADDRESS_FOLLOW_QEMU=1 the
+# entrypoint hands the address back just before QEMU starts and takes a fresh
+# lease again when QEMU exits, so the appliance is the only thing on the LAN
+# while it runs (and the Proxmox Summary shows only the guest).  See
+# proxmox/zd1200-ct-address; a no-op in the Docker flow, which sets neither the
+# flag nor the helper.
+ct_address_helper="${ZD_CT_ADDRESS_HELPER:-/usr/local/sbin/zd1200-ct-address}"
+follow_qemu_address="${ZD_CT_ADDRESS_FOLLOW_QEMU:-0}"
+ct_address() {
+    [ "$follow_qemu_address" = 1 ] || return 0
+    [ "$network_mode" = bridge ] || return 0
+    [ -x "$ct_address_helper" ] || return 0
+    "$ct_address_helper" "$1" >&2 || true
+}
+
 cleanup() {
     # $1 = 1 for a signal (docker stop/down): try an orderly guest shutdown
     # first so the guest unmounts and flushes /writable.  0 (normal exit) just
@@ -86,6 +103,9 @@ PY
         kill -KILL -- "-$qemu_pid" 2>/dev/null || true
         wait "$qemu_pid" 2>/dev/null || true
     fi
+    # The guest is down (or going down), so put the container's own address back
+    # for maintenance.  Idempotent and best-effort.
+    ct_address up
 }
 trap 'cleanup 1' INT TERM
 trap 'cleanup 0' EXIT
@@ -94,6 +114,10 @@ cd "$work_dir" || exit 1
 mkdir -p "$state_dir"
 # A stale orderly-stop marker from a previous run must not suppress a reboot.
 rm -f "$state_dir/.stop-after-reset" 2>/dev/null || true
+
+# Maintenance work below may want the network, and a previous run that crashed
+# hard could have left the address down: make sure it is up before starting.
+ct_address up
 
 if [ ! -f image/bzImage ]; then
     echo "Missing image/bzImage" >&2
@@ -194,6 +218,9 @@ fi
 # Interactive serial console (see launch-vm.sh): the chardev logfile must be
 # the SAME file the READY detect + healthcheck grep, and the socket path is where
 # you attach to the guest's /dev/console login (set ZD_CONSOLE=0 to disable).
+# Everything that wanted the container's own address is finished; release it for
+# as long as QEMU runs.
+ct_address down
 setsid env KERNEL="$patched_kernel" \
     INITRD="" \
     DISK_IMAGE="$synthetic_disk" DISK_FORMAT=raw DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
@@ -216,6 +243,7 @@ setsid env KERNEL="$patched_kernel" \
     ZD_CONSOLE="${ZD_CONSOLE:-1}" \
     ZD_CONSOLE_LOG="$log_file" \
     ZD_CONSOLE_SOCK="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}" \
+    ZD_CONSOLE_QEMU_SOCK="${ZD_CONSOLE_QEMU_SOCK:-}" \
     nice -n 10 ./launch-vm.sh \
     >>"$log_file" 2>&1 </dev/null &
 qemu_pid=$!

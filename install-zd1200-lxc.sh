@@ -41,6 +41,12 @@
 #   --no-ecdsa               do not add the ECDSA host key to the SSH service
 #   --no-network-monitor     do not install the Network Monitor page
 #   --no-r600-repair         do not patch the ap-11n-scorpion (R600) AP image
+#   --no-console-tty         leave /dev/tty1 as a login prompt instead of
+#                            showing the guest's serial console in the Proxmox
+#                            "Console" tab
+#   --keep-ct-address        keep the container's own IP address while the guest
+#                            runs (default: release it, so only the guest is on
+#                            the LAN and in the Proxmox Summary)
 #   --static-ip CIDR         give the container a static host IP instead of DHCP
 #                            (e.g. 10.222.1.180/24; gateway from --gateway)
 #   --gateway IP             default gateway for --static-ip
@@ -75,7 +81,7 @@ ROOTFS_SIZE=20
 CORES=4; MEMORY=4096; ONBOOT=1
 SOURCE=""; WRITABLE_FROM=""; WRITABLE_PARTITION=""; CONTAINER_MAC_OVERRIDE=""
 ADVANCED=0
-ROOT_SSH_KEY=""; ECDSA=1; NETWORK_MONITOR=1; R600_REPAIR=1
+ROOT_SSH_KEY=""; ECDSA=1; NETWORK_MONITOR=1; R600_REPAIR=1; CONSOLE_TTY=1; KEEP_CT_ADDRESS=0
 STATIC_IP=""; GATEWAY=""; TEMPLATE=""; TIMEOUT=1200
 ASSUME_YES=0; INTERACTIVE=1
 
@@ -103,13 +109,15 @@ while [ $# -gt 0 ]; do
         --no-ecdsa)             ECDSA=0; shift ;;
         --no-network-monitor)   NETWORK_MONITOR=0; shift ;;
         --no-r600-repair)       R600_REPAIR=0; shift ;;
+        --no-console-tty)       CONSOLE_TTY=0; shift ;;
+        --keep-ct-address)      KEEP_CT_ADDRESS=1; shift ;;
         --static-ip)            STATIC_IP="${2:?}"; shift 2 ;;
         --gateway)              GATEWAY="${2:?}"; shift 2 ;;
         --template)             TEMPLATE="${2:?}"; shift 2 ;;
         --timeout)              TIMEOUT="${2:?}"; shift 2 ;;
         --yes)                  ASSUME_YES=1; shift ;;
         --non-interactive)      ASSUME_YES=1; INTERACTIVE=0; shift ;;
-        -h|--help)              sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)              sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)                     die "unknown option: $1" ;;
         *)                      SOURCE="$1"; shift ;;
     esac
@@ -380,6 +388,8 @@ Optional pieces
   ECDSA host key .... $([ "$ECDSA" = 1 ] && echo yes || echo no)
   Network Monitor ... $([ "$NETWORK_MONITOR" = 1 ] && echo yes || echo no)
   R600 mesh repair .. $([ "$R600_REPAIR" = 1 ] && echo yes || echo no)
+  Console tab ....... $([ "$CONSOLE_TTY" = 1 ] && echo "guest serial console" || echo "container login prompt")
+  Container address . $([ "$KEEP_CT_ADDRESS" = 1 ] && echo "kept while the guest runs" || echo "released while the guest runs")
 EOF
 )"
 if [ "$INTERACTIVE" = 1 ] && [ "$ASSUME_YES" = 0 ]; then
@@ -528,6 +538,8 @@ fi
 [ "$ECDSA" = 0 ] && bootstrap_args+=(--no-ecdsa)
 [ "$NETWORK_MONITOR" = 0 ] && bootstrap_args+=(--no-network-monitor)
 [ "$R600_REPAIR" = 0 ] && bootstrap_args+=(--no-r600-repair)
+[ "$CONSOLE_TTY" = 0 ] && bootstrap_args+=(--no-console-tty)
+[ "$KEEP_CT_ADDRESS" = 1 ] && bootstrap_args+=(--keep-ct-address)
 
 # The container's own address is only informational (printed in the summary).
 ct_host_ip=""
@@ -626,6 +638,7 @@ cat <<EOF
 ${bold}Installation complete.${reset}
 
   Container ....... $CTID ($CT_HOSTNAME)
+  Console tab ..... $([ "$CONSOLE_TTY" = 1 ] && echo "the guest's serial console" || echo "container login prompt (--no-console-tty)")
   Guest console ... pct exec $CTID -- tail -f /tmp/zd1200-console.log
   Attach console .. pct exec $CTID -- python3 $DEFAULT_CT_REPO/scripts/container/attach-console.py
   Service ......... pct exec $CTID -- systemctl status zd1200

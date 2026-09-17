@@ -34,6 +34,11 @@
 #   --no-ecdsa               do not add an ECDSA host key to the SSH service
 #   --no-network-monitor     skip the Network Monitor page + collectors
 #   --no-r600-repair         skip the ap-11n-scorpion (R600) mesh repair
+#   --no-console-tty         leave /dev/tty1 as a login prompt instead of
+#                            putting the guest's serial console on it
+#   --keep-ct-address        keep the container's own IP address while the guest
+#                            runs (default: release it, so only the guest is on
+#                            the LAN and in the Proxmox Summary)
 #   --ct-dhcp                the CT's own address comes from DHCP (default)
 #   --ct-address CIDR        the CT's own static address
 #   --host-ip IP             container's own IP on the LAN (informational)
@@ -63,6 +68,8 @@ ROOT_SSH_KEY=""
 ECDSA=1
 NETWORK_MONITOR=1
 R600_REPAIR=1
+CONSOLE_TTY=1
+KEEP_CT_ADDRESS=0
 HOST_IP=""
 GUEST_IP=""
 DO_PACKAGES=1
@@ -107,6 +114,8 @@ while [ $# -gt 0 ]; do
         --no-ecdsa)             ECDSA=0; shift ;;
         --no-network-monitor)   NETWORK_MONITOR=0; shift ;;
         --no-r600-repair)       R600_REPAIR=0; shift ;;
+        --no-console-tty)       CONSOLE_TTY=0; shift ;;
+        --keep-ct-address)      KEEP_CT_ADDRESS=1; shift ;;
         --host-ip)              HOST_IP="${2:?}"; shift 2 ;;
         --guest-ip)             GUEST_IP="${2:?}"; shift 2 ;;
         --state-dir)            STATE_DIR="${2:?}"; shift 2 ;;
@@ -116,7 +125,7 @@ while [ $# -gt 0 ]; do
         --skip-image)           DO_IMAGE=0; shift ;;
         --skip-disks)           DO_DISKS=0; shift ;;
         --reconfigure)          RECONFIGURE=1; shift ;;
-        -h|--help)              sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)              sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -394,6 +403,10 @@ ZD_MAC2="${MAC2:-}"
     printf 'ZD_BRIDGE_IF=br-zd\n'
     printf 'ZD_HOST_IF=eth0\n'
     printf 'TAP_IF=tap-zd\n'
+    # Carries the guest's address for display in the Proxmox Summary (see
+    # proxmox/zd1200-guest-display); created ahead of the bridge by
+    # proxmox/zd1200-ct-net.sh so it enumerates first and gets shown first.
+    printf 'ZD_DISPLAY_IF=zd0\n'
     printf 'STATE_DIR=%s\n' "$STATE_DIR"
     printf 'IMAGE_DIR=%s\n' "$STATE_DIR/image"
     printf 'SYNTHETIC_DISK=%s\n' "$STATE_DIR/synthetic-cf.img"
@@ -413,6 +426,11 @@ ZD_MAC2="${MAC2:-}"
         dhcp|"") printf 'ZD_CT_DHCP=1\n' ;;
         *)       printf 'ZD_CT_ADDRESS=%s\n' "$ZD_CT_ADDRESS" ;;
     esac
+    # The container's own address is maintenance-only: the patch pipeline is
+    # local and the healthchecks use the guest's serial control channel.  By
+    # default the entrypoint releases it while QEMU runs and takes a fresh lease
+    # when QEMU exits (proxmox/zd1200-ct-address); 0 keeps it up at all times.
+    printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)"
     # The entrypoint's high-CPU guard: QEMU sustained above 95% CPU means the
     # guest is spinning, and a spinning guest is exactly how the appliance wedges
     # (the Docker flow leaves this at its default of 4 samples / 20s).  Keep it on
@@ -442,6 +460,26 @@ ZD_MAC2="${MAC2:-}"
 chmod 600 "$CONF"
 fi
 
+# The console-bridge keys are reconciled even when /etc/zd1200.conf already
+# exists, so re-running the bootstrap to pick up project changes can enable (or,
+# with --no-console-tty, disable) the guest console without --reconfigure --
+# which re-derives the container's MAC and is only for a fresh identity.  Keep
+# the first value of each key and rewrite it once, so repeated enable/disable
+# cycles are idempotent instead of growing the file.
+console_sock_line="$(grep -m1 '^ZD_CONSOLE_SOCK=' "$CONF" 2>/dev/null || true)"
+console_qemu_line="$(grep -m1 '^ZD_CONSOLE_QEMU_SOCK=' "$CONF" 2>/dev/null || true)"
+sed -i '/^ZD_CONSOLE_SOCK=/d; /^ZD_CONSOLE_QEMU_SOCK=/d' "$CONF"
+if [ "$CONSOLE_TTY" = 1 ]; then
+    printf '%s\n' "${console_sock_line:-ZD_CONSOLE_SOCK=/tmp/zd1200-console.sock}" \
+                  "${console_qemu_line:-ZD_CONSOLE_QEMU_SOCK=/tmp/zd1200-console.qemu.sock}" >> "$CONF"
+fi
+
+# The container-address key is written from the flag just like the console keys,
+# so a re-run without --keep-ct-address restores the default (the address is
+# released while the guest runs).  Never leave two of the key behind.
+sed -i '/^ZD_CT_ADDRESS_FOLLOW_QEMU=/d' "$CONF"
+printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)" >> "$CONF"
+
 # Single source of truth from here on: the file is what the service reads.
 set -a
 # shellcheck disable=SC1090
@@ -453,8 +491,10 @@ set +a
 # --------------------------------------------------------------------------
 log "installing the container units"
 install -m 0755 "$REPO_DIR/proxmox/zd1200-ct-net.sh" /usr/local/sbin/zd1200-ct-net
+install -m 0755 "$REPO_DIR/proxmox/zd1200-ct-address" /usr/local/sbin/zd1200-ct-address
 install -m 0755 "$REPO_DIR/proxmox/zd1200-guest-healthcheck" /usr/local/sbin/zd1200-guest-healthcheck
 install -m 0755 "$REPO_DIR/proxmox/zd1200-guest-address" /usr/local/sbin/zd1200-guest-address
+install -m 0755 "$REPO_DIR/proxmox/zd1200-guest-display" /usr/local/sbin/zd1200-guest-display
 install -m 0755 "$REPO_DIR/proxmox/zd1200-guest-watchdog" /usr/local/sbin/zd1200-guest-watchdog
 if ! getent group kvm >/dev/null 2>&1; then
     groupadd -r kvm 2>/dev/null || true
@@ -565,6 +605,65 @@ systemctl start zd1200-watchdog.service >/dev/null 2>&1 || true
 # prepare-vm-disks.sh too, and doing that concurrently with step 6 below (each
 # rm -rf's the same scratch directory) corrupts the patch run.  The installer (or
 # the operator) starts the service once the disk is ready.
+
+# --------------------------------------------------------------------------
+# 5c. the Proxmox "Console" tab: guest serial console on the container's tty1
+# --------------------------------------------------------------------------
+# The Console tab runs `lxc-console -n <vmid>` (PVE's default cmode=tty), which
+# attaches to the container's first tty1-equivalent that no other console client
+# already holds.  Hand that tty to the guest's ttyS0 via the bridge, so the tab
+# shows the appliance's real serial console instead of a container login prompt.
+#
+# The container keeps its own getty on /dev/tty2 (PVE's default second tty),
+# reachable from the host with `lxc-console -n <vmid> -t 2`; `pct enter`/`pct
+# exec` do not use a console tty at all, so container debugging is unaffected.
+if [ "$CONSOLE_TTY" = 1 ]; then
+    install -m 0755 "$REPO_DIR/proxmox/zd1200-console-bridge.py" /usr/local/sbin/zd1200-console-bridge
+    # Free tty1 for the bridge.  Inside a container Debian runs
+    # `container-getty@1`; `getty@tty1` is masked too so a non-container image
+    # cannot race the bridge for the same tty.
+    systemctl disable --now container-getty@1.service >/dev/null 2>&1 || true
+    systemctl mask container-getty@1.service >/dev/null 2>&1 || true
+    systemctl mask getty@tty1.service >/dev/null 2>&1 || true
+
+    cat > /etc/systemd/system/zd1200-console-tty.service <<'UNIT'
+[Unit]
+Description=ZD1200 guest serial console on the container console tty
+Documentation=https://github.com/ms264556/dbro_zd1200
+After=zd1200.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/zd1200.conf
+ExecStart=/usr/local/sbin/zd1200-console-bridge
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # NOTE: no Wants=zd1200.service on purpose.  This unit is started here,
+    # before the guest disk exists; a Wants would pull zd1200.service in and
+    # fight step 6 below over the same scratch directory.
+    systemctl daemon-reload
+    systemctl enable zd1200-console-tty.service >/dev/null 2>&1 || true
+    systemctl start zd1200-console-tty.service >/dev/null 2>&1 || true
+else
+    systemctl disable --now zd1200-console-tty.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/zd1200-console-tty.service /usr/local/sbin/zd1200-console-bridge
+    # Restore the login prompt on the console tty if a previous run took it.
+    systemctl unmask getty@tty1.service >/dev/null 2>&1 || true
+    systemctl unmask container-getty@1.service >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl start container-getty@1.service >/dev/null 2>&1 || true
+fi
 
 # --------------------------------------------------------------------------
 # 6. boot the guest once so the disk is built and patched
