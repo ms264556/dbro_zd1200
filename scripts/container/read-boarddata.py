@@ -34,9 +34,9 @@ AR_MAC1 = 0x66
 AR_MAC2 = 0x6C
 
 
-def read_sector(disk: Path, sector: int) -> bytes:
+def read_sector(disk: Path, sector: int, offset: int = 0) -> bytes:
     with disk.open("rb") as fh:
-        fh.seek(sector * SECTOR)
+        fh.seek(offset + sector * SECTOR)
         return fh.read(SECTOR)
 
 
@@ -47,8 +47,8 @@ def mac_at(buf: bytes, offset: int):
     return ":".join(f"{b:02x}" for b in mac)
 
 
-def read_board_data(disk: Path) -> dict:
-    rks = read_sector(disk, REGION2_START + RKS_BD_OFFSET // SECTOR)
+def read_board_data(disk: Path, offset: int = 0) -> dict:
+    rks = read_sector(disk, REGION2_START + RKS_BD_OFFSET // SECTOR, offset)
     out = {}
     if len(rks) == SECTOR and struct.unpack_from("<I", rks, 0)[0] == RKS_BD_MAGIC:
         serial = rks[RKS_SERIAL:RKS_SERIAL + 16].split(b"\x00")[0].decode("ascii", "replace")
@@ -59,7 +59,7 @@ def read_board_data(disk: Path) -> dict:
         if (mac := mac_at(rks, RKS_MAC2)):
             out["MAC2"] = mac
     if "MAC" not in out:
-        ar = read_sector(disk, REGION2_START)
+        ar = read_sector(disk, REGION2_START, offset)
         if len(ar) == SECTOR and struct.unpack_from("<I", ar, 0)[0] == AR531X_BD_MAGIC:
             if (mac := mac_at(ar, AR_MAC1)):
                 out["MAC"] = mac
@@ -71,11 +71,15 @@ def read_board_data(disk: Path) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("disk", type=Path, help="guest disk image (raw CF)")
+    ap.add_argument("--offset-bytes", type=int, default=0,
+                    help="skip this many bytes first (e.g. 512 for an ImageUSB dump)")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="exit 0 even when no board-data record with a MAC is found")
     args = ap.parse_args()
     if not args.disk.exists():
         sys.exit(f"read-boarddata: disk not found: {args.disk}")
-    data = read_board_data(args.disk)
-    if "MAC" not in data:
+    data = read_board_data(args.disk, offset=args.offset_bytes)
+    if "MAC" not in data and not args.allow_empty:
         sys.exit("read-boarddata: no valid board-data record with a MAC found")
     for key in ("SERIAL", "MAC", "MAC2"):
         if key in data:

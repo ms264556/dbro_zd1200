@@ -7,6 +7,13 @@
 #
 # Usage:
 #   ./build-container.sh /path/to/zd1200_*.img       # first run: extract + build + start
+#   ./build-container.sh /path/to/*cfcard_dump*      # a CF dump: dd .img, ImageUSB
+#                                                    # .bin or a .7z holding either
+#   ./build-container.sh /path/to/zd1200_*.img \
+#       --writable-from /path/to/cfcard_dump         # firmware rootfs/boot, but
+#                                                    # /writable + serial from a dump
+#                                                    # (e.g. a ZD1100/ZD3000 card)
+#       [--writable-partition START:COUNT]           # override the dump geometry
 #   ./build-container.sh                             # already extracted: build + start
 #   ./build-container.sh --no-up /path/to/*.img      # only build the image (no boot)
 #   ./build-container.sh --root-ssh-key ~/.ssh/id_ed25519.pub
@@ -23,6 +30,8 @@ cd "$(dirname "$0")"
 no_up=0
 archive="${ZD_ARCHIVE:-}"
 root_ssh_key=""
+writable_from=""
+writable_partition=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-up) no_up=1; shift ;;
@@ -30,6 +39,14 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "--root-ssh-key needs a public-key file or key string" >&2; exit 2; }
             root_ssh_key="$2"; shift 2 ;;
         --root-ssh-key=*) root_ssh_key="${1#*=}"; shift ;;
+        --writable-from)
+            [ $# -ge 2 ] || { echo "--writable-from needs a CF-dump path" >&2; exit 2; }
+            writable_from="$2"; shift 2 ;;
+        --writable-from=*) writable_from="${1#*=}"; shift ;;
+        --writable-partition)
+            [ $# -ge 2 ] || { echo "--writable-partition needs START:COUNT" >&2; exit 2; }
+            writable_partition="$2"; shift 2 ;;
+        --writable-partition=*) writable_partition="${1#*=}"; shift ;;
         -h|--help)
             sed -n '2,17p' "$0"
             exit 0
@@ -67,7 +84,13 @@ if [ ! -f image/rootfs.ext2 ]; then
         exit 1
     fi
     echo "== Extracting the firmware image from $archive =="
-    ./scripts/build/prepare-vendor-image.sh "$archive"
+    if [ -n "$writable_from" ]; then
+        ./scripts/build/prepare-vendor-image.sh "$archive" \
+            --writable-from "$writable_from" \
+            ${writable_partition:+--writable-partition "$writable_partition"}
+    else
+        ./scripts/build/prepare-vendor-image.sh "$archive"
+    fi
 else
     echo "== Reusing image/ (delete it to re-extract, or run scripts/build/prepare-vendor-image.sh) =="
 fi

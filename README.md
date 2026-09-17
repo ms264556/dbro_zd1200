@@ -85,6 +85,42 @@ payload and the AP firmware payload, and is mounted read-only into the container
 at `/opt/zd1200/image`. Later runs reuse it; delete the directory (or re-run
 `scripts/build/prepare-vendor-image.sh <archive>`) to extract again.
 
+### CompactFlash card dumps
+
+`prepare-vendor-image.sh` also accepts a CompactFlash card dump: a raw `dd`
+`.img`, a Windows ImageUSB `.bin` (its 512-byte `imageUSB` header is detected
+and skipped), or a `.7z` holding either. From a dump it uses the appliance's own
+boot files, kernel, board serial and `/writable` as-is:
+
+```sh
+./build-container.sh ~/images/zd1200_*cfcard_dump*.img
+./build-container.sh ~/images/*cfcard_dump*.7z
+```
+
+A real card's `/writable` is reiserfs. No host-side reiserfs code is needed: the
+partition is copied into the flat CF verbatim (as `image/writable.raw`) and the
+guest kernel — which has reiserfs built in — mounts it. `prepare-vm-disks.sh`
+therefore runs `e2fsck` only on an ext2 `/writable` and leaves a reiserfs one to
+the guest's journal replay.
+
+### Reviving a foreign `/writable`
+
+A dump's `/writable` is data/config only — it contains no ELF executables — so
+it can be paired with a ZD1200 firmware rootfs of the same version, for example
+to revive a ZD1100 or ZD3000 card dump on a ZD1200 container:
+
+```sh
+./build-container.sh ~/images/zd1200_9.10.2.0.130.ap_*.img \
+    --writable-from ~/images/zd1112_9.10.2.0.84.bin
+```
+
+The `/writable` partition is located from the dump's own vendor partition table
+(validated against its reiserfs superblock), so the dump's disk geometry need
+not match the ZD1200's; `--writable-partition START:COUNT` overrides the
+detection. The board serial comes from the dump when it carries a ZD1200-style
+board-data record, otherwise it is derived from `ZD_CONTAINER_MAC` as usual. The
+data partition must fit the ZD1200 layout; a smaller one is zero-padded.
+
 ---
 
 ## Quick start

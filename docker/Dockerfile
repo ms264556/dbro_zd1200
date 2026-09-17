@@ -186,7 +186,6 @@ RUN apt-get update \
         python3 \
         qemu-system-x86 \
         qemu-utils \
-        reiserfsprogs \
         ripgrep \
         udhcpc \
         util-linux \
