@@ -173,9 +173,12 @@ for part in "${PARTITIONS[@]}"; do
         echo "  ! /bin/sys_wrapper.sh not present, skipping partition" >&2
         continue
     fi
-    # The entitlement shortcuts always insert this marker, even on releases
-    # that have no check_sign_cert(); use it so the sed is never applied twice.
-    if grep -q '^verify-upload-support-unpatched)' "$WORK/sys_wrapper.orig"; then
+    # Either marker proves the sed already ran: the entitlement shortcuts always
+    # insert theirs, and check_sign_cert() inserts its own on cert-bearing
+    # releases.  Checking both keeps this idempotent even for a release that has
+    # only one of the two case sets.
+    if grep -q '^verify-upload-support-unpatched)' "$WORK/sys_wrapper.orig" \
+       || grep -q '^check_sign_cert_unpatched()' "$WORK/sys_wrapper.orig"; then
         echo "  /bin/sys_wrapper.sh already patched (nothing to do)"
     else
         sed -f "$WORK/sys_wrapper.sed" "$WORK/sys_wrapper.orig" > "$WORK/sys_wrapper.new"
