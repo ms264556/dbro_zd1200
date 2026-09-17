@@ -544,6 +544,39 @@ if ! pct exec "$CTID" -- "$DEFAULT_CT_REPO/proxmox/zd1200-ct-bootstrap.sh" "${bo
 fi
 
 # --------------------------------------------------------------------------
+# 7b. publish the guest address to this container's Proxmox summary
+# --------------------------------------------------------------------------
+# The GUI's Summary tab shows the description, which is host-side data.  A timer
+# on the host keeps it current from the address the guest reported; it only touches
+# CTs that have a state dir (i.e. ones this project installed).
+step "installing the Proxmox summary helper on the host"
+install -m 0755 "$REPO_ROOT/proxmox/zd1200-pve-summary-host.sh" /usr/local/sbin/zd1200-pve-summary-host
+cat > /etc/systemd/system/zd1200-pve-summary.service <<'UNIT'
+[Unit]
+Description=Publish ZD1200 guest addresses to the Proxmox summary
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zd1200-pve-summary-host
+UNIT
+
+cat > /etc/systemd/system/zd1200-pve-summary.timer <<'UNIT'
+[Unit]
+Description=Keep ZD1200 guest addresses current in the Proxmox summary
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now zd1200-pve-summary.timer >/dev/null 2>&1 || true
+/usr/local/sbin/zd1200-pve-summary-host "$CTID" >/dev/null 2>&1 || true
+
+# --------------------------------------------------------------------------
 # 8. systemd service
 # --------------------------------------------------------------------------
 step "systemd service"
