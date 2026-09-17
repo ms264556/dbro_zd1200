@@ -1,116 +1,127 @@
 #!/usr/bin/env bash
 #
-# proxmox/zd1200-guest-address — find the guest's current LAN address.
+# proxmox/zd1200-guest-address — the guest's current address.
 #
-# The guest is an ordinary DHCP client: it takes whatever address the LAN's DHCP
-# server gives it, and the container only needs to know it to print a URL or to
-# probe it.  In the macvtap/Docker layout the container shares no L2 with the
-# guest, so the only way to see the lease was to sniff the DHCP exchange
-# (scripts/container/sniff-guest-dhcp.py).  Here the container's bridge is a port
-# of the same LAN, so the guest is an ordinary neighbour: make it answer and read
-# the neighbour table.
+# The guest is the authority on its own lease: it asked the LAN's DHCP server for
+# it, so it is asked here over the container control channel (ttyS1, the same
+# private port the orderly shutdown uses).  The guest replies "ZD-GUEST-IP=<addr>"
+# and the value is cached in $ZD_GUEST_IP_FILE for callers that only want to read
+# it (the watchdog probes on a timer).
 #
-# The guest's identity is its board-data MAC1 (ZD_MAC1 in /etc/zd1200.conf), which
-# is what it transmits, so the address is found by MAC rather than guessed.
+# Nothing is inferred: no fixed default, no ARP sweep, no candidate probing.  If
+# the guest does not answer, there is no address to report.
 #
-# Prints the address on stdout and records it, or prints nothing.
-# Exit 0 when found, 1 otherwise.
+# Prints the address on stdout, or nothing.
+# Exit 0 when known, 1 otherwise.
 #
 # Options:
-#   --timeout SEC   budget for the search (default 8)
-#   --bridge IFACE  bridge to probe through (default $ZD_BRIDGE_IF)
-#   --mac MAC       guest MAC (default ZD_MAC1 from /etc/zd1200.conf)
+#   --ask         ask the guest now even if a cached value exists
+#   --file PATH   cache file (default $ZD_GUEST_IP_FILE)
+#   --sock PATH   control socket (default $ZD_CONTROL_SOCK)
+#   --diag        print the guest's interfaces, addresses and bound drivers
+#                 instead of an address (for diagnosing a NIC change)
 set -u
 
 STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
-BRIDGE="${ZD_BRIDGE_IF:-br-zd}"
-GUEST_MAC="${ZD_MAC1:-}"
-OUT_FILE="${ZD_GUEST_IP_FILE:-$STATE_DIR/guest-ip}"
-TIMEOUT="${ZD_ADDRESS_TIMEOUT:-8}"
-NO_SWEEP="${ZD_ADDRESS_NO_SWEEP:-0}"
+LEASE_FILE="${ZD_GUEST_IP_FILE:-$STATE_DIR/guest-ip}"
+CONTROL_SOCK="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
+ASK=0
+DIAG=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --timeout) TIMEOUT="${2:?}"; shift 2 ;;
-        --bridge)  BRIDGE="${2:?}"; shift 2 ;;
-        --mac)     GUEST_MAC="${2:?}"; shift 2 ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --ask)  ASK=1; shift ;;
+        --diag) DIAG=1; shift ;;
+        --file) LEASE_FILE="${2:?}"; shift 2 ;;
+        --sock) CONTROL_SOCK="${2:?}"; shift 2 ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-[ -e "/sys/class/net/$BRIDGE" ] || exit 1
-
-if [ -z "$GUEST_MAC" ] && [ -r /etc/zd1200.conf ]; then
-    GUEST_MAC="$(sed -n 's/^ZD_MAC1=//p' /etc/zd1200.conf | head -1)"
-fi
-GUEST_MAC="$(printf '%s' "$GUEST_MAC" | tr 'A-Z' 'a-z')"
-[ -n "$GUEST_MAC" ] || exit 1
-
-# Match the MAC as a whole field: "10.222.1.110 lladdr bc:24:11:22:bb:cc STALE"
-# is the only shape `ip neigh` produces, so field 3 is the address and field 5
-# the MAC.  (An awk comparison here silently mismatched; a field-anchored grep
-# is exact and has no quoting pitfalls.)
-lookup_neighbour() {
-    ip -4 neigh show dev "$BRIDGE" 2>/dev/null \
-        | grep -i -E "(^|[[:space:]])$GUEST_MAC([[:space:]]|$)" \
-        | awk '{print $1; exit}'
-}
-
 emit() {
     [ -n "$1" ] || return 1
-    [ -n "$OUT_FILE" ] && printf '%s\n' "$1" >"$OUT_FILE" 2>/dev/null
+    [ -n "$LEASE_FILE" ] && printf '%s\n' "$1" >"$LEASE_FILE" 2>/dev/null
     printf '%s\n' "$1"
 }
 
-# Cheapest path: the guest is already in the neighbour table.
-found="$(lookup_neighbour)"
-[ -n "$found" ] && emit "$found" && exit 0
-
-deadline=$(( $(date +%s) + TIMEOUT ))
-
-# Directed ARP probes: exact, and they revive an entry that has aged out.  The
-# recorded address and GUEST_IP are the likely candidates.
-if command -v arping >/dev/null 2>&1; then
-    candidates="${ZD_GUEST_IP:-} $(head -n1 "$OUT_FILE" 2>/dev/null || true)"
-    for candidate in $candidates; do
-        case "$candidate" in *[!0-9.]*|"") continue ;; esac
-        arping -q -c 2 -w 2 -I "$BRIDGE" "$candidate" >/dev/null 2>&1 || true
-        found="$(lookup_neighbour)"
-        [ -n "$found" ] && emit "$found" && exit 0
-    done
+# Diagnostic mode: ask the guest what it has and print that verbatim.  This is what
+# makes a NIC change observable without logging into the appliance, whose console
+# needs credentials the operator may not have.
+if [ "$DIAG" = 1 ]; then
+    [ -S "$CONTROL_SOCK" ] || { echo "no control channel at $CONTROL_SOCK" >&2; exit 1; }
+    timeout 15 python3 - "$CONTROL_SOCK" <<'PYEOF'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(sys.argv[1])
+s.sendall(b"diag\n")
+buf, deadline = b"", time.time() + 10
+while time.time() < deadline:
+    try:
+        chunk = s.recv(512)
+    except socket.timeout:
+        break
+    if not chunk:
+        break
+    buf += chunk
+    if b"ZD-END=diag" in buf:
+        break
+s.close()
+for line in buf.decode("ascii", "replace").splitlines():
+    if line.startswith("ZD-"):
+        print(line)
+PYEOF
+    exit 0
 fi
 
-# Otherwise sweep the IPv4 subnet this bridge is on: the guest took its address
-# from the LAN's pool, so it is on-link.  The prefix comes from the interface
-# rather than being assumed, and a network wider than a /24 is swept only around
-# our own address (a /16 holds 65k hosts, which is not worth probing).
-if [ "$NO_SWEEP" != "1" ]; then
-    own="$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | awk '{print $4; exit}')"
-    if [ -n "$own" ]; then
-        addr="${own%%/*}"
-        prefix="${own##*/}"
-        case "$prefix" in
-            ''|*[!0-9]*) prefix=24 ;;
-        esac
-        IFS=. read -r o1 o2 o3 _ <<<"$addr"
-        if [ "$prefix" -ge 24 ]; then
-            base="$o1.$o2.$o3"
-        else
-            # Wider subnet: stay within the /24 that contains us.
-            base="$o1.$o2.$o3"
-        fi
-        for h in $(seq 1 254); do
-            ping -c1 -W1 "$base.$h" >/dev/null 2>&1 &
-        done
-        wait
-    fi
+# An operator-pinned address wins, as does a cached answer.
+if [ -n "${ZD_GUEST_IP:-}" ]; then
+    emit "$ZD_GUEST_IP"
+    exit 0
+fi
+if [ "$ASK" = 0 ] && [ -r "$LEASE_FILE" ]; then
+    cached="$(head -n1 "$LEASE_FILE" 2>/dev/null | tr -d ' \r\n')"
+    case "$cached" in
+        ""|*[!0-9.]*) : ;;
+        *) emit "$cached"; exit 0 ;;
+    esac
 fi
 
-for _ in $(seq 1 5); do
-    found="$(lookup_neighbour)"
-    [ -n "$found" ] && emit "$found" && exit 0
-    [ "$(date +%s)" -ge "$deadline" ] && break
-    sleep 1
-done
+# Ask the guest.  It answers on the same serial port; QEMU's chardev echoes what
+# is sent, so the reply is identified by its marker rather than by order.
+[ -S "$CONTROL_SOCK" ] || exit 1
+# Read whole lines: the reply arrives in fragments (the serial chardev splits it),
+# and matching a partial buffer yields a truncated address such as "10".
+reply="$(python3 - "$CONTROL_SOCK" <<'PY' 2>/dev/null || true
+import socket, sys, time
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(sys.argv[1])
+    s.sendall(b"address\n")
+    buf = b""
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(256)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if line.startswith(b"ZD-GUEST-IP="):
+                value = line.split(b"=", 1)[1].decode("ascii", "replace").strip()
+                if value:
+                    print(value)
+                sys.exit(0)
+    s.close()
+except OSError:
+    pass
+PY
+)"
+[ -n "$reply" ] && emit "$reply" && exit 0
 exit 1

@@ -41,18 +41,70 @@ say() { printf '\n== %s\n' "$*"; }
 
 cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
 #!/bin/sh
-# Container lifecycle control: QEMU exposes a second serial port (ttyS1) as a
-# private channel.  entrypoint.sh writes "reboot" on it when the container is
-# stopped, so the stock shutdown sequence runs and /writable is flushed before
-# QEMU resets.  Runs in the background and never blocks init.
+# Container lifecycle control over the second serial port (ttyS1), a private
+# non-networked channel.  Two commands are understood:
+#
+#   reboot   the container is stopping: run the stock reboot path so the
+#            controller flushes its databases and the kernel unmounts /writable.
+#   address  report this guest's own address.  The guest is the authority on its
+#            lease -- asking it avoids the container having to sniff DHCP or
+#            sweep the LAN for a matching MAC.
+#
+# Replies are written back on the same port as "ZD-<KEY>=<value>".
+# Runs in the background and never blocks init.
 (
     # devtmpfs normally provides this; fall back to a static node (ttyS 4:65).
     [ -c /dev/ttyS1 ] || mknod /dev/ttyS1 c 4 65 2>/dev/null || exit 0
+
+    # Report the network state: which interfaces exist, what addresses they hold
+    # and which driver each one is bound to.  This is what makes a NIC experiment
+    # observable without logging into the appliance, whose console needs credentials
+    # the operator may not have.
+    guest_diag() {
+        for dev in $(ls /sys/class/net 2>/dev/null); do
+            [ "$dev" = lo ] && continue
+            addr=$(ip -4 -o addr show dev "$dev" 2>/dev/null \
+                   | awk '{print $4}' | cut -d/ -f1 | head -n1)
+            drv=$(basename "$(readlink /sys/class/net/$dev/device/driver 2>/dev/null)" 2>/dev/null)
+            echo "ZD-IF=$dev addr=${addr:-none} driver=${drv:-none}" > /dev/ttyS1
+        done
+        for m in igb2 igb e1000e e1000; do
+            if [ -d "/sys/module/$m" ]; then
+                echo "ZD-MODULE=$m loaded" > /dev/ttyS1
+            fi
+        done
+        echo "ZD-END=diag" > /dev/ttyS1
+    }
+
+    guest_address() {
+        # The stock stack manages the interface it created for the management
+        # address; report whatever address that interface holds now.
+        for dev in br0 uif0 eth0; do
+            addr=$(ip -4 -o addr show dev "$dev" 2>/dev/null \
+                   | awk '{print $4}' | cut -d/ -f1 | head -n1)
+            [ -n "$addr" ] && { echo "$addr"; return; }
+        done
+    }
+
     while IFS= read -r command; do
-        [ "$command" = "reboot" ] || continue
-        echo "ZD-CONTAINER-CONTROL: orderly shutdown requested" >/dev/console
-        sync
-        exec /sbin/reboot
+        case "$command" in
+            reboot)
+                echo "ZD-CONTAINER-CONTROL: orderly shutdown requested" >/dev/console
+                sync
+                exec /sbin/reboot
+                ;;
+            diag)
+                guest_diag
+                ;;
+            address)
+                addr=$(guest_address)
+                if [ -n "$addr" ]; then
+                    echo "ZD-GUEST-IP=$addr" > /dev/ttyS1
+                else
+                    echo "ZD-GUEST-IP=" > /dev/ttyS1
+                fi
+                ;;
+        esac
     done < /dev/ttyS1
 ) &
 exit 0

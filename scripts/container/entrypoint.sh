@@ -17,7 +17,13 @@ http_status=""
 http_port="${HTTP_PORT:-38080}"
 https_port="${HTTPS_PORT-38443}"
 network_mode="${NETWORK_MODE:-user}"
-guest_ip="${GUEST_IP:-192.168.10.20}"
+# The guest's address is whatever the LAN's DHCP server leased it, so it is asked
+# for it on the control channel (see proxmox/zd1200-guest-address) or taken from an
+# explicitly configured GUEST_IP.  There is deliberately no guessed default:
+# probing an address that may not be the guest's makes a healthy guest look dead,
+# and then the readiness deadline restarts it.
+guest_ip="${GUEST_IP:-}"
+address_helper="${ZD_ADDRESS_HELPER:-$work_dir/zd1200-guest-address}"
 state_dir="${STATE_DIR:-$work_dir}"
 synthetic_disk="${SYNTHETIC_DISK:-$state_dir/synthetic-cf.img}"
 vm_snapshot="${VM_SNAPSHOT:-0}"
@@ -184,14 +190,6 @@ if [ "${NETWORK_MODE:-user}" = macvtap ] || [ "${NETWORK_MODE:-user}" = bridge ]
     if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_HOST_NET:-0}" != "1" ]; then
         udhcpc -i eth0 -b -q -p /var/run/udhcpc.pid >>"$log_file" 2>&1 || true
     fi
-    # The macvlan bridge isolates this container from its macvtap guest, so the
-    # container can neither reach nor ARP-scan the guest.  sniff-guest-dhcp.py
-    # watches the LAN (eth0) for the DHCP reply addressed to the guest MAC and
-    # records the guest's dynamic lease to $state_dir/guest-ip (and the log).
-    if [ -f "$work_dir/sniff-guest-dhcp.py" ]; then
-        python3 "$work_dir/sniff-guest-dhcp.py" "$zd_mac1" "$state_dir/guest-ip" \
-            >>"$log_file" 2>&1 &
-    fi
 fi
 # Interactive serial console (see launch-vm.sh): the chardev logfile must be
 # the SAME file the READY detect + healthcheck grep, and the socket path is where
@@ -263,8 +261,16 @@ if [ -n "$cpu_limit" ]; then
 else
     echo "Startup runs at full speed and has a ${wait_seconds}s readiness deadline."
 fi
+refreshed_guest_ip() {
+    # Ask the guest (or read its cached answer).  It may lease after startup, and
+    # it may renew onto a different address.
+    if [ -z "${GUEST_IP:-}" ] && [ -x "$address_helper" ]; then
+        guest_ip="$("$address_helper" --ask 2>/dev/null || true)"
+    fi
+}
 if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ] || [ "$network_mode" = bridge ]; then
-    probe_base="https://$guest_ip"
+    # No lease means no address to probe yet; the loop waits for one.
+    probe_base=""
 else
     probe_base="https://127.0.0.1:$https_port"
 fi
@@ -273,37 +279,35 @@ fi
 # this container by its LAN IP: curling $guest_ip would always time out.  In
 # macvtap mode detect readiness from the guest's serial console instead, which
 # this entrypoint writes to $log_file.  Other modes keep the HTTP probe.
-if [ "$network_mode" = macvtap ]; then
-    probe_method=console
-else
-    probe_method=http
-fi
+# The guest announces readiness itself, on the console the appliance prints to:
+# "System go into READY status."  That is the authority in every mode -- it needs
+# no address, and a container that cannot yet see a lease still knows the
+# controller came up.  Downloading an address is a *display* concern (the URL) and
+# must never gate readiness: doing so once made a healthy guest look dead and the
+# readiness deadline restart it.
+probe_method=console
 ready_marker="System go into READY status."
 deadline=$((SECONDS + wait_seconds))
 next_notice=$((SECONDS + 30))
 while (( SECONDS < deadline )); do
     if [ "$probe_method" = console ]; then
-        # macvtap: the guest is a sibling macvlan on the same parent as this
-        # container, so it is unreachable by LAN IP from here.  Detect READY
-        # from the guest's serial console (written to $log_file) instead.
+        # The guest's own announcement, written to $log_file by the console
+        # chardev.  No address is involved, so no lease or DHCP state can make a
+        # healthy controller look absent.
         if rg -qF "$ready_marker" "$log_file" 2>/dev/null; then
-            # Prefer the guest lease learned from the LAN by sniff-guest-dhcp.py
-            # (the macvlan bridge isolates this container from its guest).
-            if [ -s "$state_dir/guest-ip" ]; then
-                ready_ip="$(cat "$state_dir/guest-ip")"
-            else
-                ready_ip="$guest_ip"
-            fi
+            # Best effort, for the printed URL only: ask the guest for its
+            # address.  A failure here changes nothing about readiness.
+            refreshed_guest_ip
+            ready_ip="${guest_ip:-}"
             ready_url="https://$ready_ip/admin10/login.jsp"
             ready_kind="web service"
             echo "ZD1200 $ready_kind is ready (guest console reported: '$ready_marker')."
-            echo "HTTP:  http://$ready_ip/"
-            echo "HTTPS: $ready_url"
-            if [ "$ready_ip" = "$guest_ip" ]; then
-                # No lease observed yet — the guest IP may not match the
-                # configured ZD_GUEST_IP; tell the user how to confirm it.
-                echo "Note: guest IP is dynamic on DHCP; if $guest_ip is not its lease,"
-                echo "      find it from another LAN host (e.g. arp-scan --localnet)."
+            if [ -n "$ready_ip" ]; then
+                echo "HTTPS: $ready_url"
+            else
+                echo "The guest has not reported an address yet; it takes one from your"
+                echo "LAN's DHCP server. Check later with:"
+                echo "  $address_helper"
             fi
             if [ "$vm_accel" = kvm ]; then
                 echo "Hardware acceleration: KVM"
@@ -350,11 +354,11 @@ while (( SECONDS < deadline )); do
             fi
             echo "ZD1200 $ready_kind is ready:"
             if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ] || [ "$network_mode" = bridge ]; then
-                echo "HTTP:  http://$guest_ip/"
+                [ -n "$guest_ip" ] && echo "HTTPS: $ready_url"
             else
                 echo "HTTP:  http://127.0.0.1:$http_port/"
+                echo "HTTPS: $ready_url"
             fi
-            echo "HTTPS: $ready_url"
             if [ "$vm_accel" = kvm ]; then
                 echo "Hardware acceleration: KVM"
             fi

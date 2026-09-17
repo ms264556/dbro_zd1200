@@ -290,7 +290,7 @@ The board data (serial + MACs) is authoritative. `ZD_CONTAINER_MAC` (a unique,
 locally-administered MAC generated into `.env` on first run) seeds the identity
 when the base disk is built; from then on the board data on the disk wins. Every
 start runs `scripts/container/read-boarddata.py` and uses the value read back for
-the macvtap, the QEMU NIC and the DHCP sniffer, so a MAC changed in the
+the macvtap and the QEMU NIC, so a MAC changed in the
 appliance's web UI is honoured on the next start. Re-seeding (a new
 `ZD_CONTAINER_MAC`, or `ZD_BOARDDATA_FROM_MAC=0` with `ZD_SERIAL`/`ZD_MAC1`)
 needs a fresh state volume. A CF dump's serial is used when present.
@@ -324,8 +324,10 @@ compose file's `stop_grace_period` does. The `NETWORK_MODE=bridge` case in
 `launch-vm.sh` creates `tap-zd`, enslaves it to the bridge `zd1200-net.service`
 built (`br-zd`), and hands it to QEMU; because the guest's tap and the CT's
 uplink are ports of the same bridge, the CT can `curl` the guest directly and the
-DHCP sniffer is not needed for reachability (it still records the lease for
-`/var/lib/zd1200/guest-ip`).
+connectivity is direct: the container asks the guest for its own address over the
+control serial channel (the same private port used for the orderly shutdown) and
+caches the answer in `/var/lib/zd1200/guest-ip` for display and health checks.
+The guest's lease is authoritative, so nothing is sniffed or guessed.
 
 ## Boot test without the container
 

@@ -83,6 +83,9 @@ INSTALL_LOG="${ZD_INSTALL_LOG:-$STATE_DIR/install.log}"
 run_logged() {
     local description="$1"; shift
     printf '  %s...\n' "$description"
+    # Both streams go to the log.  These steps narrate on stdout (every changed
+    # block) and put diagnostics on stderr (debugfs banners, missing-certificate
+    # notes), so neither belongs on the console; a failure prints the tail.
     if ! "$@" >>"$INSTALL_LOG" 2>&1; then
         warn "$description failed; last lines of $INSTALL_LOG:"
         tail -25 "$INSTALL_LOG" >&2 || true
@@ -429,6 +432,9 @@ ZD_MAC2="${MAC2:-}"
     printf 'ZD_SERIAL=%s\n' "$ZD_SERIAL"
     printf 'ZD_MAC1=%s\n' "$ZD_MAC1"
     [ -n "$ZD_MAC2" ] && printf 'ZD_MAC2=%s\n' "$ZD_MAC2"
+    # The guest's address is not knowable until it leases one, so leave GUEST_IP
+    # unset unless the operator supplied it: the entrypoint then reads the
+    # recorded lease instead of probing a guessed default.
     [ -n "$GUEST_IP" ] && printf 'GUEST_IP=%s\n' "$GUEST_IP"
     [ -n "$HOST_IP" ] && printf 'ZD_HOST_IP=%s\n' "$HOST_IP"
     printf 'ZD_NETWORK_MONITOR=%s\n' "$NETWORK_MONITOR"
@@ -503,6 +509,7 @@ UNIT
 # Recovery: if the guest stops answering for a run of probes, reboot it.  A
 # wedged guest is invisible to Proxmox (QEMU stays up), so this is the only thing
 # that heals it without a human.
+
 cat > /etc/systemd/system/zd1200-watchdog.service <<'UNIT'
 [Unit]
 Description=Recover the ZD1200 guest if it stops answering
