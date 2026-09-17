@@ -148,10 +148,16 @@ with tempfile.TemporaryDirectory() as td2:
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # ac_upg.sh _upg_rootfs resize2fs's the freshly written root to fill its
     # partition; do the same so the guest sees the full partition, not the size
-    # of the rootfs.ext2 we were shipped.
+    # of the rootfs.ext2 we were shipped.  A CF-dump rootfs is already
+    # partition-sized (and e2fsprogs refuses to resize an unfsck'd
+    # resize_inode filesystem), so only resize one that is genuinely smaller.
+    size_before = os.path.getsize(rt)
     os.truncate(rt, C2 * SECTOR)
-    subprocess.run(["resize2fs", str(rt)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if size_before < C2 * SECTOR:
+        subprocess.run(["resize2fs", str(rt)],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        print(f"  rootfs already fills its partition ({size_before} bytes); not resizing")
     rfs = open(rt, "rb").read()
 with disk.open("r+b") as h:
     for start in (H2, H3):
@@ -213,34 +219,52 @@ def stage_payload(stage: Path) -> None:
         made.rename(target / "firmwares")
 
 
-# ---- sda4 /writable (ext2) ---------------------------------------------------
-# Mirror the /writable state a firmware install leaves behind: the web-UI aidfs
-# (_upg_aidfs) and the AP images + manifest under
-# etc/airespider-images/firmwares (_upg_apimg), staged from the payload tarball.
-# mke2fs -d seeds the filesystem from the staged tree.
-with tempfile.TemporaryDirectory() as sd:
-    stage = Path(sd)
-    (stage / "etc").mkdir(parents=True, exist_ok=True)
-    stage_payload(stage)
-    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
-        tf_path = tf.name
-    try:
-        os.truncate(tf_path, C4 * SECTOR)
-        subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", "-d", str(stage), tf_path],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        seed_writable_config(tf_path)
-        with open(tf_path, "rb") as rf, disk.open("r+b") as h:
-            h.seek(H4 * SECTOR)
-            while True:
-                chunk = rf.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                h.write(chunk)
-    finally:
-        os.unlink(tf_path)
+# ---- sda4 /writable ----------------------------------------------------------
+# Two sources.  A CF-dump image carries its own /writable (reiserfs), copied
+# verbatim so the appliance keeps its configuration, AP payloads and aidfs; the
+# guest kernel has reiserfs built in, so no conversion is needed.  A
+# firmware-archive image has no /writable, so mirror what a firmware install
+# leaves behind: the web-UI aidfs (_upg_aidfs) and the AP images + manifest
+# under etc/airespider-images/firmwares (_upg_apimg), staged from the payload
+# tarball, with mke2fs -d seeding the ext2 filesystem.
+writable_raw = base / "image" / "writable.raw"
+if writable_raw.exists():
+    data = writable_raw.read_bytes()
+    if len(data) > C4 * SECTOR:
+        raise SystemExit(
+            f"image/writable.raw is {len(data)} bytes, larger than the "
+            f"{C4 * SECTOR}-byte data partition")
+    with disk.open("r+b") as h:
+        h.seek(H4 * SECTOR)
+        h.write(data)
+    if len(data) < C4 * SECTOR:
+        print(f"  sda4 data : image/writable.raw ({len(data)} bytes) + zero padding")
+    else:
+        print(f"  sda4 data : verbatim copy of image/writable.raw ({len(data)} bytes)")
+else:
+    with tempfile.TemporaryDirectory() as sd:
+        stage = Path(sd)
+        (stage / "etc").mkdir(parents=True, exist_ok=True)
+        stage_payload(stage)
+        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+            tf_path = tf.name
+        try:
+            os.truncate(tf_path, C4 * SECTOR)
+            subprocess.run([mke2fs, "-F", "-q", "-t", "ext2", "-d", str(stage), tf_path],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            seed_writable_config(tf_path)
+            with open(tf_path, "rb") as rf, disk.open("r+b") as h:
+                h.seek(H4 * SECTOR)
+                while True:
+                    chunk = rf.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    h.write(chunk)
+        finally:
+            os.unlink(tf_path)
 
 print(f"created {disk} ({DISK_SIZE // (1024 * 1024)} MiB)")
 print(f"  sda1 boot : sectors {H1}..{H1 + C1} (bootfs + kernel)")
 print(f"  sda2 rootA: sectors {H2}..{H2 + C2} (rootfs)")
 print(f"  sda3 rootB: sectors {H3}..{H3 + C3} (rootfs)")
-print(f"  sda4 data : sectors {H4}..{H4 + C4} (ext2)")
+print(f"  sda4 data : sectors {H4}..{H4 + C4} (from image/ or payload)")

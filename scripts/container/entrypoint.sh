@@ -124,6 +124,16 @@ else
     zd_mac1="${ZD_MAC1:-00:0c:e6:12:00:01}"
     zd_mac2="${ZD_MAC2:-}"
 fi
+# A CF-dump image carries the appliance's own board serial (extracted by
+# prepare-vendor-image.sh); reuse it.  The MAC still comes from
+# ZD_CONTAINER_MAC so a clone does not collide on the LAN.
+if [ -f "$work_dir/image/dump-boarddata" ]; then
+    dump_serial="$(sed -n 's/^SERIAL=//p' "$work_dir/image/dump-boarddata" | head -n1)"
+    if [ -n "$dump_serial" ]; then
+        echo "board data: using the CF-dump serial $dump_serial"
+        zd_serial="$dump_serial"
+    fi
+fi
 # Build the flat synthetic disk if missing, write the board data, and run the
 # kernel + rootfs customisations on whichever root partitions still need them
 # (see prepare-vm-disks.sh).  It is the ONLY place that builds or patches the disk.

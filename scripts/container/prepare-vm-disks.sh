@@ -125,26 +125,41 @@ if [ "$rebuild" = 1 ]; then
 fi
 
 # --- repair the writable data partition if the last stop was not clean ------
-# The stock firmware mounts /writable (hda4, legacy ext2 with no journal)
-# read-write, and the container can be stopped without a clean guest shutdown.
-# The vendor's factory-restore path fsck'd that partition before mounting it;
-# this fork boots the stock kernel directly, so do it here, offline, before QEMU
-# starts.  Gated on the ext2 superblock clean flag (offset 1024+58, 1 = clean),
-# which the kernel sets to "errors" (2) when it detects damage, so a clean start
-# pays only a two-byte read.
-hda4_state="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 1024 + 58)) count=2 status=none 2>/dev/null \
-    | od -An -tu2 | tr -d ' ')"
-if [ "$hda4_state" != "1" ]; then
-    say "data partition (hda4) is not clean (superblock state=${hda4_state:-unknown}); running e2fsck"
-    hda4_tmp="$STATE_DIR/.hda4-fsck.img"
-    dd if="$DISK" of="$hda4_tmp" bs=$SECTOR skip="$HDA4_START" count="$HDA4_SECTORS" status=none
-    hda4_rc=0
-    e2fsck -fy "$hda4_tmp" || hda4_rc=$?
-    if [ "$hda4_rc" -ge 4 ]; then
-        echo "prepare-vm-disks: WARNING: e2fsck could not fully repair hda4 (rc=$hda4_rc)" >&2
+# The stock firmware mounts /writable (hda4) read-write, and the container can be
+# stopped without a clean guest shutdown.  The vendor's factory-restore path
+# fsck'd that partition before mounting it; this fork boots the stock kernel
+# directly, so do it here, offline, before QEMU starts.
+#
+# The filesystem depends on where the image came from: a firmware-archive build
+# creates a legacy ext2 (no journal), while a CF-dump build carries the
+# appliance's own reiserfs.  Handle each on its own terms:
+#   * ext2   -> e2fsck, gated on the superblock clean flag (offset 1024+58,
+#               1 = clean, which the kernel sets to "errors" (2) on damage), so
+#               a clean start pays only a two-byte read;
+#   * reiserfs -> leave it alone: it is journaled and the guest kernel (which
+#               has reiserfs built in) replays the journal on mount.
+hda4_ext2_magic="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 1080)) count=2 status=none 2>/dev/null \
+    | od -An -tx1 | tr -d ' ')"
+hda4_reiser_magic="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 0x10034)) count=9 status=none 2>/dev/null)"
+if [ "$hda4_ext2_magic" = "53ef" ]; then
+    hda4_state="$(dd if="$DISK" bs=1 skip=$((HDA4_START * SECTOR + 1024 + 58)) count=2 status=none 2>/dev/null \
+        | od -An -tu2 | tr -d ' ')"
+    if [ "$hda4_state" != "1" ]; then
+        say "data partition (hda4) is not clean (superblock state=${hda4_state:-unknown}); running e2fsck"
+        hda4_tmp="$STATE_DIR/.hda4-fsck.img"
+        dd if="$DISK" of="$hda4_tmp" bs=$SECTOR skip="$HDA4_START" count="$HDA4_SECTORS" status=none
+        hda4_rc=0
+        e2fsck -fy "$hda4_tmp" || hda4_rc=$?
+        if [ "$hda4_rc" -ge 4 ]; then
+            echo "prepare-vm-disks: WARNING: e2fsck could not fully repair hda4 (rc=$hda4_rc)" >&2
+        fi
+        dd if="$hda4_tmp" of="$DISK" bs=$SECTOR seek="$HDA4_START" count="$HDA4_SECTORS" conv=notrunc status=none
+        rm -f "$hda4_tmp"
     fi
-    dd if="$hda4_tmp" of="$DISK" bs=$SECTOR seek="$HDA4_START" count="$HDA4_SECTORS" conv=notrunc status=none
-    rm -f "$hda4_tmp"
+elif [ "$hda4_reiser_magic" = "ReIsEr2Fs" ]; then
+    say "data partition (hda4) is reiserfs (journaled); the guest kernel replays its journal"
+else
+    say "data partition (hda4) has no recognized filesystem (ext2 magic '$hda4_ext2_magic'); skipping repair"
 fi
 
 # --- helpers ----------------------------------------------------------------
