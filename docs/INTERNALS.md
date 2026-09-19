@@ -338,12 +338,12 @@ image (r600, r500, r310, t300, t300e, t301n, t301s). Because the AP rootfs is
 historical LZMA SquashFS, the Dockerfile carries a `ruckus-squashfs-tools` stage
 that builds the matching `unsquashfs`/`mksquashfs` from pinned GPL-2.0 source.
 
-**R600 is the validated target**; the other models are repaired only because they
-resolve to the identical vendor image. **A repaired image requires the AP to
-already run Solo 104 or 106 firmware**: the repair produces an unsigned image, and
-an AP on anything older will not accept it, so the APs must be moved to Solo
-104/106 through their own standalone upgrade page first. An AP still on fully
-signed FSI firmware has the same prerequisite.
+**The repair targets AC Wave 1 APs (e.g. R600)**: every model that resolves to
+the identical vendor image gets the same repaired image. **A repaired image
+requires the AP to already run Solo 104 or 106 firmware**: the repair produces an
+unsigned image, and an AP on anything older will not accept it, so the APs must be
+moved to Solo 104/106 through their own standalone upgrade page first. An AP still
+on fully signed FSI firmware has the same prerequisite.
 
 This is the one repair that keys off a version number: the helper reads the AP
 image's own BL7 version and applies the fix only to a 10.5.1 build at or after

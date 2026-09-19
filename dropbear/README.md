@@ -1,16 +1,14 @@
 # Static ZD1200 dropbear replacement (optional)
 
-This directory vendors the source patches and build script from the author's
-[`ms264556/zd_dropbear`](https://github.com/ms264556/zd_dropbear) project
-(revision `2d8bb0e`, "fix auth none"). It produces a **static musl i386**
-`dropbear` 2026.94, `dropbearkey`, `dropbearconvert` and OpenSSH 9.9p2
+This directory holds the source patches and build script for a **static musl
+i386** `dropbear` 2026.94, `dropbearkey`, `dropbearconvert` and OpenSSH 9.9p2
 `sftp-server` that replace the ZD1200's own uClibc binaries.
 
 ## Why this exists
 
 The vendor `/usr/sbin/dropbear` on 10.5.1.0.282 is a Ruckus-modified build
 whose server advertises **`password` only** — public-key authentication is not
-compiled in, and its custom `-A` option is mandatory. The upstream project's
+compiled in, and its custom `-A` option is mandatory. This project's
 `ZD_ROOT_SSH_PUBLIC_KEY` promise therefore cannot be satisfied with the vendor
 binary.
 
@@ -79,6 +77,5 @@ placed there manually is never overwritten.
 
 ## License
 
-Patches and build script are the `zd_dropbear` author's work. Dropbear is MIT;
-OpenSSH and zlib carry their own licenses. Nothing from the vendor firmware is
-committed here.
+Dropbear is MIT; OpenSSH and zlib carry their own licenses. Nothing from the
+vendor firmware is committed here.

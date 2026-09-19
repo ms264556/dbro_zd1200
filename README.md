@@ -1,188 +1,93 @@
 # Ruckus ZoneDirector ZD1200 as a virtual appliance
 
-Run the Ruckus ZoneDirector ZD1200 controller as a virtual appliance, on a Proxmox
-VE host or in Docker. It joins your network like the physical box would, and your
-access points connect to it directly.
+Run the ZoneDirector ZD1200 controller as a virtual appliance in Docker or on
+Proxmox VE. It joins your LAN like the physical box, and your APs connect to it.
 
-You supply the input: a firmware upgrade file downloaded from Ruckus/CommScope
-support, or a dump of a real appliance's CompactFlash card. Nothing vendor-owned is
-committed here, and the recipes below show which path to pass.
-
-Two entry points, both in the repository root:
-
-| installer | platform |
-|---|---|
-| `install-zd1200-docker.sh` | Docker |
-| `install-zd1200-lxc.sh` | Proxmox VE (LXC) |
-
-If something goes wrong, **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** has
-the symptom-by-symptom fixes.
+You supply a ZD1200 firmware upgrade file from Ruckus/CommScope support, or a dump
+of a real appliance's CompactFlash card. Any ZD1200 release >= 9.10 should work.
 
 ## Recipe: Docker
 
+Docker Engine + Compose v2, and a host NIC that passes foreign MACs.
+
 ```sh
-# Linux host with Docker Engine + Compose v2, and a NIC that can pass foreign
-# MACs.
 git clone https://github.com/ms264556/dbro_zd1200 && cd dbro_zd1200
-
 ./install-zd1200-docker.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
-
-docker logs -f zd1200                             # boot progress
-docker exec zd1200 cat /var/lib/zd1200/guest-ip   # the guest's address
 ```
 
-Open `https://<guest-ip>/` from another LAN machine.
+The guest takes a DHCP lease: read it from your DHCP server, or with
+`docker exec zd1200 cat /var/lib/zd1200/guest-ip`, then open `https://<guest-ip>/`
+from another LAN machine — the Docker host cannot reach its own guest.
 
 ## Recipe: Proxmox VE (LXC)
 
+As root on a PVE 8.2+ host:
+
 ```sh
-# As root on the PVE host (8.2+).
 git clone https://github.com/ms264556/dbro_zd1200 && cd dbro_zd1200
-
 ./install-zd1200-lxc.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
-
-pct exec <id> -- journalctl -fu zd1200            # boot progress
-pct exec <id> -- cat /var/lib/zd1200/guest-ip     # the guest's address
 ```
 
-Open `https://<guest-ip>/` from any LAN machine — including the PVE host itself.
+The guest takes a DHCP lease: read it from your DHCP server, from the container's
+**Summary** tab in the Proxmox web UI, or with
+`pct exec <id> -- cat /var/lib/zd1200/guest-ip`, then open `https://<guest-ip>/`
+from any LAN machine, including the PVE host.
 
-## Alternatives
+## Installing from an existing ZD1100/ZD1200/ZD3000 disk dump
 
-Pass a different input, or drop a repair you do not need. The Docker entry point is
-`./install-zd1200-docker.sh`; the Proxmox one is `./install-zd1200-lxc.sh`.
-Both take the same flags.
+> Docker and Proxmox VE installers both take the same arguments: substitute
+> `./install-zd1200-lxc.sh` to run the commands below on Proxmox.
+
+### A CompactFlash dump of a real ZD1200
+
+Everything comes from the card dump, so the appliance arrives
+with the original device's configuration:
 
 ```sh
-# A CompactFlash dump of a real ZD1200: rootfs, /writable and serial all come
-# from the card, so the appliance arrives with its own configuration.
 ./install-zd1200-docker.sh /path/to/zd1200_10.5.1.0.240_cfcard_dump.img
-./install-zd1200-lxc.sh /path/to/zd1200_10.5.1.0.240_cfcard_dump.img
+```
 
-# Firmware for the kernel/rootfs plus a foreign card's /writable and serial: here
-# a ZD3000 card on ZD1200 firmware of the same version, which revives the card's
-# AP payloads and configuration.
+### A USB flash dump of a real ZD1100, or a disk dump of a real ZD3000
+
+These devices are incompatible with the ZD1200 hardware, so you also need to
+supply a ZD1200 firmware upgrade file of the same version:
+
+```sh
 ./install-zd1200-docker.sh /path/to/zd1200_9.10.2.0.130.ap_9.10.2.0.130.img \
-    --writable-from /path/to/zd3000_9.10.2.0.130_cfcard_dump.bin
-./install-zd1200-lxc.sh /path/to/zd1200_9.10.2.0.130.ap_9.10.2.0.130.img \
-    --writable-from /path/to/zd3000_9.10.2.0.130_cfcard_dump.bin
-
-# Ship the vendor AP images exactly as they came, without the R600 /
-# ap-11n-scorpion mesh repair. Useful when comparing against stock behaviour.
-./install-zd1200-docker.sh --no-r600-repair /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
-./install-zd1200-lxc.sh --no-r600-repair /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
+    --writable-from /path/to/zd1106_9.10.2.0.130_flash_dump.bin
 ```
 
-> **If the mesh repair is applied, the APs must already be running Solo 104 or 106
-> firmware or they will not join.** The repair delivers an unsigned AP image, and
-> an AP on older firmware will not accept it — upgrade the APs to Solo 104/106
-> through their own standalone upgrade page first.
+## Firmware upgrades
 
-## Inputs
+Perform ZoneDirector firmware upgrades and downgrades from within its Web UI or CLI.
 
-| input | example | notes |
-|---|---|---|
-| firmware upgrade file | `zd1200_10.5.1.0.282.ap_*.img` | TAC-encrypted; decrypted during preparation |
-| CF card dump | `*_cfcard_dump.img`, ImageUSB `.bin` | raw `dd` or Windows ImageUSB dump |
-| firmware + a foreign card's data | `--writable-from <dump>` | reuses the dump's `/writable` (and its serial, when one can be read) |
+## Mesh repair
 
-Any ZD1200 release >= 9.10 should work; the tested matrix is 9.10.2.0.130, 9.13.3.0.164,
-10.1.2.0.318, 10.2.1.0.236, 10.3.1.0.45, 10.4.1.0.272, 10.5.1.0.255 and
-10.5.1.0.282.
+For ZoneDirector 10.5.1.0.276 and later, the container repairs the mesh receive-path
+bug in the AC Wave 1 AP image (e.g. R600) by default. The repaired image is
+unsigned, so APs must already run Solo 104 or 106 before they can be adopted by the
+ZD1200.
 
-## Optional features
+Pass `--no-r600-repair` to ship the vendor images untouched.
 
-| flag (both entry points) | effect |
-|---|---|
-| `--upgrade` | upgrade an existing appliance in place, keeping `/writable` |
-| `--root-ssh-key <key\|file>` | static-dropbear replacement + public-key root SSH on 2222 |
-| `--writable-from <dump>` | take `/writable` + serial from a CF dump |
-| `--writable-partition START:COUNT` | override the detected dump geometry |
-| `--no-up` (Docker) / `--no-*` (LXC) | build without booting / skip individual pieces |
+## Updating the container machinery
 
-The guest also gets an ECDSA SSH host key, the community Network Monitor page and
-the R600/`ap-11n-scorpion` mesh repair by default. `--help` lists every flag,
-including `--ecdsa`, `--network-monitor` and `--console-tty`, and their `--no-`
-forms.
-
-## Upgrading an existing appliance
-
-Pull the new checkout and upgrade in place — no firmware argument, and the
-appliance's configuration is kept:
+To pick up changes to this project's scripts, patches or guest tooling:
 
 ```sh
-./install-zd1200-docker.sh --upgrade          # Docker
-./install-zd1200-lxc.sh --upgrade             # Proxmox: finds the container it made
-./install-zd1200-lxc.sh --upgrade --ctid 120  # ... or name it
+git clone https://github.com/ms264556/dbro_zd1200 && cd dbro_zd1200
+./install-zd1200-docker.sh --upgrade
+./install-zd1200-lxc.sh --upgrade
 ```
 
-`--root-ssh-key` replaces the provisioned key; without it the existing key is
-kept. This does **not** change the firmware. To move to a different firmware
-release, reset the state first (see [Clean state](#clean-state)).
+## Help
 
-## Reach the appliance
+* Use the `--help` argument to see all available installer options.
+* Visit [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) if you have installer or
+  container problems.
+* Visit [docs/INTERNALS.md](docs/INTERNALS.md) / [docs/PROXMOX.md](docs/PROXMOX.md) for the
+  technical detail.
+* The tested matrix is 9.10.2.0.130, 9.13.3.0.164, 10.1.2.0.318, 10.2.1.0.236,
+  10.3.1.0.45, 10.4.1.0.272, 10.5.1.0.255 and 10.5.1.0.282.
 
-```sh
-docker exec zd1200 cat /var/lib/zd1200/guest-ip     # Docker
-pct exec <id> -- cat /var/lib/zd1200/guest-ip       # Proxmox
-```
-
-Open `https://<guest-ip>/`. At the ZD CLI, `!v54! <any word>` drops to a root
-shell.
-
-Serial console (the same prompt as on the physical box):
-
-```sh
-docker exec -it zd1200 python3 /opt/zd1200/attach-console.py
-pct exec <id> -- python3 /opt/zd1200/scripts/container/attach-console.py
-```
-
-## Constraints
-
-- **The Docker host cannot reach its own guest.** macvtap is a macvlan sibling, so
-  frames never loop back — test from another LAN machine. The Proxmox LXC layout
-  has no such limitation: the PVE host can reach its guest.
-- **The LAN interface must pass foreign MACs** (MAC spoofing, or an unfiltered
-  bridge port). There is no NAT/user-mode fallback; WSL2 is not supported.
-- **Applying the R600 mesh repair needs Solo 104 or 106 on the APs first.** The
-  repair delivers an unsigned AP image, and newer AP firmware will not accept it —
-  so the APs will not join. Upgrade them through their own standalone upgrade page
-  before pointing them at the controller, or build with `--no-r600-repair`.
-
-## If it does not work
-
-The guest's console tells you why:
-
-```sh
-docker logs zd1200 | tail -80                       # Docker
-pct exec <id> -- journalctl -u zd1200 -n 80         # Proxmox
-```
-
-Symptom-by-symptom fixes, including the common installation failures, are in
-[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
-
-## Clean state
-
-```sh
-# Docker: container + state volume (the next build boots a factory appliance)
-docker compose --project-directory . -f docker/docker-compose.yml down -v
-
-# Proxmox: the container's whole state
-pct exec <id> -- rm -rf /var/lib/zd1200 && pct reboot <id>
-```
-
-## Documentation
-
-| document | contents |
-|---|---|
-| [`docs/INTERNALS.md`](docs/INTERNALS.md) | disk model, rootfs patch pipeline, board data/identity, boot/shutdown, boot test |
-| [`docs/PROXMOX.md`](docs/PROXMOX.md) | LXC layout, MAC rules, network unit, safeguards, rebuilding |
-| [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | symptom-to-fix for starting, reaching, slow/unhealthy guests, APs and firmware |
-| `install-zd1200-lxc.sh --help` | every installer flag |
-| `docker/Dockerfile`, `docker/docker-compose.yml` | the Docker runtime |
-| [`analytics/README.md`](analytics/README.md), [`bl7/README.md`](bl7/README.md) | Network Monitor, R600 mesh repair |
-
-## License
-
-MIT — see `LICENSE`. The firmware (including the GRUB binaries this repo reuses)
-is Ruckus/CommScope's and is never committed or redistributed here.
+MIT — see `LICENSE`.

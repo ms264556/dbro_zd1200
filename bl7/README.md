@@ -11,7 +11,7 @@ Mesh AP shows as connected but does not pass ordinary Layer-2 traffic. 10.5.1.0.
 (the release this project recommends) still has it.
 
 These files are ported from [`dbro/zd1200`](https://github.com/dbro/zd1200)
-(upstream revision `10aeb90`) and applied to the staged `/writable` tree by
+and applied to the staged `/writable` tree by
 `scripts/container/build-synthetic-cf.py`, so the repaired image is what the
 controller delivers to APs.
 
@@ -50,9 +50,8 @@ project (pinned revision `3d9e4add414228eac4091f301e813d14130c3d61`) by the
 
 ## Important scope
 
-R600 is the validated target. R500, R310, T300, T300e, T301n and T301s are
-experimental: they are repaired only because they resolve to the exact same
-vendor image. An AP running fully signed FSI firmware will reject the resulting
-unsigned UI image, so it must first be moved to a compatible ISI release (for
-the R600, `110.0.0.0.675`) through its standalone upgrade page. See the upstream
-project's README for that procedure.
+The repair targets **AC Wave 1 APs (e.g. R600)**: every model whose AP image
+resolves to the same vendor `ap-11n-scorpion` BL7 gets the repaired image. An AP
+running fully signed FSI firmware will reject the resulting unsigned UI image, so
+it must first be moved to Solo 104 or 106 through its standalone upgrade page. See
+the upstream project's README for that procedure.
