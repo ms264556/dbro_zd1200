@@ -84,23 +84,41 @@ Both take the same flags.
 |---|---|---|
 | firmware upgrade file | `zd1200_10.5.1.0.282.ap_*.img` | TAC-encrypted; decrypted during preparation |
 | CF card dump | `*_cfcard_dump.img`, ImageUSB `.bin` | raw `dd` or Windows ImageUSB dump |
-| firmware + a foreign card's data | `--writable-from <dump>` | reuses another card's `/writable` + serial (e.g. a ZD1100 card) |
+| firmware + a foreign card's data | `--writable-from <dump>` | reuses the dump's `/writable` (and its serial, when one can be read) |
 
-Any ZD1200 release works; the tested matrix is 9.10.2.0.130, 9.13.3.0.164,
-10.1.2.0.318, 10.2.1.0.236, 10.5.1.0.255 and 10.5.1.0.282.
+Any ZD1200 release >= 9.10 should work; the tested matrix is 9.10.2.0.130, 9.13.3.0.164,
+10.1.2.0.318, 10.2.1.0.236, 10.3.1.0.45, 10.4.1.0.272, 10.5.1.0.255 and
+10.5.1.0.282.
 
 ## Optional features
 
 | flag (both entry points) | effect |
 |---|---|
+| `--upgrade` | upgrade an existing appliance in place, keeping `/writable` |
 | `--root-ssh-key <key\|file>` | static-dropbear replacement + public-key root SSH on 2222 |
 | `--writable-from <dump>` | take `/writable` + serial from a CF dump |
 | `--writable-partition START:COUNT` | override the detected dump geometry |
 | `--no-up` (Docker) / `--no-*` (LXC) | build without booting / skip individual pieces |
 
 The guest also gets an ECDSA SSH host key, the community Network Monitor page and
-the R600/`ap-11n-scorpion` mesh repair by default. Details:
-[`docs/INTERNALS.md`](docs/INTERNALS.md).
+the R600/`ap-11n-scorpion` mesh repair by default. `--help` lists every flag,
+including `--ecdsa`, `--network-monitor` and `--console-tty`, and their `--no-`
+forms.
+
+## Upgrading an existing appliance
+
+Pull the new checkout and upgrade in place — no firmware argument, and the
+appliance's configuration is kept:
+
+```sh
+./install-zd1200-docker.sh --upgrade          # Docker
+./install-zd1200-lxc.sh --upgrade             # Proxmox: finds the container it made
+./install-zd1200-lxc.sh --upgrade --ctid 120  # ... or name it
+```
+
+`--root-ssh-key` replaces the provisioned key; without it the existing key is
+kept. This does **not** change the firmware. To move to a different firmware
+release, reset the state first (see [Clean state](#clean-state)).
 
 ## Reach the appliance
 

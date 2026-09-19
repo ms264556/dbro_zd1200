@@ -2,8 +2,8 @@
 #
 # 20-signing-license.sh — bake the ZD1200 image-signing bypass and upgrade
 # entitlement into the lab VM rootfs partitions (hda2/hda3), writing the
-# result into the flat disk.  Runs as a standard user: no root, no
-# loop devices, no nbd, no mount.
+# result into the flat disk.  Runs as a standard user: no root, no loop
+# devices, no nbd, no mount.
 #
 # This applies the sys_wrapper.sh patch from the create_zd1200_signing_bypass
 # persist.sh verbatim (it already works on real ZD boxes), minus the
@@ -32,12 +32,19 @@
 # from the ZD firmware archive.  It must contain signing_cert.pem +
 # digital_sig_sha256.bin + digital_sig_sha384.bin + all_checksums.txt (packed
 # into cert.tgz exactly like the create_zd1200_signing_bypass tool does).
+#
+# Re-patching: /bin/sys_wrapper.sh and the patch-storage payload are recorded in
+# the root's /.patchrollback store by write_local, so the pristine vendor
+# sys_wrapper.sh is restored before a changed patch set is re-applied (see
+# scripts/container/patch-lib.sh).
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QCOW="${QCOW:-$BASE/synthetic-cf.img}"
 WORK="${WORK:-$BASE/.rootfs-patch-work}"
 ALIGN=512
+# shellcheck source=../patch-lib.sh
+. "$(dirname "$BASE")/patch-lib.sh"
 
 CERT_DIR="${1:-$(dirname "$BASE")/image/signing-cert}"
 
@@ -62,8 +69,6 @@ for c in signing_cert.pem digital_sig_sha256.bin digital_sig_sha384.bin all_chec
 done
 
 rm -rf "$WORK"; mkdir -p "$WORK"
-
-say() { printf '\n== %s\n' "$*"; }
 
 say "reading the flat disk $QCOW"
 ln -sf "$QCOW" "$WORK/flat.raw"
@@ -134,56 +139,31 @@ patched_any=0
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     say "[$name] extracting partition (sector $start, ${sectors}s)"
-    dd if="$WORK/flat.raw" of="$WORK/$name.img" bs=$ALIGN skip="$start" count="$sectors" status=none
-    cp "$WORK/$name.img" "$WORK/$name.orig.img"
+    extract_part "$name" "$start" "$sectors"
+    snapshot_orig "$name"
+    IMG="$WORK/$name.img"
+    pr_init "$IMG"
 
-    # inode metadata preservation (debugfs rm+write resets mode/uid/gid)
-    stat_meta() { debugfs -R "stat $1" "$WORK/$name.img" 2>/dev/null \
-        | awk '{ for (i = 1; i <= NF; i++) {
-                     if ($i == "Type:")  t = $(i+1)
-                     else if ($i == "Mode:")  m = $(i+1)
-                     else if ($i == "User:")  u = $(i+1)
-                     else if ($i == "Group:") g = $(i+1)
-                 }} END { print t, m, u, g }'; }
-
-    replace_file() { # $1 = fspath, $2 = local new content
-        local fspath="$1" local_new="$2"
-        local type_old mode_old uid_old gid_old
-        read -r type_old mode_old uid_old gid_old <<< "$(stat_meta "$fspath")"
-        printf 'rm %s\nwrite %s %s\n' "$fspath" "$local_new" "$fspath" > "$WORK/cmds.txt"
-        debugfs -w -f "$WORK/cmds.txt" "$WORK/$name.img" 2>/dev/null
-        if [ "$type_old" = "regular" ]; then
-            debugfs -w -R "set_inode_field $fspath mode 010$mode_old" "$WORK/$name.img" >/dev/null 2>&1 || true
-        else
-            echo "  !! $fspath is not a regular file; aborting" >&2; exit 1
-        fi
-        debugfs -w -R "set_inode_field $fspath uid $uid_old" "$WORK/$name.img" >/dev/null 2>&1 || true
-        debugfs -w -R "set_inode_field $fspath gid $gid_old" "$WORK/$name.img" >/dev/null 2>&1 || true
-        read -r type_new mode_new uid_new gid_new <<< "$(stat_meta "$fspath")"
-        if [ "$type_old" != "$type_new" ] || [ "$mode_old" != "$mode_new" ] \
-           || [ "$uid_old" != "$uid_new" ] || [ "$gid_old" != "$gid_new" ]; then
-            echo "  !! inode metadata mismatch for $fspath; aborting" >&2; exit 1
-        fi
-    }
+    part_changed=0
 
     # ---- 1. /bin/sys_wrapper.sh ----
     say "[$name] patching /bin/sys_wrapper.sh"
-    if ! debugfs -R "dump /bin/sys_wrapper.sh $WORK/sys_wrapper.orig" "$WORK/$name.img" 2>/dev/null \
-       || [ ! -s "$WORK/sys_wrapper.orig" ]; then
+    if ! fs_read "$IMG" /bin/sys_wrapper.sh "$WORK/sys_wrapper.orig"; then
         echo "  ! /bin/sys_wrapper.sh not present, skipping partition" >&2
         continue
     fi
     # Either marker proves the sed already ran: the entitlement shortcuts always
     # insert theirs, and check_sign_cert() inserts its own on cert-bearing
-    # releases.  Checking both keeps this idempotent even for a release that has
-    # only one of the two case sets.
+    # releases.  The pipeline restores the pristine file before it re-applies a
+    # changed set, so this is a belt-and-braces check for a direct run.
     if grep -q '^verify-upload-support-unpatched)' "$WORK/sys_wrapper.orig" \
        || grep -q '^check_sign_cert_unpatched()' "$WORK/sys_wrapper.orig"; then
         echo "  /bin/sys_wrapper.sh already patched (nothing to do)"
     else
         sed -f "$WORK/sys_wrapper.sed" "$WORK/sys_wrapper.orig" > "$WORK/sys_wrapper.new"
         diff -u "$WORK/sys_wrapper.orig" "$WORK/sys_wrapper.new" | sed 's/^/    /' || true
-        replace_file /bin/sys_wrapper.sh "$WORK/sys_wrapper.new"
+        write_local "$IMG" /bin/sys_wrapper.sh "$WORK/sys_wrapper.new"
+        part_changed=1
     fi
 
     # ---- 2. /etc/persistent-scripts/patch-storage/ payload ----
@@ -198,48 +178,23 @@ for part in "${PARTITIONS[@]}"; do
 EOF
     ( cd "$WORK" && tar -czf support.spt support )
 
-    debugfs -w -R "mkdir /etc/persistent-scripts/patch-storage" "$WORK/$name.img" 2>/dev/null || true
-    : > "$WORK/cmds2.txt"
+    mkdir_p "$IMG" /etc/persistent-scripts/patch-storage
     storage_files=(support support.spt)
     [ "$have_cert" = 1 ] && storage_files+=(cert.tgz)
     for f in "${storage_files[@]}"; do
-        debugfs -w -R "rm /etc/persistent-scripts/patch-storage/$f" "$WORK/$name.img" >/dev/null 2>&1 || true
-        printf 'write %s /etc/persistent-scripts/patch-storage/%s\n' "$WORK/$f" "$f" >> "$WORK/cmds2.txt"
+        write_local "$IMG" "/etc/persistent-scripts/patch-storage/$f" "$WORK/$f"
+        part_changed=1
     done
-    debugfs -w -f "$WORK/cmds2.txt" "$WORK/$name.img" 2>/dev/null
 
-    # ---- delta: only changed 512-byte blocks reach the disk ----
-    say "[$name] writing changed blocks into the disk"
-    python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
-import sys
-orig = open(sys.argv[1], 'rb').read()
-new  = open(sys.argv[2], 'rb').read()
-al   = int(sys.argv[3])
-assert len(orig) == len(new), "partition size changed"
-blocks = [i for i in range(0, len(orig), al) if orig[i:i + al] != new[i:i + al]]
-runs = []
-for b in blocks:
-    if runs and b == runs[-1][1]:
-        runs[-1] = (runs[-1][0], b + al)
-    else:
-        runs.append((b, b + al))
-for s, e in runs:
-    print(s, e - s)
-PYEOF
-
-    if [ ! -s "$WORK/$name.runs" ]; then
-        echo "  no byte changes (already patched on the disk?)"
+    if [ "$part_changed" = 0 ]; then
+        echo "  no byte changes for $name"
         continue
     fi
-    abs_start=$((start * ALIGN))
-    while read -r off len; do
-        dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
-           skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
-        abs_off=$((abs_start + off))
-        echo "  write: $len bytes at offset $abs_off"
-        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN seek=$((abs_off / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
-    done < "$WORK/$name.runs"
-    patched_any=1
+    if write_deltas "$name" "$start"; then
+        patched_any=1
+    else
+        echo "  no byte changes for $name (already patched on the disk?)"
+    fi
 done
 
 if [ "$patched_any" = 0 ]; then

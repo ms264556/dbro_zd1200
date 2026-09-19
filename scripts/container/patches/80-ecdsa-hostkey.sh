@@ -28,6 +28,8 @@ BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
 WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
+# shellcheck source=../patch-lib.sh
+. "$(dirname "$BASE")/patch-lib.sh"
 
 INIT_TARGET="/etc/init.d/dropbear"
 INIT_BACKUP="/etc/init.d/dropbear.vendor"
@@ -49,7 +51,6 @@ case "${ZD_ECDSA_SSH:-1}" in
 esac
 
 rm -rf "$WORK"; mkdir -p "$WORK"
-say() { printf '\n== %s\n' "$*"; }
 if [ "$ecdsa_enabled" = 1 ]; then
     say "ECDSA host key: ENABLED"
 else
@@ -85,86 +86,15 @@ exit 0
 ZD_ECDSA_KEYGEN
 chmod 755 "$WORK/S59zd_ecdsa_hostkey"
 
-stat_meta() {
-    debugfs -R "stat $2" "$1" 2>/dev/null \
-        | awk '{ for (i = 1; i <= NF; i++) {
-                     if ($i == "Type:")  t = $(i+1)
-                     else if ($i == "Mode:")  m = $(i+1)
-                     else if ($i == "User:")  u = $(i+1)
-                     else if ($i == "Group:") g = $(i+1)
-                 }} END { if (t != "") print t, m, u, g }'
-}
-
-write_local() {
-    local img="$1" fspath="$2" localfile="$3"
-    local dmode="${4:-0644}" duid="${5:-0}" dgid="${6:-0}"
-    local t m u g mode_field
-    read -r t m u g <<< "$(stat_meta "$img" "$fspath")"
-    if [ -z "$t" ]; then
-        m="$dmode"; u="$duid"; g="$dgid"
-    elif [ "$t" != "regular" ]; then
-        echo "  ! $fspath was not a regular file (type '$t'); replacing it" >&2
-        m="$dmode"; u="$duid"; g="$dgid"
-    fi
-    mode_field="$(printf '010%04o' "$(( 0$m & 07777 ))")"
-    printf 'rm %s\nwrite %s %s\n' "$fspath" "$localfile" "$fspath" > "$WORK/cmds.$$"
-    debugfs -w -f "$WORK/cmds.$$" "$img" >/dev/null 2>&1
-    rm -f "$WORK/cmds.$$"
-    debugfs -w -R "set_inode_field $fspath mode $mode_field" "$img" >/dev/null 2>&1 || true
-    debugfs -w -R "set_inode_field $fspath uid $u" "$img" >/dev/null 2>&1 || true
-    debugfs -w -R "set_inode_field $fspath gid $g" "$img" >/dev/null 2>&1 || true
-    if ! debugfs -R "dump $fspath $WORK/verify.$$" "$img" >/dev/null 2>&1 \
-       || ! cmp -s "$WORK/verify.$$" "$localfile"; then
-        echo "  !! content verification failed for $fspath; aborting" >&2
-        rm -f "$WORK/verify.$$"
-        return 1
-    fi
-    rm -f "$WORK/verify.$$"
-    return 0
-}
-
-rm_path() { debugfs -w -R "rm $2" "$1" >/dev/null 2>&1 || true; }
-
-write_deltas() {
-    local name="$1" start="$2" off len abs_start
-    python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
-import sys
-orig = open(sys.argv[1], 'rb').read()
-new  = open(sys.argv[2], 'rb').read()
-al   = int(sys.argv[3])
-assert len(orig) == len(new), "partition size changed"
-blocks = [i for i in range(0, len(orig), al) if orig[i:i + al] != new[i:i + al]]
-runs = []
-for b in blocks:
-    if runs and b == runs[-1][1]:
-        runs[-1] = (runs[-1][0], b + al)
-    else:
-        runs.append((b, b + al))
-for s, e in runs:
-    print(s, e - s)
-PYEOF
-    if [ ! -s "$WORK/$name.runs" ]; then
-        return 1
-    fi
-    abs_start=$((start * ALIGN))
-    while read -r off len; do
-        dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
-           skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
-        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN \
-           seek=$(((abs_start + off) / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
-    done < "$WORK/$name.runs"
-    return 0
-}
-
 install_ecdsa() {
     local img="$1"
     write_local "$img" "$KEYGEN_TARGET" "$WORK/S59zd_ecdsa_hostkey" 0755
 
-    if [ -z "$(stat_meta "$img" "$INIT_TARGET")" ]; then
+    if [ -z "$(fs_stat_meta "$img" "$INIT_TARGET")" ]; then
         echo "  ! $INIT_TARGET missing; only the key generator was installed" >&2
         return 0
     fi
-    if [ -n "$(stat_meta "$img" "$INIT_BACKUP")" ]; then
+    if [ -n "$(fs_stat_meta "$img" "$INIT_BACKUP")" ]; then
         debugfs -R "dump $INIT_BACKUP $WORK/dropbear-init.pristine" "$img" >/dev/null 2>&1
     else
         debugfs -R "dump $INIT_TARGET $WORK/dropbear-init.current" "$img" >/dev/null 2>&1
@@ -191,17 +121,17 @@ install_ecdsa() {
 revert_ecdsa() {
     local img="$1" installed=0 f
     for f in "$KEYGEN_TARGET" "$INIT_BACKUP"; do
-        [ -n "$(stat_meta "$img" "$f")" ] && installed=1
+        [ -n "$(fs_stat_meta "$img" "$f")" ] && installed=1
     done
     [ "$installed" = 1 ] || return 0
-    if [ -n "$(stat_meta "$img" "$INIT_BACKUP")" ]; then
+    if [ -n "$(fs_stat_meta "$img" "$INIT_BACKUP")" ]; then
         debugfs -R "dump $INIT_BACKUP $WORK/dropbear-init.restore" "$img" >/dev/null 2>&1
         if [ -s "$WORK/dropbear-init.restore" ]; then
             write_local "$img" "$INIT_TARGET" "$WORK/dropbear-init.restore" 0755
         fi
     fi
-    rm_path "$img" "$INIT_BACKUP"
-    rm_path "$img" "$KEYGEN_TARGET"
+    remove_path "$img" "$INIT_BACKUP"
+    remove_path "$img" "$KEYGEN_TARGET"
 }
 
 say "reading the flat disk $QCOW"
@@ -211,8 +141,10 @@ patched_any=0
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     say "[$name] extracting partition (sector $start, ${sectors}s)"
-    dd if="$WORK/flat.raw" of="$WORK/$name.img" bs=$ALIGN skip="$start" count="$sectors" status=none
-    cp "$WORK/$name.img" "$WORK/$name.orig.img"
+    extract_part "$name" "$start" "$sectors"
+    snapshot_orig "$name"
+    IMG="$WORK/$name.img"
+    pr_init "$IMG"
 
     if [ "$ecdsa_enabled" = 1 ]; then
         say "[$name] adding the ECDSA host key"
@@ -247,7 +179,7 @@ for part in "${PARTITIONS[@]}"; do
         exit 1
     fi
     if [ "$ecdsa_enabled" = 1 ]; then
-        read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" "$KEYGEN_TARGET")"
+        read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$KEYGEN_TARGET")"
         [ "$t" = "regular" ] || { echo "FAIL $name: $KEYGEN_TARGET missing" >&2; exit 1; }
         debugfs -R "dump $INIT_TARGET $WORK/init.check" "$WORK/$name.verify.img" >/dev/null 2>&1
         if grep -q -- "$ECDSA_KEY" "$WORK/init.check"; then

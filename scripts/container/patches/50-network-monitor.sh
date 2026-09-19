@@ -49,6 +49,8 @@ ANALYTICS_DIR="${ANALYTICS_DIR:-$(dirname "$BASE")/analytics}"
 # changing it re-customises the roots.
 ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
 ALIGN=512
+# shellcheck source=../patch-lib.sh
+. "$(dirname "$BASE")/patch-lib.sh"
 
 if [ "$ZD_NETWORK_MONITOR" = "0" ]; then
     echo "50-network-monitor: disabled (ZD_NETWORK_MONITOR=0); nothing to install"
@@ -138,70 +140,10 @@ fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-say() { printf '\n== %s\n' "$*"; }
-
-# --- ext2 helpers (identical approach to the other rootfs patches) -----------
-stat_meta() {
-    debugfs -R "stat $2" "$1" 2>/dev/null \
-        | awk '{ for (i = 1; i <= NF; i++) {
-                     if ($i == "Type:")  t = $(i+1)
-                     else if ($i == "Mode:")  m = $(i+1)
-                     else if ($i == "User:")  u = $(i+1)
-                     else if ($i == "Group:") g = $(i+1)
-                 }} END { if (t != "") print t, m, u, g }'
-}
-
-# write_local <img> <fspath> <localfile> [mode] [uid] [gid]
-# debugfs 'write' creates mode 0644 uid/gid 0, so preserve the metadata of an
-# existing target (or apply the given defaults for a new one) and verify the
-# content round-trips before it can reach the disk.
-write_local() {
-    local img="$1" fspath="$2" localfile="$3"
-    local dmode="${4:-0644}" duid="${5:-0}" dgid="${6:-0}"
-    local t m u g mode_field
-    read -r t m u g <<< "$(stat_meta "$img" "$fspath")"
-    if [ -z "$t" ]; then
-        m="$dmode"; u="$duid"; g="$dgid"
-    elif [ "$t" != "regular" ]; then
-        echo "  ! $fspath was not a regular file (type '$t'); replacing it" >&2
-        m="$dmode"; u="$duid"; g="$dgid"
-    fi
-    # debugfs 'write' lands as mode 0644 uid/gid 0 and debugfs wants the whole
-    # 16-bit mode, so rebuild S_IFREG | permission-bits (0100000 | 0755 = 0100755).
-    mode_field="$(printf '010%04o' "$(( 0$m & 07777 ))")"
-    printf 'rm %s\nwrite %s %s\n' "$fspath" "$localfile" "$fspath" > "$WORK/cmds.$$"
-    debugfs -w -f "$WORK/cmds.$$" "$img" >/dev/null 2>&1
-    rm -f "$WORK/cmds.$$"
-    debugfs -w -R "set_inode_field $fspath mode $mode_field" "$img" >/dev/null 2>&1 || true
-    debugfs -w -R "set_inode_field $fspath uid $u" "$img" >/dev/null 2>&1 || true
-    debugfs -w -R "set_inode_field $fspath gid $g" "$img" >/dev/null 2>&1 || true
-    if ! debugfs -R "dump $fspath $WORK/verify.$$" "$img" >/dev/null 2>&1 \
-       || ! cmp -s "$WORK/verify.$$" "$localfile"; then
-        echo "  !! content verification failed for $fspath; aborting" >&2
-        rm -f "$WORK/verify.$$"
-        return 1
-    fi
-    rm -f "$WORK/verify.$$"
-    return 0
-}
-
-mkdir_p() {
-    local img="$1" path="$2" p="" part
-    local IFS='/'
-    for part in $path; do
-        [ -n "$part" ] || continue
-        p="$p/$part"
-        [ -n "$(stat_meta "$img" "$p")" ] && continue
-        debugfs -w -R "mkdir $p" "$img" >/dev/null 2>&1 || true
-    done
-}
-
-# symlink_force <img> <linkpath> <target>  (replaces a file or symlink)
-symlink_force() {
-    local img="$1" link="$2" target="$3"
-    debugfs -w -R "rm $link" "$img" >/dev/null 2>&1 || true
-    debugfs -w -R "symlink $link $target" "$img" >/dev/null 2>&1
-}
+# The ext2/store helpers (fs_stat_meta, write_local, mkdir_p, symlink_force,
+# write_deltas) come from patch-lib.sh: every file this patch
+# replaces is kept in the root's /.patchrollback store and every file it creates
+# is recorded, so a changed patch set can be re-applied from the vendor rootfs.
 
 # ui_layout_of <img>  -> "<flavor>|<webroot>"
 #   10       : 10.x admin console, /web/admin10, webpack bundles in /web/build
@@ -210,11 +152,11 @@ symlink_force() {
 #   9classic : 9.9-9.11 classic console, /web/admin, menu compiled into
 #              admin_template.mod (patched through a DOM hook in scripts/util.js)
 ui_layout_of() {
-    if [ -n "$(stat_meta "$1" /web/admin10)" ]; then
+    if [ -n "$(fs_stat_meta "$1" /web/admin10)" ]; then
         echo "10|/web/admin10"
-    elif [ -n "$(stat_meta "$1" /web/admin/edison/js/common/systemMenu.js)" ]; then
+    elif [ -n "$(fs_stat_meta "$1" /web/admin/edison/js/common/systemMenu.js)" ]; then
         echo "9edison|/web/admin"
-    elif [ -n "$(stat_meta "$1" /web/admin)" ]; then
+    elif [ -n "$(fs_stat_meta "$1" /web/admin)" ]; then
         echo "9classic|/web/admin"
     else
         echo "10|/web/admin10"
@@ -488,44 +430,11 @@ process_bundle() {
         fi
     fi
     write_local "$img" "$relpath" "$localfile"
-    if [ -n "$(stat_meta "$img" "$relpath.gz")" ]; then
+    if [ -n "$(fs_stat_meta "$img" "$relpath.gz")" ]; then
         gzip -9 -c "$localfile" > "$gz"
         write_local "$img" "$relpath.gz" "$gz"
     fi
     echo "  patched $relpath"
-    return 0
-}
-
-# --- delta write (only changed 512-byte blocks reach the disk) ---------------
-# Returns 0 when bytes were written, 1 when the partition was unchanged.
-write_deltas() {
-    local name="$1" start="$2" off len abs_start
-    python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
-import sys
-orig = open(sys.argv[1], 'rb').read()
-new  = open(sys.argv[2], 'rb').read()
-al   = int(sys.argv[3])
-assert len(orig) == len(new), "partition size changed"
-blocks = [i for i in range(0, len(orig), al) if orig[i:i + al] != new[i:i + al]]
-runs = []
-for b in blocks:
-    if runs and b == runs[-1][1]:
-        runs[-1] = (runs[-1][0], b + al)
-    else:
-        runs.append((b, b + al))
-for s, e in runs:
-    print(s, e - s)
-PYEOF
-    if [ ! -s "$WORK/$name.runs" ]; then
-        return 1
-    fi
-    abs_start=$((start * ALIGN))
-    while read -r off len; do
-        dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
-           skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
-        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN \
-           seek=$(((abs_start + off) / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
-    done < "$WORK/$name.runs"
     return 0
 }
 
@@ -537,8 +446,10 @@ menu_missing=0
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     say "[$name] extracting partition (sector $start, ${sectors}s)"
-    dd if="$WORK/flat.raw" of="$WORK/$name.img" bs=$ALIGN skip="$start" count="$sectors" status=none
-    cp "$WORK/$name.img" "$WORK/$name.orig.img"
+    extract_part "$name" "$start" "$sectors"
+    snapshot_orig "$name"
+    IMG="$WORK/$name.img"
+    pr_init "$IMG"
 
     say "[$name] installing the Network Monitor payload"
     mkdir_p "$WORK/$name.img" /usr/local/sbin
@@ -555,7 +466,7 @@ for part in "${PARTITIONS[@]}"; do
     # A private copy of the vendor busybox gives the collectors a stable
     # /usr/local/sbin/busybox with the applets they use (the stock root has no
     # standalone sed/awk utilities, only the multicall /bin/busybox).
-    if [ -z "$(stat_meta "$WORK/$name.img" /bin/busybox)" ]; then
+    if [ -z "$(fs_stat_meta "$WORK/$name.img" /bin/busybox)" ]; then
         echo "  ! $name: /bin/busybox missing; the collectors will need it" >&2
     else
         debugfs -R "dump /bin/busybox $WORK/busybox" "$WORK/$name.img" >/dev/null 2>&1
@@ -585,9 +496,9 @@ for part in "${PARTITIONS[@]}"; do
             "$WORK/ping-monitor-defaults.conf" 0644
     else
         # No defaults configured any more: drop a file an earlier build installed,
-        # so a fresh /writable is never seeded from a stale image.
-        debugfs -w -R "rm /etc/zd1200-ping-monitor-defaults.conf" \
-            "$WORK/$name.img" >/dev/null 2>&1 || true
+        # so a fresh /writable is never seeded from a stale image.  remove_path
+        # records it for rollback first.
+        remove_path "$WORK/$name.img" /etc/zd1200-ping-monitor-defaults.conf
     fi
 
     say "[$name] linking the monitor data endpoints into $WEB_ROOT"
@@ -626,7 +537,7 @@ for part in "${PARTITIONS[@]}"; do
             fi
             # 9.13 also ships the classic console, and that is what login.jsp
             # lands on (dashboard.jsp), so add the classic menu hook as well.
-            if [ -n "$(stat_meta "$WORK/$name.img" /web/admin/admin_template.mod)" ]; then
+            if [ -n "$(fs_stat_meta "$WORK/$name.img" /web/admin/admin_template.mod)" ]; then
                 say "[$name] adding the Network Monitor menu entry (classic console)"
                 if ! install_classic_menu "$WORK/$name.img" "$WEB_ROOT" \
                    || ! grep -q 'zd1200NetworkMonitorControl' "$WORK/util.patched" 2>/dev/null; then
@@ -671,12 +582,12 @@ for part in "${PARTITIONS[@]}"; do
     for bin in zd1200-ping-monitor zd1200-ping-export zd1200-local-getstat \
                zd1200-network-snapshot-collect zd1200-snapshot-index-publish \
                zd1200-ping-daily-publish zd1200-ping-monitor-settings-sync; do
-        read -r t _ u g <<< "$(stat_meta "$WORK/$name.verify.img" "/usr/local/sbin/$bin")"
+        read -r t _ u g <<< "$(fs_stat_meta "$WORK/$name.verify.img" "/usr/local/sbin/$bin")"
         [ "$t" = "regular" ] || { echo "FAIL $name: /usr/local/sbin/$bin missing" >&2; exit 1; }
     done
-    read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" "$V_ROOT/zd1200-network-monitor.html")"
+    read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$V_ROOT/zd1200-network-monitor.html")"
     [ "$t" = "regular" ] || { echo "FAIL $name: monitor page missing" >&2; exit 1; }
-    read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" /etc/init.d/S99zd_ping_monitor)"
+    read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" /etc/init.d/S99zd_ping_monitor)"
     [ "$t" = "regular" ] || { echo "FAIL $name: collector init script missing" >&2; exit 1; }
     case "$V_FLAVOR" in
         10)
@@ -694,9 +605,9 @@ for part in "${PARTITIONS[@]}"; do
             else
                 echo "  ! $name: Edison menu entry not found after patch" >&2
             fi
-            read -r t _ _ _ <<< "$(stat_meta "$WORK/$name.verify.img" "$V_ROOT/edison/js/mon/zd1200NetworkMonitor.js")"
+            read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$V_ROOT/edison/js/mon/zd1200NetworkMonitor.js")"
             [ "$t" = "regular" ] || { echo "FAIL $name: Edison monitor module missing" >&2; exit 1; }
-            if [ -n "$(stat_meta "$WORK/$name.verify.img" /web/admin/admin_template.mod)" ]; then
+            if [ -n "$(fs_stat_meta "$WORK/$name.verify.img" /web/admin/admin_template.mod)" ]; then
                 debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$WORK/$name.verify.img" >/dev/null 2>&1
                 if grep -q 'zd1200NetworkMonitorControl' "$WORK/util.final" 2>/dev/null; then
                     echo "OK   $name: classic util.js carries the Network Monitor menu hook"

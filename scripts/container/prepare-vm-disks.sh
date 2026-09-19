@@ -4,20 +4,29 @@
 # customisations to the root partitions that need them.
 #
 # FLAT model: the synthetic CF image ($SYNTHETIC_DISK) *is* the live disk — there
-# is no qcow2 overlay.  Each root partition carries a sentinel, /etc/.zd-image,
-# holding the signature of the patch set applied to it.  On every start we read
-# each root's sentinel and customise only the roots that are missing it or were
-# done by an older patch set:
+# is no qcow2 overlay.  Each root partition carries a rollback store,
+# /.patchrollback/, holding the signature of the patch set applied to it and the
+# pristine vendor copy of every file the patches replaced (see
+# scripts/container/patch-lib.sh).  On every start we read each root's sentinel
+# and customise only the roots that are missing it or were done by an older
+# patch set:
 #
 #   * fresh disk             -> no sentinel, customise both roots
-#   * patch set changed      -> sentinel mismatch, re-customise
+#   * patch set changed      -> sentinel mismatch, restore the vendor rootfs from
+#                               the store and re-apply every patch
 #   * in-guest firmware upgrade writes a new rootfs onto the spare partition ->
 #     that root has no sentinel so it is customised; the untouched root is skipped
 #   * a rollback leaves both roots already customised -> nothing to do
 #
-# The kernel is applied to each root's *own* /bzImage, because the two roots can
-# hold different firmware builds (an upgrade writes its kernel into the target
-# root); the archive kernel is only installed when a root has none at all.
+# Restoring before re-applying is what makes an upgrade safe: a patch that has
+# been edited, or a new patch inserted in the order, always runs against the
+# vendor files rather than against the output of an earlier patch set.  /writable
+# (hda4) is never involved.
+#
+# The kernel is deliberately NOT in the rollback store: it is the largest file
+# and its transform is deterministic, so /bzImage is keyed on the hash of
+# patch-kernel.py instead (/.patchrollback/kernel).  A root already patched by
+# the same patcher is left alone.
 #
 # Env (all optional, defaults shown):
 #   STATE_DIR        scratch/state dir            ($BASE; entrypoint passes /var/lib/zd1200)
@@ -27,6 +36,7 @@
 #   PATCHES_DIR      the ordered patches          ($BASE/patches)
 #   ZD_SERIAL ZD_MAC1 ZD_MODEL ZD_CUSTOMER        board data (written when the disk is built)
 #   ZD_SIGN_CERT_DIR payload for the license/signing patch
+#   ZD_ALLOW_DISK_REBUILD=1  allow a rebuild that discards /writable
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,11 +63,19 @@ ZD_ECDSA_SSH="${ZD_ECDSA_SSH:-1}"
 ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
 MARKER="${MARKER:-$STATE_DIR/.disk-built}"
 SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}"
-SENTINEL=/etc/.zd-image
-
-say() { printf '\n== %s\n' "$*"; }
 
 SECTOR=512
+ALIGN=$SECTOR
+# shellcheck source=patch-lib.sh
+. "$BASE/patch-lib.sh"
+# patch-lib.sh's partition helpers use $QCOW; here the flat disk is $DISK.
+QCOW="$DISK"
+# The pre-rollback pipeline's sentinel.  Its presence means the root was
+# customised before /.patchrollback existed, so there is no pristine copy to
+# restore from; that combination is refused rather than silently re-patching an
+# already-patched rootfs.
+LEGACY_SENTINEL=/etc/.zd-image
+
 HDA1_START=62;     HDA1_SECTORS=84506
 HDA2_START=84568;  HDA2_SECTORS=415152
 HDA3_START=499720; HDA3_SECTORS=415152
@@ -75,11 +93,19 @@ done
 
 # --- signatures -------------------------------------------------------------
 rootfs_sig="$(sha256sum "$ROOTFS" | awk '{print $1}')"
-bootfs_sig="$( cd "$BASE" && { sha256sum "$BOOTFS_SRC" "$IMAGE_DIR/menu.lst" \
-    "$IMAGE_DIR/restoreinitramfs.ver" build-bootfs.py; } | sha256sum | awk '{print $1}')"
+# The vendor inputs that identify the firmware on the disk: the rootfs and the
+# boot files.  Only these decide a rebuild — not the scripts that consume them —
+# so a project update cannot make an existing appliance look like it needs its
+# whole disk (and /writable) rebuilt.
+vendor_sig="$(sha256sum "$ROOTFS" "$BOOTFS_SRC" "$IMAGE_DIR/menu.lst" \
+    "$IMAGE_DIR/restoreinitramfs.ver" "$IMAGE_DIR/bzImage" | sha256sum | awk '{print $1}')"
+kernel_sig="$(sha256sum "$BASE/patch-kernel.py" | awk '{print $1}')"
 patch_sig="$( {
     cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; \
         printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}'
+    printf 'patch-lib=%s\n' "$(sha256sum "$BASE/patch-lib.sh" | awk '{print $1}')"
+    printf 'patch-kernel=%s\n' "$kernel_sig"
+    printf 'rollback-format=%s\n' "$PR_FORMAT"
     if [ -d "$ANALYTICS_DIR" ]; then
         ( cd "$ANALYTICS_DIR" && find . -type f -print | LC_ALL=C sort | while read -r f; do
               printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'
@@ -107,16 +133,39 @@ rebuild=0; reason=""
 if [ ! -f "$DISK" ]; then
     rebuild=1; reason="no disk yet"
 else
-    stored_rootfs=""; stored_bootfs=""
+    stored_rootfs=""; stored_vendor=""
     if [ -f "$MARKER" ]; then
         stored_rootfs="$(sed -n 's/^rootfs=//p' "$MARKER")"
-        stored_bootfs="$(sed -n 's/^bootfs=//p' "$MARKER")"
+        stored_vendor="$(sed -n 's/^vendor=//p' "$MARKER")"
     fi
+    # stale_rootfs is written by every version; vendor= only by this one, so an
+    # existing marker without it is compared on the rootfs alone (its boot files
+    # are not part of the decision and must not trigger a rebuild).
     if   [ "$stored_rootfs" != "$rootfs_sig" ]; then rebuild=1; reason="base rootfs changed"
-    elif [ "$stored_bootfs" != "$bootfs_sig" ]; then rebuild=1; reason="bootfs inputs changed"
+    elif [ -n "$stored_vendor" ] && [ "$stored_vendor" != "$vendor_sig" ]; then
+        rebuild=1; reason="vendor boot files changed"
     fi
 fi
 if [ "$rebuild" = 1 ]; then
+    # Rebuilding replaces the whole CF image, including /writable — i.e. the
+    # appliance's configuration.  Never do that to an existing appliance by
+    # accident: it must be asked for explicitly (a factory reset), because the
+    # whole point of the rollback store is to upgrade without it.
+    if [ "$reason" != "no disk yet" ] && [ -f "$DISK" ] \
+       && [ "${ZD_ALLOW_DISK_REBUILD:-0}" != "1" ]; then
+        cat >&2 <<EOF
+prepare-vm-disks: the base firmware changed ($reason) and rebuilding the
+synthetic CF would discard /writable (the appliance's configuration).
+Refusing to rebuild an existing appliance.
+
+  * To upgrade the project's patches/firmware tooling, keep image/ unchanged and
+    re-run the installer with --upgrade (this only re-customises the roots).
+  * To accept a factory reset and rebuild from $IMAGE_DIR, remove the state
+    (Docker: docker compose --project-directory . -f docker/docker-compose.yml down -v;
+     Proxmox: pct exec <id> -- rm -rf $STATE_DIR) or set ZD_ALLOW_DISK_REBUILD=1.
+EOF
+        exit 1
+    fi
     say "Building the synthetic CF disk — $reason"
     rm -f "$DISK"
     SYNTHETIC_DISK="$DISK" ZD_R600_REPAIR="${ZD_R600_REPAIR:-1}" \
@@ -125,7 +174,7 @@ if [ "$rebuild" = 1 ]; then
     python3 "$BASE/write-boarddata.py" --disk "$DISK" \
         --serial "${ZD_SERIAL:-123456000789}" --mac "${ZD_MAC1:-00:0c:e6:12:00:01}" \
         --model "${ZD_MODEL:-ZD1200}" --customer "${ZD_CUSTOMER:-ruckus}"
-    printf 'rootfs=%s\nbootfs=%s\n' "$rootfs_sig" "$bootfs_sig" > "$MARKER"
+    printf 'rootfs=%s\nvendor=%s\n' "$rootfs_sig" "$vendor_sig" > "$MARKER"
 fi
 
 # --- repair the writable data partition if the last stop was not clean ------
@@ -171,9 +220,47 @@ fi
 # --- helpers ----------------------------------------------------------------
 is_ext2()  { [ "$(dd if="$1" bs=1 skip=1080 count=2 status=none 2>/dev/null \
                   | od -An -tx1 | tr -d ' ')" = "53ef" ]; }
-sentinel_of() { debugfs -R "cat $SENTINEL" "$1" 2>/dev/null | head -n1; }
-extract_part() { dd if="$DISK" of="$WORK/$1.img" bs=$SECTOR skip="$2" count="$3" status=none; }
-write_part()   { dd if="$WORK/$1.img" of="$DISK" bs=$SECTOR seek="$2" count="$3" conv=notrunc status=none; }
+sentinel_of()        { debugfs -R "cat $PR_SENTINEL" "$1" 2>/dev/null | head -n1; }
+legacy_sentinel_of() { debugfs -R "cat $LEGACY_SENTINEL" "$1" 2>/dev/null | head -n1; }
+
+# apply_kernel <name>: leave the root's own /bzImage carrying the QEMU patches,
+# recording which kernel patcher did it.  Idempotent by marker, because
+# patch-kernel.py's signatures describe the *stock* bytes and cannot recognise an
+# already-patched kernel.
+apply_kernel() {
+    local name="$1" img="$WORK/$name.img" have=""
+    have="$(debugfs -R "cat $PR_KERNEL" "$img" 2>/dev/null | head -n1 || true)"
+    if [ "$have" = "$kernel_sig" ]; then
+        say "[$name] /bzImage already carries the QEMU patches; leaving it"
+        return 0
+    fi
+    say "[$name] applying the QEMU kernel patch"
+    # The vendor install drops the archive kernel at /bzImage in the root it
+    # writes; a guest firmware upgrade drops *its* kernel there.  Patch whatever
+    # kernel the root already carries, and install the archive kernel only when a
+    # root has none at all.
+    if ! fs_read "$img" /bzImage "$WORK/$name.kernel"; then
+        say "[$name] no /bzImage in this root; installing the archive kernel"
+        cp "$IMAGE_DIR/bzImage" "$WORK/$name.kernel"
+    fi
+    rm -f "$WORK/$name.kernel.patched"
+    if ! python3 "$BASE/patch-kernel.py" --in "$WORK/$name.kernel" \
+            --out "$WORK/$name.kernel.patched" >"$WORK/$name.patch-kernel.log" 2>&1; then
+        echo "prepare-vm-disks: the kernel patcher failed for $name:" >&2
+        tail -25 "$WORK/$name.patch-kernel.log" >&2 || true
+        exit 1
+    fi
+    if [ -s "$WORK/$name.kernel.patched" ] \
+       && ! cmp -s "$WORK/$name.kernel" "$WORK/$name.kernel.patched"; then
+        debugfs -w -R "rm /bzImage" "$img" 2>/dev/null || true
+        debugfs -w -R "write $WORK/$name.kernel.patched /bzImage" "$img"
+        say "[$name] /bzImage patched"
+    else
+        say "[$name] /bzImage already carries the QEMU patches; leaving it"
+    fi
+    printf '%s\n' "$kernel_sig" > "$WORK/kernel.sig"
+    fs_write "$img" "$PR_KERNEL" "$WORK/kernel.sig" 0644 0 0
+}
 
 # --- which root partitions need (re)customising? ----------------------------
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -188,10 +275,32 @@ for part in "${ROOT_PARTS[@]}"; do
     have="$(sentinel_of "$WORK/$name.img")"
     if [ "$have" = "$patch_sig" ]; then
         say "[$name] already customised (sentinel $patch_sig); skipping"
+        continue
+    fi
+    if ! pr_has_store "$WORK/$name.img" && [ -n "$(legacy_sentinel_of "$WORK/$name.img")" ]; then
+        cat >&2 <<EOF
+prepare-vm-disks: [$name] was customised by an older version of this project
+(sentinel $LEGACY_SENTINEL) and has no /.patchrollback store, so the pristine
+vendor files cannot be restored before re-applying the changed patch set.
+
+This build cannot upgrade that rootfs in place.  Reset the state and install
+again from a firmware image (Docker: docker compose --project-directory .
+-f docker/docker-compose.yml down -v; Proxmox: pct exec <id> -- rm -rf $STATE_DIR
+then re-run the installer).
+EOF
+        exit 1
+    fi
+    if pr_has_store "$WORK/$name.img"; then
+        # The patch set changed: put the vendor files back first, so every patch
+        # runs against the rootfs it was written for.
+        say "[$name] patch set changed (sentinel: ${have:-<none>}); restoring the vendor rootfs"
+        snapshot_orig "$name"
+        pr_reset "$WORK/$name.img"
+        write_deltas "$name" "$start" || true
     else
         say "[$name] needs customising (sentinel: ${have:-<none>})"
-        patch_parts+=("$part")
     fi
+    patch_parts+=("$part")
 done
 
 if [ ${#patch_parts[@]} -eq 0 ]; then
@@ -199,29 +308,14 @@ if [ ${#patch_parts[@]} -eq 0 ]; then
     exit 0
 fi
 
-# --- apply the QEMU kernel patch to each root's own /bzImage -----------------
-# The vendor install drops the archive kernel at /bzImage in the root it writes;
-# a guest firmware upgrade drops *its* kernel there.  Patch whatever kernel the
-# root already carries, and only install the archive kernel when a root has none.
+# --- apply the QEMU kernel patch and seed the store on each such root --------
 for part in "${patch_parts[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] applying the QEMU kernel patch"
-    debugfs -R "dump /bzImage $WORK/$name.kernel" "$WORK/$name.img" 2>/dev/null || true
-    if [ ! -s "$WORK/$name.kernel" ]; then
-        say "[$name] no /bzImage in this root; installing the archive kernel"
-        cp "$IMAGE_DIR/bzImage" "$WORK/$name.kernel"
-    fi
-    python3 "$BASE/patch-kernel.py" --in "$WORK/$name.kernel" \
-        --out "$WORK/$name.kernel.patched" >"$WORK/$name.patch-kernel.log" 2>&1 || true
-    if [ -s "$WORK/$name.kernel.patched" ] \
-        && ! cmp -s "$WORK/$name.kernel" "$WORK/$name.kernel.patched"; then
-        debugfs -w -R "rm /bzImage" "$WORK/$name.img" 2>/dev/null || true
-        debugfs -w -R "write $WORK/$name.kernel.patched /bzImage" "$WORK/$name.img"
-        write_part "$name" "$start" "$sectors"
-        say "[$name] /bzImage patched"
-    else
-        say "[$name] /bzImage already carries the QEMU patches; leaving it"
-    fi
+    extract_part "$name" "$start" "$sectors"
+    snapshot_orig "$name"
+    pr_init "$WORK/$name.img"
+    apply_kernel "$name"
+    write_deltas "$name" "$start" || true
 done
 
 # --- run the ordered customisation patches (they read/rewrite the flat disk) -
@@ -240,14 +334,16 @@ for patch in "$PATCHES_DIR"/*.sh; do
 done
 
 # --- stamp each customised root with the sentinel ---------------------------
-mkdir -p "$WORK"
 for part in "${patch_parts[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     extract_part "$name" "$start" "$sectors"
+    snapshot_orig "$name"
+    pr_init "$WORK/$name.img"
     printf '%s\n' "$patch_sig" > "$WORK/sentinel.$name"
-    debugfs -w -R "rm $SENTINEL" "$WORK/$name.img" 2>/dev/null || true
-    debugfs -w -R "write $WORK/sentinel.$name $SENTINEL" "$WORK/$name.img"
-    write_part "$name" "$start" "$sectors"
+    fs_write "$WORK/$name.img" "$PR_SENTINEL" "$WORK/sentinel.$name" 0644 0 0
+    # Drop the old pipeline's sentinel if this root somehow carries one.
+    debugfs -w -R "rm $LEGACY_SENTINEL" "$WORK/$name.img" >/dev/null 2>&1 || true
+    write_deltas "$name" "$start" || true
     say "[$name] sentinel written"
 done
 

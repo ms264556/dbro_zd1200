@@ -42,6 +42,9 @@ there rather than continuing.
 | *(Proxmox)* `Unsupported NIC model: igb` | the container's QEMU is too old for the guest's NIC. Use a Debian 13 template; the installer checks this before provisioning |
 | *(Proxmox)* installer refuses the template | it is not Debian 13. The installer fetches Debian 13 when none is present |
 | *(Proxmox)* `could not install QEMU in container <id>` | the container has no working outbound network for apt |
+| `refusing to rebuild an existing appliance` (the base firmware changed) | `image/` no longer matches what the disk was built from, and rebuilding would discard `/writable`. Put the old `image/` back, or upgrade with `--upgrade` (which never re-prepares `image/`), or accept a factory reset (see [Clean state](../README.md#clean-state)) / set `ZD_ALLOW_DISK_REBUILD=1` |
+| `was customised by an older version ... no /.patchrollback store` | the rootfs was patched before the rollback store existed, so it cannot be re-patched safely. Reset the state and install again from firmware |
+| `the kernel patcher failed for hda2/hda3` | the kernel no longer matches `patch-kernel.py` (unexpected firmware, or a kernel patch set that changed after the root was built). The tail of the log is printed; a kernel patch-set change needs a factory reset |
 
 ## Problems reaching the appliance
 
@@ -63,6 +66,20 @@ there rather than continuing.
 | *(Proxmox)* the Console tab shows a `... login:` prompt, not the appliance | the console bridge is not on tty1. Check `pct exec <id> -- systemctl status zd1200-console-tty` and `journalctl -u zd1200-console-tty`. `container-getty@1` must be masked and `/tmp/zd1200-console.qemu.sock` must exist (i.e. QEMU is up). A console session opened *before* the bridge started is still attached to what was there; close and reopen the tab, or `pkill -f 'dtach -A /var/run/dtach/vzctlconsole<id>'` on the host |
 | *(Proxmox)* the Console tab is blank or shows old output | expected when the tab has been closed: the tty buffer is drained only while a client is attached, and the bridge drops output rather than stall the guest while nobody is. Press Enter and the guest reprints its prompt. The complete record is always `pct exec <id> -- tail -f /tmp/zd1200-console.log` |
 | *(Proxmox)* I want the container's own login prompt back | run the installer or bootstrap with `--no-console-tty`; tty1 returns to a getty and QEMU keeps binding the public console socket. `pct enter <id>` also gives a container shell without using a tty |
+
+## Upgrading
+
+`--upgrade` rebuilds the container/CT from the current checkout and re-customises
+the roots in place, keeping `/writable` and the provisioned keys. Docker:
+`./install-zd1200-docker.sh --upgrade`. Proxmox: `./install-zd1200-lxc.sh
+--upgrade` (it finds the container this installer made, or pass `--ctid`).
+
+| symptom | cause and fix |
+|---|---|
+| the upgrade finishes suspiciously fast | expected if the patch signature is unchanged: the start reads the two sentinels and does nothing. It only re-customises after a patch, feature or environment value changes |
+| after an upgrade the guest boots but a change is missing | check `pct exec <id> -- tail -50 /var/lib/zd1200/install.log` (Docker: `docker logs zd1200`). A patch that fails aborts the run rather than half-applying |
+| `--upgrade` says the container cannot be found | the container description marker is missing. Pass `--ctid <id>` explicitly |
+| root SSH stopped working after an upgrade | it should not: an existing `provision/authorized_keys` is reused. Check `pct exec <id> -- cat /var/lib/zd1200/provision/authorized_keys`; re-run with `--root-ssh-key <file>` to replace it deliberately |
 
 ## Slow, unhealthy or stuck
 

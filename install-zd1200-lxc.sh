@@ -28,6 +28,11 @@
 #   --start-on-boot / --no-start-on-boot
 #   --source PATH            firmware upgrade file or CF card dump (on the host,
 #                            or a file already in a PVE storage)
+#   --upgrade                upgrade an existing ZD1200 container in place: copy
+#                            the current checkout into it and re-customise the
+#                            roots from their rollback store, keeping /writable.
+#                            Takes no --source.  Uses --ctid to pick the
+#                            container, or finds the one this installer made.
 #   --writable-from PATH     take /writable + serial from a CF dump while the
 #                            kernel/rootfs come from --source firmware
 #   --writable-partition S:C override the detected dump geometry
@@ -38,12 +43,15 @@
 #                            one, the LAN bridge are asked for)
 #   --root-ssh-key PATH      enable public-key root SSH on TCP 2222 (slow: the
 #                            static dropbear replacement is built in the CT)
-#   --no-ecdsa               do not add the ECDSA host key to the SSH service
-#   --no-network-monitor     do not install the Network Monitor page
+#   --ecdsa / --no-ecdsa     add the ECDSA host key to the SSH service, or not.
+#                            On --upgrade the container's current setting is
+#                            kept unless one of these is given.
+#   --network-monitor / --no-network-monitor
+#                            install (or not) the Network Monitor page
 #   --no-r600-repair         do not patch the ap-11n-scorpion (R600) AP image
-#   --no-console-tty         leave /dev/tty1 as a login prompt instead of
-#                            showing the guest's serial console in the Proxmox
-#                            "Console" tab
+#   --console-tty / --no-console-tty
+#                            show the guest's serial console in the Proxmox
+#                            "Console" tab, or leave a login prompt there
 #   --keep-ct-address        keep the container's own IP address while the guest
 #                            runs (default: release it, so only the guest is on
 #                            the LAN and in the Proxmox Summary)
@@ -84,6 +92,10 @@ ADVANCED=0
 ROOT_SSH_KEY=""; ECDSA=1; NETWORK_MONITOR=1; R600_REPAIR=1; CONSOLE_TTY=1; KEEP_CT_ADDRESS=0
 STATIC_IP=""; GATEWAY=""; TEMPLATE=""; TIMEOUT=1200
 ASSUME_YES=0; INTERACTIVE=1
+UPGRADE=0
+# Set when the matching option was given explicitly, so an upgrade can keep the
+# feature set already configured in the container by default.
+ECDSA_SET=0; NETWORK_MONITOR_SET=0; CONSOLE_TTY_SET=0; KEEP_CT_ADDRESS_SET=0
 
 # whiptail geometry (the PVE helper convention).
 WT=(whiptail --backtitle "ZD1200 LXC installer" --title "ZD1200" --cancel-button Cancel)
@@ -101,23 +113,27 @@ while [ $# -gt 0 ]; do
         --start-on-boot)        ONBOOT=1; shift ;;
         --no-start-on-boot)     ONBOOT=0; shift ;;
         --source)               SOURCE="${2:?}"; shift 2 ;;
+        --upgrade)              UPGRADE=1; shift ;;
         --container-mac)        CONTAINER_MAC_OVERRIDE="${2:?}"; shift 2 ;;
         --advanced)             ADVANCED=1; shift ;;
         --writable-from)        WRITABLE_FROM="${2:?}"; shift 2 ;;
         --writable-partition)   WRITABLE_PARTITION="${2:?}"; shift 2 ;;
         --root-ssh-key)         ROOT_SSH_KEY="${2:?}"; shift 2 ;;
-        --no-ecdsa)             ECDSA=0; shift ;;
-        --no-network-monitor)   NETWORK_MONITOR=0; shift ;;
+        --ecdsa)                ECDSA=1; ECDSA_SET=1; shift ;;
+        --no-ecdsa)             ECDSA=0; ECDSA_SET=1; shift ;;
+        --network-monitor)      NETWORK_MONITOR=1; NETWORK_MONITOR_SET=1; shift ;;
+        --no-network-monitor)   NETWORK_MONITOR=0; NETWORK_MONITOR_SET=1; shift ;;
         --no-r600-repair)       R600_REPAIR=0; shift ;;
-        --no-console-tty)       CONSOLE_TTY=0; shift ;;
-        --keep-ct-address)      KEEP_CT_ADDRESS=1; shift ;;
+        --console-tty)          CONSOLE_TTY=1; CONSOLE_TTY_SET=1; shift ;;
+        --no-console-tty)       CONSOLE_TTY=0; CONSOLE_TTY_SET=1; shift ;;
+        --keep-ct-address)      KEEP_CT_ADDRESS=1; KEEP_CT_ADDRESS_SET=1; shift ;;
         --static-ip)            STATIC_IP="${2:?}"; shift 2 ;;
         --gateway)              GATEWAY="${2:?}"; shift 2 ;;
         --template)             TEMPLATE="${2:?}"; shift 2 ;;
         --timeout)              TIMEOUT="${2:?}"; shift 2 ;;
         --yes)                  ASSUME_YES=1; shift ;;
         --non-interactive)      ASSUME_YES=1; INTERACTIVE=0; shift ;;
-        -h|--help)              sed -n '2,57p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)              sed -n '2,65p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)                     die "unknown option: $1" ;;
         *)                      SOURCE="$1"; shift ;;
     esac
@@ -204,6 +220,166 @@ next_free_ctid() {
     done
     die "no free container id in 120..999"
 }
+
+# --------------------------------------------------------------------------
+# 0b. --upgrade: re-provision an existing container from this checkout, without
+# touching the firmware image, /writable, or the keys it already holds.
+# --------------------------------------------------------------------------
+detect_zd1200_ctid() {
+    # The container this installer created carries its description marker.
+    local f id found=""
+    for f in /etc/pve/lxc/*.conf; do
+        [ -f "$f" ] || continue
+        grep -q 'installed by dbro_zd1200/install-zd1200-lxc.sh' "$f" || continue
+        id="$(basename "$f" .conf)"
+        [ -n "$found" ] && die "more than one ZD1200 container found ($found, $id); pass --ctid"
+        found="$id"
+    done
+    [ -n "$found" ] || die "no ZD1200 container found (none carries this installer's description); pass --ctid"
+    printf '%s' "$found"
+}
+
+# ct_conf_get <ctid> <key>: one value from the container's /etc/zd1200.conf.
+ct_conf_get() {
+    pct exec "$1" -- bash -c "sed -n 's/^$2=//p' /etc/zd1200.conf 2>/dev/null | head -n1" 2>/dev/null || true
+}
+
+upgrade_existing_container() {
+    [ -n "$SOURCE" ] && die "--upgrade takes no firmware/source argument"
+    [ -z "$CTID" ] && CTID="$(detect_zd1200_ctid)"
+    [ -f "/etc/pve/lxc/$CTID.conf" ] || die "container $CTID does not exist"
+    pct status "$CTID" >/dev/null 2>&1 || die "cannot query container $CTID"
+
+    info "upgrading container $CTID in place (keeping /writable and its keys)"
+
+    # The feature set already configured in the container is the default; an
+    # explicitly passed flag still overrides it.
+    local v key_line="" ct_key="$DEFAULT_CT_STATE/provision/authorized_keys"
+    v="$(ct_conf_get "$CTID" ZD_ECDSA_SSH)"
+    [ "$ECDSA_SET" = 1 ] || ECDSA="${v:-1}"
+    v="$(ct_conf_get "$CTID" ZD_NETWORK_MONITOR)"
+    [ "$NETWORK_MONITOR_SET" = 1 ] || NETWORK_MONITOR="${v:-1}"
+    if [ "$CONSOLE_TTY_SET" = 0 ]; then
+        if pct exec "$CTID" -- grep -q '^ZD_CONSOLE_SOCK=' /etc/zd1200.conf 2>/dev/null; then
+            CONSOLE_TTY=1
+        else
+            CONSOLE_TTY=0
+        fi
+    fi
+    if [ "$KEEP_CT_ADDRESS_SET" = 0 ]; then
+        v="$(ct_conf_get "$CTID" ZD_CT_ADDRESS_FOLLOW_QEMU)"
+        if [ "$v" = "0" ]; then KEEP_CT_ADDRESS=1; else KEEP_CT_ADDRESS=0; fi
+    fi
+
+    # Keep the provisioned root-SSH key unless a new one was supplied.  Nothing
+    # here deletes a key: patch 60 re-installs the rootfs copy from this file.
+    if [ -n "$ROOT_SSH_KEY" ]; then
+        [ -r "$ROOT_SSH_KEY" ] || die "SSH public key not readable: $ROOT_SSH_KEY"
+        key_line="$(read_public_key "$ROOT_SSH_KEY")" || die "$ROOT_SSH_KEY is not an SSH public key"
+        info "root SSH key .... replacing with ${key_line%% *}"
+    else
+        key_line="$(pct exec "$CTID" -- cat "$ct_key" 2>/dev/null | head -n1 | tr -d '\r' || true)"
+        [ -n "$key_line" ] && info "root SSH key .... keeping ${key_line%% *}"
+    fi
+
+    if [ "$(pct status "$CTID" | awk '{print $2}')" != "running" ]; then
+        step "starting container $CTID"
+        pct start "$CTID"
+        for _ in $(seq 1 30); do
+            pct exec "$CTID" -- true >/dev/null 2>&1 && break
+            sleep 1
+        done
+    fi
+
+    step "stopping the appliance"
+    # Stop the watchdog first: the guest is about to be down while the roots are
+    # patched, and a watchdog that keeps probing would eventually reboot it.
+    pct exec "$CTID" -- systemctl stop zd1200-watchdog.service 2>/dev/null || true
+    pct exec "$CTID" -- systemctl stop zd1200.service 2>/dev/null || true
+
+    step "copying the current checkout into the container"
+    pct exec "$CTID" -- mkdir -p "$DEFAULT_CT_REPO"
+    # Replace the checkout's own trees rather than overlaying them: a patch or
+    # script deleted in the new revision must not linger in the container, or it
+    # stays in the patch signature and keeps being applied.  The built payloads
+    # (dropbear/, ruckus-squashfs/) are deliberately kept; the bootstrap rebuilds
+    # analytics/ and re-links scripts/container/{image,bl7,analytics,dropbear}.
+    pct exec "$CTID" -- bash -c "cd '$DEFAULT_CT_REPO' && rm -rf analytics bl7 docker docs proxmox scripts && rm -f README.md LICENSE install-zd1200-docker.sh install-zd1200-lxc.sh"
+    tar -C "$REPO_ROOT" -cf - \
+        --exclude='./.git' --exclude='./.reasonix' --exclude='./.boot-test' \
+        --exclude='./image' --exclude='./dropbear-provision' --exclude='./proxmox-build' \
+        . | pct exec "$CTID" -- tar -C "$DEFAULT_CT_REPO" -xf -
+
+    step "re-provisioning (packages and image/ kept; roots re-customised)"
+    bootstrap_args=(
+        --repo-dir "$DEFAULT_CT_REPO"
+        --state-dir "$DEFAULT_CT_STATE"
+        --skip-packages
+        --skip-image
+        --ct-dhcp
+    )
+    [ -n "$key_line" ] && bootstrap_args+=(--root-ssh-key "$key_line")
+    [ "$ECDSA" = 0 ] && bootstrap_args+=(--no-ecdsa)
+    [ "$NETWORK_MONITOR" = 0 ] && bootstrap_args+=(--no-network-monitor)
+    [ "$R600_REPAIR" = 0 ] && bootstrap_args+=(--no-r600-repair)
+    [ "$CONSOLE_TTY" = 0 ] && bootstrap_args+=(--no-console-tty)
+    [ "$KEEP_CT_ADDRESS" = 1 ] && bootstrap_args+=(--keep-ct-address)
+    if ! pct exec "$CTID" -- "$DEFAULT_CT_REPO/proxmox/zd1200-ct-bootstrap.sh" "${bootstrap_args[@]}"; then
+        die "container upgrade failed — see the output above (the container is left in place: pct enter $CTID)"
+    fi
+
+    # The host-side summary helper may have changed with the project.
+    install -m 0755 "$REPO_ROOT/proxmox/zd1200-pve-summary-host.sh" /usr/local/sbin/zd1200-pve-summary-host
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart zd1200-pve-summary.timer >/dev/null 2>&1 || true
+    /usr/local/sbin/zd1200-pve-summary-host "$CTID" >/dev/null 2>&1 || true
+
+    step "starting the appliance"
+    # Drop the previous boot's console log: the readiness check below greps for
+    # the guest's READY line, and a stale one would pass instantly.
+    pct exec "$CTID" -- rm -f /tmp/zd1200-console.log
+    pct exec "$CTID" -- systemctl start --no-block zd1200.service
+    info "waiting up to ${TIMEOUT}s for the guest to report READY (watch: pct exec $CTID -- journalctl -fu zd1200)"
+    deadline=$((SECONDS + TIMEOUT))
+    guest_ip=""
+    while (( SECONDS < deadline )); do
+        guest_ip="$(pct exec "$CTID" -- bash -c 'cat /var/lib/zd1200/guest-ip 2>/dev/null' || true)"
+        if pct exec "$CTID" -- bash -c 'grep -qF "System go into READY status." /tmp/zd1200-console.log 2>/dev/null'; then
+            printf '  [%4ds] guest READY\n' "$((SECONDS - (deadline - TIMEOUT)))"
+            break
+        fi
+        if ! pct exec "$CTID" -- systemctl is-active --quiet zd1200.service; then
+            warn "the zd1200 service stopped early"
+            pct exec "$CTID" -- journalctl -u zd1200 -n 40 --no-pager || true
+            break
+        fi
+        sleep 5
+    done
+
+    if [ -n "$guest_ip" ]; then
+        guest_url="https://$guest_ip/"
+    else
+        guest_url="<not known yet: see Address below>"
+    fi
+    cat <<EOF
+
+Upgrade complete for container $CTID.
+
+  Guest URL ....... $guest_url
+  Address ......... pct exec $CTID -- cat /var/lib/zd1200/guest-ip
+  Service ......... pct exec $CTID -- systemctl status zd1200
+  Logs ............ pct exec $CTID -- journalctl -fu zd1200
+  Install log ..... pct exec $CTID -- tail -50 /var/lib/zd1200/install.log
+EOF
+    if [ -n "$key_line" ]; then
+        printf '  Root SSH ........ ssh -p 2222 -i <key> root@%s\n' "${guest_ip:-<guest-ip>}"
+    fi
+}
+
+if [ "$UPGRADE" = 1 ]; then
+    upgrade_existing_container
+    exit 0
+fi
 
 
 # --------------------------------------------------------------------------
@@ -602,6 +778,9 @@ pct exec "$CTID" -- systemctl is-enabled --quiet zd1200.service \
 # 9. start and wait for the guest
 # --------------------------------------------------------------------------
 step "starting the appliance"
+# Drop any previous boot's console log so a stale READY line cannot pass the
+# readiness check below.
+pct exec "$CTID" -- rm -f /tmp/zd1200-console.log
 pct exec "$CTID" -- systemctl start --no-block zd1200.service
 info "waiting up to ${TIMEOUT}s for the guest to report READY (watch: pct exec $CTID -- journalctl -fu zd1200)"
 deadline=$((SECONDS + TIMEOUT))

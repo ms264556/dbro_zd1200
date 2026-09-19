@@ -16,11 +16,22 @@
 #                                                    # (e.g. a ZD1100/ZD3000 card)
 #       [--writable-partition START:COUNT]           # override the dump geometry
 #   ./install-zd1200-docker.sh                        # already prepared: start
+#   ./install-zd1200-docker.sh --upgrade              # upgrade an existing
+#                                                    # appliance in place: rebuild
+#                                                    # the container image and
+#                                                    # re-customise the roots from
+#                                                    # their rollback store, keeping
+#                                                    # /writable.  Needs no firmware.
 #   ./install-zd1200-docker.sh --no-up /path/to/*.img # only build/prepare (no boot)
 #   ./install-zd1200-docker.sh --root-ssh-key ~/.ssh/id_ed25519.pub
 #                                                    # also build the static dropbear
 #                                                    # replacement and enable public-key
 #                                                    # root SSH on TCP 2222 (slow build)
+#
+# --upgrade replaces the firmware argument: it never re-prepares image/ and never
+# rebuilds the CF disk (which would discard the appliance's configuration).  Root
+# SSH, the ECDSA host key and the Network Monitor setting already installed are
+# kept; a key is only replaced when --root-ssh-key is given explicitly.
 #
 # The container runs under host-netns; see README.md ("Host requirements" and
 # "Gotchas") for what the host must provide (MAC-spoofing NIC, KVM optional).
@@ -33,6 +44,7 @@ cd "$(dirname "$0")"
 . ./scripts/install-common.sh
 
 no_up=0
+upgrade=0
 r600_repair="${ZD_R600_REPAIR:-1}"
 archive="${ZD_ARCHIVE:-}"
 root_ssh_key=""
@@ -41,6 +53,7 @@ writable_partition=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-up) no_up=1; shift ;;
+        --upgrade) upgrade=1; shift ;;
         --root-ssh-key)
             [ $# -ge 2 ] || { echo "--root-ssh-key needs a public-key file or key string" >&2; exit 2; }
             root_ssh_key="$2"; shift 2 ;;
@@ -55,12 +68,18 @@ while [ $# -gt 0 ]; do
         --writable-partition=*) writable_partition="${1#*=}"; shift ;;
         --no-r600-repair) r600_repair=0; shift ;;
         -h|--help)
-            sed -n '2,18p' "$0"
+            sed -n '2,29p' "$0"
             exit 0
             ;;
         *) archive="${1:-}"; shift ;;
     esac
 done
+
+if [ "$upgrade" = 1 ] && [ -n "$archive" ]; then
+    echo "--upgrade takes no firmware argument: it upgrades the existing appliance" >&2
+    echo "in place.  To move to different firmware, reset the state and install." >&2
+    exit 2
+fi
 
 # --- docker access: use sudo if this user is not in the docker group --------
 docker_cmd=(docker)
@@ -86,6 +105,49 @@ export ZD_R600_REPAIR="$r600_repair"
 # ./image volume mount and the build context rooted at the repo root.
 compose_cmd=("${docker_cmd[@]}" compose --project-directory . -f docker/docker-compose.yml)
 
+# --- 1a. optional public-key root SSH on TCP 2222 ---------------------------
+# Supplying a public key enables the static-dropbear replacement build and
+# installs a public-key-only root listener on 2222.  The key is staged in
+# dropbear-provision/ (gitignored) for the container, and its content is part
+# of the rootfs re-patch signature so rotating the key re-customises the disk.
+key_line=""
+if [ -n "$root_ssh_key" ]; then
+    if [ -r "$root_ssh_key" ]; then
+        key_line="$(head -n1 "$root_ssh_key" | tr -d '\r')"
+    else
+        key_line="$root_ssh_key"
+    fi
+elif [ -n "${ZD_ROOT_SSH_PUBLIC_KEY:-}" ]; then
+    if [ -r "${ZD_ROOT_SSH_PUBLIC_KEY}" ]; then
+        key_line="$(head -n1 "${ZD_ROOT_SSH_PUBLIC_KEY}" | tr -d '\r')"
+    else
+        key_line="${ZD_ROOT_SSH_PUBLIC_KEY}"
+    fi
+fi
+# An upgrade keeps the key that is already provisioned (and the 2222 listener it
+# enables): treating "the flag was not repeated" as "disable root SSH" would
+# silently remove access.  A supplied key always wins, so rotating it still works.
+if [ -z "$key_line" ] && [ "$upgrade" = 1 ] && [ -s dropbear-provision/authorized_keys ]; then
+    key_line="$(head -n1 dropbear-provision/authorized_keys | tr -d '\r')"
+    echo "== Keeping the existing root SSH key (${key_line%% *}) =="
+fi
+if [ -n "$key_line" ]; then
+    key_line="$(read_public_key "$key_line")" \
+        || { echo "--root-ssh-key is not an SSH public key: $key_line" >&2; exit 2; }
+    mkdir -p dropbear-provision
+    printf '%s\n' "$key_line" > dropbear-provision/authorized_keys
+    # 0644, not 0600: it is a public key, and the container drops
+    # CAP_DAC_OVERRIDE so it could not read a root-only host file.
+    chmod 644 dropbear-provision/authorized_keys
+    export ZD_ROOT_SSH=1
+    export ZD_ROOT_SSH_PROVISION=./dropbear-provision
+    echo "== Root SSH on TCP 2222 enabled (${key_line%% *}) =="
+    echo "   The image build compiles the static dropbear replacement; the first"
+    echo "   build downloads a ~110 MB cross toolchain and is slow."
+else
+    export ZD_ROOT_SSH=0
+fi
+
 # --- 1. build the container image --------------------------------------------
 # The image doubles as the prepare helper: it carries e2fsprogs (debugfs),
 # python3, tar and gzip, so the host needs no filesystem tooling to unpack a
@@ -100,6 +162,12 @@ echo "== Building the ZD1200 container image =="
 # read-only at /opt/zd1200/image.
 image_name="local/zd1200-qemu"
 if [ ! -f image/rootfs.ext2 ]; then
+    if [ "$upgrade" = 1 ]; then
+        echo "--upgrade needs an existing install (image/rootfs.ext2 missing)." >&2
+        echo "Install once with a firmware image first:" >&2
+        echo "  $0 /path/to/zd1200_<version>.img" >&2
+        exit 1
+    fi
     if [ -z "$archive" ]; then
         echo "First run needs a ZD1200 firmware upgrade file or a CF card dump:" >&2
         echo "  $0 /path/to/zd1200_<version>.img     # firmware upgrade" >&2
@@ -160,46 +228,23 @@ if ! grep -qE '^ZD_VIRTUAL_BUILD_ID=..*' .env 2>/dev/null \
         && echo "== Admin console will report source revision: virtual $ZD_VIRTUAL_BUILD_ID =="
 fi
 
-# --- 3c. optional public-key root SSH on TCP 2222 ---------------------------
-# Supplying a public key enables the static-dropbear replacement build and
-# installs a public-key-only root listener on 2222.  The key is staged in
-# dropbear-provision/ (gitignored) for the container, and its content is part
-# of the rootfs re-patch signature so rotating the key re-customises the disk.
-key_line=""
-if [ -n "$root_ssh_key" ]; then
-    if [ -r "$root_ssh_key" ]; then
-        key_line="$(head -n1 "$root_ssh_key" | tr -d '\r')"
-    else
-        key_line="$root_ssh_key"
-    fi
-elif [ -n "${ZD_ROOT_SSH_PUBLIC_KEY:-}" ]; then
-    if [ -r "${ZD_ROOT_SSH_PUBLIC_KEY}" ]; then
-        key_line="$(head -n1 "${ZD_ROOT_SSH_PUBLIC_KEY}" | tr -d '\r')"
-    else
-        key_line="${ZD_ROOT_SSH_PUBLIC_KEY}"
-    fi
-fi
-if [ -n "$key_line" ]; then
-    key_line="$(read_public_key "$key_line")" \
-        || { echo "--root-ssh-key is not an SSH public key: $key_line" >&2; exit 2; }
-    mkdir -p dropbear-provision
-    printf '%s\n' "$key_line" > dropbear-provision/authorized_keys
-    # 0644, not 0600: it is a public key, and the container drops
-    # CAP_DAC_OVERRIDE so it could not read a root-only host file.
-    chmod 644 dropbear-provision/authorized_keys
-    export ZD_ROOT_SSH=1
-    export ZD_ROOT_SSH_PROVISION=./dropbear-provision
-    echo "== Root SSH on TCP 2222 enabled (${key_line%% *}) =="
-    echo "   The image build compiles the static dropbear replacement; the first"
-    echo "   build downloads a ~110 MB cross toolchain and is slow."
-else
-    export ZD_ROOT_SSH=0
-fi
-
 # --- 4. start ---------------------------------------------------------------
 # The image was built in step 1; compose up only creates/starts the container.
 if [ "$no_up" = 1 ]; then
-    echo "== Image built (not started). =="
+    if [ "$upgrade" = 1 ]; then
+        echo "== Image rebuilt for upgrade (not started). =="
+        echo "   Start it with: ${compose_cmd[*]} up -d --force-recreate"
+    else
+        echo "== Image built (not started). =="
+    fi
+elif [ "$upgrade" = 1 ]; then
+    echo "== Upgrading the ZD1200 appliance in place =="
+    echo "   The state volume (and /writable) is kept; the roots are re-customised"
+    echo "   from their rollback store on start."
+    "${compose_cmd[@]}" up -d --force-recreate
+    echo
+    echo "Upgraded. Follow it:   ${docker_cmd[*]} logs -f zd1200"
+    echo "Guest console:         ${docker_cmd[*]} exec zd1200 tail -f /tmp/zd1200-console.log"
 else
     echo "== Starting the ZD1200 container =="
     "${compose_cmd[@]}" up -d

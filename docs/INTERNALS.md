@@ -17,7 +17,14 @@ list.
 Any ZD1200 release works: the script validates `metadata`
 (`REQUIRE_PLATFORM=nar5520`, `REQUIRE_SUBPLATFORM=cob7402`) and the kernel/rootfs
 MD5s, and does not pin a version. The tested matrix is 10.5.1.0.282, 10.5.1.0.255,
-10.2.1.0.236, 10.1.2.0.318, 9.13.3.0.164 and 9.10.2.0.130.
+10.4.1.0.272, 10.3.1.0.45, 10.2.1.0.236, 10.1.2.0.318, 9.13.3.0.164 and
+9.10.2.0.130.
+
+9.9.1.0.52 is **not** supported: its kernel's gzip member has no slack, so the
+QEMU-patched kernel recompresses a few hundred bytes larger and
+`patch-kernel.py` refuses it (the boot decompressor reads a fixed input size, so
+the member length cannot grow). `build-synthetic-cf.py` prints the patcher's
+message and stops rather than booting a half-patched kernel.
 
 The archive layout differs between releases, independently of the version: some
 payloads carry the web `aidfs` tree and the `signing_cert.pem` / `digital_sig_*`
@@ -78,8 +85,10 @@ The `/writable` partition is located from the dump's own vendor partition table
 (an MBR-style sector ending in `0x55AA` whose entries describe the layout),
 validated against the reiserfs superblock at the partition's 64 KiB mark, so the
 dump's disk geometry need not match the ZD1200's. `--writable-partition
-START:COUNT` overrides the detection. The board serial is used when the dump
-carries a ZD1200-style board-data record; otherwise the serial is derived from
+START:COUNT` overrides the detection. The board serial is taken from the dump
+when one can be read from a known board-data location — the ZD1200 layout
+(`REGION2_START` 3920881) or the ZD3000-family layout (3981601), accepting it
+only when it is a plain number — otherwise the serial is derived from
 `ZD_CONTAINER_MAC` as usual. The data partition must fit the ZD1200 layout; a
 smaller one is zero-padded into the partition (the reiserfs filesystem keeps its
 own size).
@@ -156,10 +165,44 @@ resize an unfsck'd `resize_inode` filesystem).
 `scripts/container/prepare-vm-disks.sh` builds the disk when it is missing or
 the prepared input changed, then applies the QEMU kernel patch and the ordered
 patches in `scripts/container/patches/` to whichever root partitions lack the
-current patch-set sentinel (`/etc/.zd-image`). Re-runs are cheap: a start where
-nothing changed just reads two sentinels. A guest firmware upgrade writes a new
-rootfs to the spare root; that root has no sentinel and is customised on the next
-start, while the untouched root is left alone.
+current patch-set sentinel. Re-runs are cheap: a start where nothing changed just
+reads two sentinels.
+
+Each root partition carries a rollback store at `/.patchrollback/`:
+
+| entry | meaning |
+|---|---|
+| `sentinel` | signature of the patch set applied to this root |
+| `kernel` | hash of `patch-kernel.py` that customised `/bzImage` |
+| `replaced.list`, `replaced/<n>`, `replaced/<n>.meta` | the pristine vendor copy (content, plus mode/uid/gid) of every file a patch replaced |
+| `added` | paths a patch created, deleted again on reset |
+
+Every patch writes through `scripts/container/patch-lib.sh`, which stores the
+vendor copy before replacing a file and records a path before creating one. When
+the sentinel no longer matches — a patch was added, edited or removed, or a
+feature/environment value in the signature changed — `prepare-vm-disks.sh`
+restores every replaced file and deletes every added path *before* re-running the
+whole set, so each patch always starts from the vendor rootfs rather than from the
+output of an earlier patch set. `/writable` (hda4) is never involved, which is
+what lets an upgrade keep the appliance's configuration.
+
+The kernel is the one deliberate exception: it is not copied into the store (it
+is the largest file the pipeline touches, and its transform is deterministic).
+`/bzImage` is keyed on the hash of `patch-kernel.py` instead, so a root already
+carrying the QEMU patches is left alone and the patcher never has to recognise an
+already-patched kernel.
+
+A guest firmware upgrade writes a new rootfs to the spare root; that root has no
+store and no sentinel, so it is customised normally and the untouched root is
+skipped. A root that carries the pre-rollback sentinel (`/etc/.zd-image`) and no
+store is refused rather than re-patched: there is no pristine copy to restore, and
+re-running the patches against already-patched files is exactly what the store
+exists to avoid.
+
+The store itself is unit-tested without firmware or QEMU:
+`scripts/test/patch-lib-test.sh` builds a throwaway ext2 "rootfs", applies a patch
+set, resets it, re-applies a changed set and asserts that vendor content, modes
+and symlinks come back and that a repeat run is byte-for-byte deterministic.
 
 The patches, in order:
 
@@ -179,6 +222,31 @@ Every patch decides from the files and patterns it finds (`sesame`/`sesame2`,
 rather than from a version number. The kernel patcher matches byte signatures,
 with `rks_pkt_trace_init` optional because the 9.x kernels predate tif0. The one
 exception is the R600 repair below.
+
+## Upgrading an existing appliance
+
+Both entry points take `--upgrade`, which rebuilds the container/CT from the
+current checkout and re-customises the roots in place:
+
+```sh
+./install-zd1200-docker.sh --upgrade        # Docker
+./install-zd1200-lxc.sh --upgrade [--ctid N]  # Proxmox (finds the container it made)
+```
+
+`--upgrade` takes no firmware argument and never re-prepares `image/` or rebuilds
+the CF disk, so `/writable` — the appliance's configuration — is preserved. The
+changed patch signature makes the next start restore the roots from their
+rollback store and re-apply the whole set. An explicit `--root-ssh-key` replaces
+the provisioned key; otherwise the existing one is kept (and the 2222 listener
+with it). The LXC flow likewise keeps the feature set and console/address
+settings already in `/etc/zd1200.conf`.
+
+Changing the firmware itself is intentionally *not* part of `--upgrade`:
+`prepare-vm-disks.sh` refuses to rebuild an existing disk (which would discard
+`/writable`) when `image/` no longer matches what the disk was built from. Accept
+a factory reset by removing the state volume/directory, or set
+`ZD_ALLOW_DISK_REBUILD=1` deliberately.
+
 
 ## Network Monitor
 

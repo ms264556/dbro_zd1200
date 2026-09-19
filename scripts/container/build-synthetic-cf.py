@@ -66,12 +66,21 @@ if not mke2fs:
 
 # Patch the kernel for QEMU (scripts/container/patch-kernel.py); the raw
 # bzImage triggers a kernel `BUG: scheduling while atomic` early in init.
+# The patcher's own message is printed when it refuses a kernel (for example one
+# whose gzip member has no room for the re-patched stream), because otherwise the
+# only symptom is a generic CalledProcessError.
 with tempfile.TemporaryDirectory() as _kp:
     _kp = Path(_kp)
     patched = _kp / "bzImage.patched"
-    subprocess.run(["python3", str(base / "patch-kernel.py"),
-                    "--in", str(kernel_src), "--out", str(patched)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _patch = subprocess.run(
+        ["python3", str(base / "patch-kernel.py"),
+         "--in", str(kernel_src), "--out", str(patched)],
+        capture_output=True, text=True)
+    if _patch.returncode != 0:
+        sys.stderr.write("patch-kernel.py failed:\n")
+        sys.stderr.write(_patch.stdout or "")
+        sys.stderr.write(_patch.stderr or "")
+        raise SystemExit(f"the kernel in {kernel_src} could not be patched for QEMU")
     kernel = patched.read_bytes()
     # persist the patched kernel to a temp file so debugfs can reference it.
     _kf = tempfile.NamedTemporaryFile(prefix="bzImage.patched.", suffix=".bin", delete=False)

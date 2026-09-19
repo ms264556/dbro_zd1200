@@ -311,11 +311,17 @@ if [ "$DO_PAYLOADS" = 1 ]; then
     # 3c. optional static dropbear (public-key root SSH on TCP 2222).  The
     # vendored builder fetches its own musl.cc cross toolchain, so this is the
     # slowest optional step and only runs when a public key was supplied.
-    if [ -n "$ROOT_SSH_KEY" ] && [ ! -x "$REPO_DIR/dropbear/dropbear" ]; then
-        log "building the static dropbear replacement (slow: cross toolchain + sources)"
+    #
+    # The key is written whenever one was supplied, even when the binary is
+    # already built, so rotating the key (or removing --skip-payloads) takes
+    # effect; nothing here deletes an existing key.
+    if [ -n "$ROOT_SSH_KEY" ]; then
         mkdir -p "$STATE_DIR/provision"
         printf '%s\n' "$ROOT_SSH_KEY" > "$STATE_DIR/provision/authorized_keys"
         chmod 644 "$STATE_DIR/provision/authorized_keys"
+    fi
+    if [ -n "$ROOT_SSH_KEY" ] && [ ! -x "$REPO_DIR/dropbear/dropbear" ]; then
+        log "building the static dropbear replacement (slow: cross toolchain + sources)"
         sh "$REPO_DIR/dropbear/build-zd1200-dropbear.sh" \
             --work "$STATE_DIR/build/dropbear-work" \
             --out "$REPO_DIR/dropbear" \
@@ -480,6 +486,14 @@ fi
 sed -i '/^ZD_CT_ADDRESS_FOLLOW_QEMU=/d' "$CONF"
 printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)" >> "$CONF"
 
+# The feature switches are part of the rootfs patch signature, and the entrypoint
+# runs prepare-vm-disks.sh again when the service starts: it reads them from this
+# file.  Reconcile them here so an upgrade that changes a feature (say --no-ecdsa)
+# is not re-patched with the new value and then undone by the start.
+sed -i '/^ZD_ECDSA_SSH=/d; /^ZD_NETWORK_MONITOR=/d' "$CONF"
+printf 'ZD_ECDSA_SSH=%s\n' "$ECDSA" >> "$CONF"
+printf 'ZD_NETWORK_MONITOR=%s\n' "$NETWORK_MONITOR" >> "$CONF"
+
 # Single source of truth from here on: the file is what the service reads.
 set -a
 # shellcheck disable=SC1090
@@ -598,9 +612,11 @@ systemctl enable zd1200-healthcheck.timer zd1200-watchdog.service >/dev/null 2>&
 # container booted, so multi-user.target/timers.target have already been reached
 # and `enable` alone will never start them: the guest would run with no health
 # probing and no recovery until the next container reboot.
+# The watchdog is started only after step 6 below: it probes the guest, and the
+# guest is deliberately stopped while the disk is patched, so starting it here
+# would count the patch window as failures and could reboot mid-patch.
 systemctl start zd1200-net.service >/dev/null 2>&1 || true
 systemctl start zd1200-healthcheck.timer >/dev/null 2>&1 || true
-systemctl start zd1200-watchdog.service >/dev/null 2>&1 || true
 # NOTE: zd1200.service is deliberately NOT started here.  Its entrypoint runs
 # prepare-vm-disks.sh too, and doing that concurrently with step 6 below (each
 # rm -rf's the same scratch directory) corrupts the patch run.  The installer (or
@@ -688,5 +704,9 @@ if [ "$DO_DISKS" = 1 ]; then
         run_logged "building and patching the guest disk (several minutes; log: $INSTALL_LOG)" \
         "$CC/prepare-vm-disks.sh"
 fi
+
+# Only now is it safe to let the watchdog probe: the disk is patched and the
+# guest is about to run again.
+systemctl start zd1200-watchdog.service >/dev/null 2>&1 || true
 
 log "bootstrap complete"

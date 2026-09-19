@@ -16,14 +16,17 @@
 # Usage:
 #   QCOW=<flat-disk> WORK=<workdir> ./"40-skip-integrity.sh"
 #
-# Idempotent: a partition whose /file_list.txt already has no FILE/LINK/DIR/OTHER
-# entries (all SKIP) is left alone.
+# Re-patching: the pristine /file_list.txt is kept in the root's
+# /.patchrollback store (pr_save), so a changed patch set can be re-applied from
+# the vendor list rather than from the already-all-SKIP one.
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
 WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
 ALIGN=512
+# shellcheck source=../patch-lib.sh
+. "$(dirname "$BASE")/patch-lib.sh"
 
 TARGET="/file_list.txt"
 # Rewrite the leading type token of every non-SKIP entry to SKIP:, keeping the
@@ -41,19 +44,6 @@ PARTITIONS=(
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-say() { printf '\n== %s\n' "$*"; }
-
-file_stat() {
-    # Type Mode User Group for a given path, matched by field name.
-    debugfs -R "stat $TARGET" "$1" 2>/dev/null \
-        | awk '{ for (i = 1; i <= NF; i++) {
-                    if ($i == "Type:")  t = $(i+1)
-                    else if ($i == "Mode:")  m = $(i+1)
-                    else if ($i == "User:")  u = $(i+1)
-                    else if ($i == "Group:") g = $(i+1)
-                }} END { print t, m, u, g }'
-}
-
 say "reading the flat disk $QCOW"
 ln -sf "$QCOW" "$WORK/flat.raw"
 
@@ -61,11 +51,12 @@ patched_any=0
 for part in "${PARTITIONS[@]}"; do
     IFS='|' read -r name start sectors <<< "$part"
     say "[$name] extracting partition (sector $start, ${sectors}s)"
-    dd if="$WORK/flat.raw" of="$WORK/$name.img" bs=$ALIGN skip="$start" count="$sectors" status=none
-    cp "$WORK/$name.img" "$WORK/$name.orig.img"
+    extract_part "$name" "$start" "$sectors"
+    snapshot_orig "$name"
+    IMG="$WORK/$name.img"
+    pr_init "$IMG"
 
-    if ! debugfs -R "dump $TARGET $WORK/flist.orig" "$WORK/$name.img" >/dev/null 2>&1 \
-       || [ ! -s "$WORK/flist.orig" ]; then
+    if ! fs_read "$IMG" "$TARGET" "$WORK/flist.orig"; then
         echo "  ! $TARGET not present on $name, skipping"
         continue
     fi
@@ -76,62 +67,27 @@ for part in "${PARTITIONS[@]}"; do
         continue
     fi
 
-    read -r type_old mode_old uid_old gid_old <<< "$(file_stat "$WORK/$name.img")"
+    read -r type_old mode_old uid_old gid_old <<< "$(fs_stat_meta "$IMG" "$TARGET")"
     before=$(grep -cE '^(FILE|LINK|DIR|OTHER):' "$WORK/flist.orig" || true)
     after=$(grep -cE '^(FILE|LINK|DIR|OTHER):' "$WORK/flist.new" || true)
     echo "  rewriting $TARGET: $before FILE/LINK/DIR/OTHER entries -> SKIP (now $after remaining)"
 
-    # debugfs 'write' creates mode 0100644 uid/gid 0; restore the vendor file's
-    # metadata (0644 group-readable, root:root) explicitly.
-    printf 'rm %s\nwrite %s %s\n' "$TARGET" "$WORK/flist.new" "$TARGET" > "$WORK/cmds.txt"
-    debugfs -w -f "$WORK/cmds.txt" "$WORK/$name.img" >/dev/null 2>&1
-    debugfs -w -R "set_inode_field $TARGET mode 010$mode_old" "$WORK/$name.img" >/dev/null 2>&1
-    debugfs -w -R "set_inode_field $TARGET uid $uid_old" "$WORK/$name.img" >/dev/null 2>&1
-    debugfs -w -R "set_inode_field $TARGET gid $gid_old" "$WORK/$name.img" >/dev/null 2>&1
+    # write_local keeps the pristine list in the rollback store, preserves the
+    # vendor metadata (debugfs 'write' lands 0644 root:root) and verifies the
+    # content round-trips.
+    write_local "$IMG" "$TARGET" "$WORK/flist.new"
 
-    read -r type_new mode_new _ _ <<< "$(file_stat "$WORK/$name.img")"
+    read -r type_new mode_new _ _ <<< "$(fs_stat_meta "$IMG" "$TARGET")"
     if [ "$type_new" != "regular" ] || [ "$mode_new" != "$mode_old" ]; then
         echo "  !! unexpected result on $name: type=$type_new mode=$mode_new (wanted regular/$mode_old); aborting" >&2
         exit 1
     fi
-    if ! debugfs -R "dump $TARGET $WORK/flist.check" "$WORK/$name.img" >/dev/null 2>&1 \
-       || ! cmp -s "$WORK/flist.check" "$WORK/flist.new"; then
-        echo "  !! content verification failed for $TARGET on $name; aborting" >&2
-        exit 1
-    fi
 
-    # Only changed 512-byte blocks (pristine vs now) are written back.
-    python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
-import sys
-orig = open(sys.argv[1], 'rb').read()
-new  = open(sys.argv[2], 'rb').read()
-al   = int(sys.argv[3])
-assert len(orig) == len(new), "partition size changed"
-blocks = [i for i in range(0, len(orig), al) if orig[i:i + al] != new[i:i + al]]
-runs = []
-for b in blocks:
-    if runs and b == runs[-1][1]:
-        runs[-1] = (runs[-1][0], b + al)
-    else:
-        runs.append((b, b + al))
-for s, e in runs:
-    print(s, e - s)
-PYEOF
-
-    if [ ! -s "$WORK/$name.runs" ]; then
+    if write_deltas "$name" "$start"; then
+        patched_any=1
+    else
         echo "  no byte changes for $TARGET on $name (already patched on the disk?)"
-        continue
     fi
-
-    abs_start=$((start * ALIGN))
-    while read -r off len; do
-        dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
-           skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
-        abs_off=$((abs_start + off))
-        echo "  write: $len bytes at offset $abs_off"
-        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN seek=$((abs_off / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
-    done < "$WORK/$name.runs"
-    patched_any=1
 done
 
 if [ "$patched_any" = 0 ]; then
@@ -151,7 +107,7 @@ for part in "${PARTITIONS[@]}"; do
         echo "FAIL $name: disk does not match the patched partition image" >&2
         exit 1
     fi
-    debugfs -R "dump $TARGET $WORK/flist.check" "$WORK/$name.verify.img" >/dev/null 2>&1
+    fs_read "$WORK/$name.verify.img" "$TARGET" "$WORK/flist.check" || true
     remaining=$(grep -cE '^(FILE|LINK|DIR|OTHER):' "$WORK/flist.check" || true)
     if [ "$remaining" = "0" ]; then
         echo "OK   $name: $TARGET has no FILE/LINK/DIR/OTHER entries (all SKIP)"

@@ -46,15 +46,16 @@ import zlib
 from pathlib import Path
 
 # Each patch is (name, signature_hex, patch_offset, patch_hex, description,
-# rel32_exit).  signature_hex is matched against the unpatched kernel ELF with
-# "??" as a wildcard; patch_hex is written at patch_offset inside the match.
+# rel32_exit).  signature_hex is matched against the kernel ELF with "??" as a
+# wildcard; patch_hex is written at patch_offset inside the match.
 # When rel32_exit is non-zero, patch_hex is only the 0xe9 opcode and the
 # displacement is computed from the exit jump at match+rel32_exit.
 #
-# The signatures describe the *stock* bytes, so they match a vendor kernel only:
-# re-running this against an already patched bzImage reports every site as NOT
-# FOUND.  (To locate a site in a patched image, mask the bytes patch_hex
-# overwrites, as the board_data_retry comment notes.)
+# The signatures describe the *stock* bytes.  A site is located with the bytes
+# the patch overwrites masked out, so the same signature finds the site in a
+# stock kernel and in one this script already patched; the bytes actually present
+# then decide whether there is anything to do.  That makes re-running the patcher
+# on an already-patched bzImage a no-op instead of a "NOT FOUND" error.
 #
 # The comment above each entry says what the target does and when it runs, since
 # that is what decides whether the patch is still needed after a firmware bump.
@@ -217,7 +218,13 @@ def main():
     elf = bytearray(payload)
     missing = []
     for name, sig_hex, patch_off, patch, desc, rel32_exit in PATCHES:
-        hits = find_signature(bytes(elf), sig_hex)
+        # Locate the site with the bytes the patch overwrites masked out: that
+        # matches whether or not the patch has already been applied.
+        written = 5 if rel32_exit else len(patch)
+        locator = (sig_hex[:patch_off * 2]
+                   + "??" * written
+                   + sig_hex[(patch_off + written) * 2:])
+        hits = find_signature(bytes(elf), locator)
         if len(hits) == 0:
             print(f"  {name:22s}: NOT FOUND - release lacks this function")
             missing.append(name)
@@ -230,7 +237,7 @@ def main():
         va = off_to_va(bytes(elf), fo)
         if rel32_exit:
             # Re-target the jump to the exit of the block being skipped, whose
-            # displacement is read from the exit jump inside the signature.
+            # displacement is read from the exit jump inside the match.
             # Both sites are in one PT_LOAD segment, so file offsets and VAs
             # share a delta.
             exit_rel32 = struct.unpack_from("<i", bytes(elf),
