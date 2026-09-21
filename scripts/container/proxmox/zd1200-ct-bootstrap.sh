@@ -1,0 +1,814 @@
+#!/usr/bin/env bash
+#
+# scripts/container/proxmox/zd1200-ct-bootstrap.sh — provision an LXC container
+# in place, so it can run the ZD1200 QEMU guest directly (no Docker) and
+# supervise it with systemd.
+#
+# This script is executed INSIDE the container by install-zd1200-lxc.sh
+# (`pct exec <id> -- .../zd1200-ct-bootstrap.sh ...`).  It expects the repository
+# to have been copied to $REPO_DIR ($CT_REPO_DIR) first.  It is idempotent: run
+# it again to rebuild the payloads or after changing the feature set.
+#
+# The container needs three things a plain Debian CT lacks:
+#   * /dev/kvm   (passed through by the installer when the host has it) — the
+#                guest boots in ~1-2 minutes with KVM, minutes without;
+#   * /dev/net/tun (passed through by the installer) — QEMU's tap device;
+#   * a bridge with the container's eth0 as a port, so the guest's tap is an
+#     ordinary L2 neighbour (the Proxmox host can reach it; macvtap cannot).
+#
+# Design: the container is the "runtime image".  Everything host-only stays on
+# the host: the PVE host never builds or patches guest images.  All the vendor
+# artifacts and compiled payloads live under $STATE_DIR (persistent), and the
+# repo checkout stays read-only in spirit — the installer only adds symlinks
+# under scripts/container/ that point at $STATE_DIR.
+#
+# Usage:
+#   zd1200-ct-bootstrap.sh [options]
+#
+# Options:
+#   --source PATH            firmware upgrade file or CF dump (default:
+#                            $STATE_DIR/source/<single file>)
+#   --writable-from PATH     CF dump to take /writable + serial from (same
+#                            release as the firmware, any build)
+#   --writable-partition S:C override the detected /writable partition
+#   --backup PATH            ZD configuration backup (ruckus_db_*.bak) the guest
+#                            restores on its first boot (same release as the
+#                            firmware); --no-backup clears one staged earlier
+#   --root-ssh-key FILE      public key for the root SSH listener on TCP 2222
+#                            (builds the static dropbear replacement; slow)
+#   --no-ecdsa               do not add an ECDSA host key to the SSH service
+#   --no-network-monitor     skip the Network Monitor page + collectors
+#   --no-r600-repair         skip the ap-11n-scorpion (R600) mesh repair
+#   --no-console-tty         leave /dev/tty1 as a login prompt instead of
+#                            putting the guest's serial console on it
+#   --keep-ct-address        keep the container's own IP address while the guest
+#                            runs (default: release it, so only the guest is on
+#                            the LAN and in the Proxmox Summary)
+#   --share-mac              give the guest the container's own uplink MAC, so the
+#                            LAN sees exactly the identity Proxmox allocated and
+#                            no invented MAC is on the wire (default: the guest
+#                            gets its own random MAC).  The installer passes this
+#                            for a new container; the network setup cross-connects
+#                            the uplink so the shared MAC is not shadowed.
+#   --ct-dhcp                the CT's own address comes from DHCP (default)
+#   --ct-address CIDR        the CT's own static address
+#   --host-ip IP             container's own IP on the LAN (informational)
+#   --guest-ip IP            expected guest IP (used for the printed URL)
+#   --state-dir DIR          derived-artifact directory (default /var/lib/zd1200)
+#   --repo-dir DIR           repository checkout (default /opt/zd1200)
+#   --reconfigure            rewrite /etc/zd1200.conf even if it exists (the
+#                            container MAC is re-derived; only do this for a
+#                            fresh identity, not for a running appliance)
+#   --skip-packages          don't apt-get install the CT packages
+#   --skip-payloads          don't (re)build the i386 helpers / squashfs tools
+#   --skip-image             don't re-run the vendor image preparation
+#   --skip-disks             don't rebuild/patch the guest disk
+#   -h | --help
+#
+# Every step is skipped when its output already exists, so a re-run is cheap.
+set -euo pipefail
+
+REPO_DIR="${CT_REPO_DIR:-/opt/zd1200}"
+STATE_DIR="${ZD_CT_STATE_DIR:-/var/lib/zd1200}"
+IMAGE_DIR="$STATE_DIR/image"
+SOURCE=""
+CONTAINER_MAC=""
+WRITABLE_FROM=""
+WRITABLE_PARTITION=""
+BACKUP=""
+BACKUP_MODE=""
+ROOT_SSH_KEY=""
+ECDSA=1
+NETWORK_MONITOR=1
+R600_REPAIR=1
+CONSOLE_TTY=1
+KEEP_CT_ADDRESS=0
+SHARE_MAC=0
+HOST_IP=""
+GUEST_IP=""
+DO_PACKAGES=1
+DO_PAYLOADS=1
+RECONFIGURE=0
+DO_IMAGE=1
+DO_DISKS=1
+CONF=/etc/zd1200.conf
+
+log()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+
+# Verbose step output goes to a log file rather than the console: the rootfs patch
+# pipeline narrates every changed 512-byte block and every debugfs command, which
+# buries the progress in hundreds of lines.  stderr stays on the console so a real
+# failure is visible immediately, and the log is named in the summary and in
+# docs/TROUBLESHOOTING.md.
+INSTALL_LOG="${ZD_INSTALL_LOG:-$STATE_DIR/install.log}"
+run_logged() {
+    local description="$1"; shift
+    printf '  %s...\n' "$description"
+    # Both streams go to the log.  These steps narrate on stdout (every changed
+    # block) and put diagnostics on stderr (debugfs banners, missing-certificate
+    # notes), so neither belongs on the console; a failure prints the tail.
+    if ! "$@" >>"$INSTALL_LOG" 2>&1; then
+        warn "$description failed; last lines of $INSTALL_LOG:"
+        tail -25 "$INSTALL_LOG" >&2 || true
+        exit 1
+    fi
+}
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --source)               SOURCE="${2:?--source needs a path}"; shift 2 ;;
+        --container-mac)        CONTAINER_MAC="${2:?}"; shift 2 ;;
+        --ct-dhcp)              ZD_CT_ADDRESS=dhcp; shift ;;
+        --ct-address)           ZD_CT_ADDRESS="${2:?}"; shift 2 ;;
+        --writable-from)        WRITABLE_FROM="${2:?}"; shift 2 ;;
+        --writable-partition)   WRITABLE_PARTITION="${2:?}"; shift 2 ;;
+        --backup)               BACKUP="${2:?}"; shift 2 ;;
+        --no-backup)            BACKUP_MODE=clear; shift ;;
+        --root-ssh-key)         ROOT_SSH_KEY="${2:?}"; shift 2 ;;
+        --no-ecdsa)             ECDSA=0; shift ;;
+        --no-network-monitor)   NETWORK_MONITOR=0; shift ;;
+        --no-r600-repair)       R600_REPAIR=0; shift ;;
+        --no-console-tty)       CONSOLE_TTY=0; shift ;;
+        --keep-ct-address)      KEEP_CT_ADDRESS=1; shift ;;
+        --share-mac)            SHARE_MAC=1; shift ;;
+        --no-share-mac)         SHARE_MAC=0; shift ;;
+        --host-ip)              HOST_IP="${2:?}"; shift 2 ;;
+        --guest-ip)             GUEST_IP="${2:?}"; shift 2 ;;
+        --state-dir)            STATE_DIR="${2:?}"; shift 2 ;;
+        --repo-dir)             REPO_DIR="${2:?}"; shift 2 ;;
+        --skip-packages)        DO_PACKAGES=0; shift ;;
+        --skip-payloads)        DO_PAYLOADS=0; shift ;;
+        --skip-image)           DO_IMAGE=0; shift ;;
+        --skip-disks)           DO_DISKS=0; shift ;;
+        --reconfigure)          RECONFIGURE=1; shift ;;
+        -h|--help)              sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+[ "$(id -u)" = 0 ] || die "run as root inside the container"
+mkdir -p "$STATE_DIR"
+: >"$INSTALL_LOG" 2>/dev/null || true
+# Everything the pipeline shells out to.  A wrong (tiny) template is the usual
+# cause when one is missing; --skip-packages still needs python3/bash/ip.
+for cmd in bash python3 sha256sum tar gzip dd ip debugfs e2fsck; do
+    command -v "$cmd" >/dev/null 2>&1 || die "$cmd is missing: the container image does not look like a Debian LXC template"
+done
+[ -d "$REPO_DIR/scripts/container" ] || die "repository not found at $REPO_DIR (copy it in first)"
+CC="$REPO_DIR/scripts/container"
+mkdir -p "$STATE_DIR" "$IMAGE_DIR"
+
+# localise_mac <mac>: the address with the locally-administered bit set.  Used
+# only for the fallback identity when no Proxmox-allocated MAC is available.
+localise_mac() {
+    local mac="$1" o1 rest
+    IFS=: read -r o1 rest <<<"$mac"
+    printf '%02x:%s\n' "$(( 0x$o1 | 0x02 ))" "$rest"
+}
+
+# random_local_mac: a locally-administered unicast MAC with an even last octet.
+# Only used when the bootstrap is run with no seed and no identity in $CONF: a
+# normal install passes the MAC install-zd1200-lxc.sh drew from Proxmox's
+# random-MAC function (which has no equivalent inside the container).
+random_local_mac() {
+    local hex
+    hex="$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '02:%s:%s:%s:%s:%02x\n' "${hex:0:2}" "${hex:2:2}" "${hex:4:2}" "${hex:6:2}" \
+        "$(( 0x${hex:8:2} & 0xFE ))"
+}
+
+# guest_mac_seed <guest-mac>: normalise a NON-shared guest MAC1.  The value
+# handed in is the fresh random MAC install-zd1200-lxc.sh drew from Proxmox's
+# random-MAC function (or the value --container-mac overrode it with), so this
+# only lower-cases it and guarantees the last octet is even.
+#
+# Even matters because MAC2 = MAC1 + 1 (boarddata-from-mac.sh): an odd MAC1 makes
+# the pair run even/odd the wrong way round, and a last octet of 0xff carries
+# into the fifth octet, so MAC2 would no longer share MAC1's prefix.
+#
+# It is deliberately NOT the MAC Proxmox allocated for the container's port: a
+# bridge keeps a permanent local FDB entry for a port's own MAC, so a guest
+# wearing it never sees its DHCP reply.  With --share-mac the guest DOES wear the
+# uplink's MAC on purpose and the uplink is cross-connected rather than enslaved,
+# so that entry never exists; this helper is not used on that path.
+guest_mac_seed() {
+    local mac="$1" prefix last
+    prefix="$(printf '%s' "$mac" | cut -d: -f1-5)"
+    last="$(printf '%s' "$mac" | awk -F: '{print $6}')"
+    if [ -n "$prefix" ] && [ -n "$last" ]; then
+        printf '%s:%02x\n' "$prefix" "$(( 0x$last & 0xFE ))"
+    else
+        localise_mac "$mac"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# 1. packages
+# --------------------------------------------------------------------------
+# The base debian-*-standard template already has e2fsprogs, tar, gzip, python3
+# and ca-certificates; everything else the toolchain needs is installed here.
+# gcc-multilib/musl-tools are needed to rebuild the i386 guest helpers (the
+# helper sources are compiled statically, exactly as the Dockerfile does).
+if [ "$DO_PACKAGES" = 1 ]; then
+    log "installing container packages"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+        qemu-system-x86 qemu-utils \
+        e2fsprogs \
+        python3 \
+        curl \
+        iproute2 \
+        nodejs \
+        ripgrep \
+        procps \
+        gzip \
+        tar \
+        util-linux \
+        ca-certificates \
+        unzip \
+        iputils-arping \
+        iputils-ping \
+        bridge-utils \
+        build-essential \
+        git \
+        zlib1g-dev \
+        >/dev/null
+    # i386 toolchain for the Network Monitor helpers (the guest is i386 Linux).
+    if [ "$NETWORK_MONITOR" = 1 ]; then
+        dpkg --add-architecture i386
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends \
+            gcc:i386 make:i386 musl-tools:i386 libc6-dev:i386 zlib1g-dev:i386 >/dev/null 2>&1 \
+            || warn "the i386 toolchain could not be installed; the Network Monitor helpers may be stale"
+    fi
+fi
+
+# --------------------------------------------------------------------------
+# 2. runtime layout
+# --------------------------------------------------------------------------
+# The container-side scripts resolve their payloads relative to their own
+# directory (the Docker image layout: /opt/zd1200 + /opt/zd1200/image +
+# /opt/zd1200/packages).  Keep the repository where it is and add the few links
+# that make the checkout look like that layout, with the derived artifacts living
+# under $STATE_DIR.
+log "linking the runtime layout"
+ln -sfn "$STATE_DIR/image" "$CC/image"
+ln -sfn "$REPO_DIR/packages" "$CC/packages"
+# Links left by the pre-packages/ layout (analytics/, bl7/, dropbear/ at the repo
+# root) would now dangle; drop them so only one payload location exists.
+for legacy in bl7 analytics dropbear; do
+    [ -L "$CC/$legacy" ] && rm -f "$CC/$legacy"
+done
+mkdir -p "$REPO_DIR/ruckus-squashfs"
+[ -e "$CC/ruckus-squashfs" ] || ln -sfn "$REPO_DIR/ruckus-squashfs" "$CC/ruckus-squashfs"
+mkdir -p "$STATE_DIR/provision"
+[ -e "$REPO_DIR/dropbear-provision" ] || ln -sfn "$STATE_DIR/provision" "$REPO_DIR/dropbear-provision"
+
+# --------------------------------------------------------------------------
+# 3. build the payloads that are compiled rather than copied
+# --------------------------------------------------------------------------
+if [ "$DO_PAYLOADS" = 1 ]; then
+    # Order matters: build the native Ruckus squashfs tools BEFORE adding the
+    # i386 architecture below.  `dpkg --add-architecture i386` changes gcc's
+    # default library search, after which a native link can no longer resolve
+    # -lz (observed: "/bin/ld: cannot find -lz" on Debian 13).
+    # 3a. the ap-11n-scorpion (R600) mesh repair needs the matching historical
+    # LZMA squashfs tools, built from the pinned GPL-2.0 source (the Dockerfile
+    # builds the same revision in its ruckus-squashfs-tools stage).
+    if [ "$R600_REPAIR" = 1 ]; then
+        if [ ! -x "$REPO_DIR/ruckus-squashfs/mksquashfs" ]; then
+            log "building the Ruckus squashfs tools (R600 mesh repair)"
+            RUCKUS_SRC="$STATE_DIR/build/ruckus_ap_firmware_mod"
+            RUCKUS_REV=3d9e4add414228eac4091f301e813d14130c3d61
+            rm -rf "$RUCKUS_SRC"
+            mkdir -p "$RUCKUS_SRC"
+            git init -q "$RUCKUS_SRC"
+            git -C "$RUCKUS_SRC" remote add origin https://github.com/ms264556/ruckus_ap_firmware_mod.git
+            git -C "$RUCKUS_SRC" fetch -q --depth 1 origin "$RUCKUS_REV"
+            git -C "$RUCKUS_SRC" checkout -q --detach FETCH_HEAD
+            make -C "$RUCKUS_SRC/src/squashfs4.0-ruckus-lzma" -j"$(nproc)" \
+                >"$STATE_DIR/build/squashfs-build.log" 2>&1 \
+                || { tail -20 "$STATE_DIR/build/squashfs-build.log" >&2; die "squashfs build failed"; }
+            cp "$RUCKUS_SRC/src/squashfs4.0-ruckus-lzma/mksquashfs" \
+               "$RUCKUS_SRC/src/squashfs4.0-ruckus-lzma/unsquashfs" \
+               "$REPO_DIR/ruckus-squashfs/"
+        fi
+    else
+        # Without the repair the tools are never called, but
+        # build-synthetic-cf.py insists they exist.  Leave inert placeholders.
+        for t in mksquashfs unsquashfs; do
+            [ -x "$REPO_DIR/ruckus-squashfs/$t" ] || {
+                printf '#!/bin/sh\nexit 0\n' > "$REPO_DIR/ruckus-squashfs/$t"
+                chmod +x "$REPO_DIR/ruckus-squashfs/$t"
+            }
+        done
+    fi
+
+    # 3b. Network Monitor guest helpers: static i386, built with the
+    # distribution's musl-gcc + the SQLite release contemporary with the
+    # guest's Linux 2.6.32 (see the Dockerfile's analytics-helper stage).
+    if [ "$NETWORK_MONITOR" = 1 ]; then
+        if ! command -v musl-gcc >/dev/null 2>&1; then
+            # Required even when --skip-packages was used: the guest-side
+            # collectors are i386 binaries and the patch pipeline needs them.
+            log "installing the i386 helper toolchain (musl-gcc)"
+            export DEBIAN_FRONTEND=noninteractive
+            dpkg --add-architecture i386
+            apt-get update -qq
+            # libc6-dev:i386 is required: gcc:i386 alone cannot find the i386
+            # bits/wordsize.h that glibc's headers include.
+            apt-get install -y -qq --no-install-recommends \
+                gcc:i386 make:i386 musl-tools:i386 libc6-dev:i386 zlib1g-dev:i386 >/dev/null 2>&1 || true
+        fi
+        command -v musl-gcc >/dev/null 2>&1 \
+            || die "musl-gcc is unavailable: the Network Monitor helpers cannot be built (pass --no-network-monitor to skip them)"
+        log "building the Network Monitor helpers (i386, static)"
+        SQLITE_VER=3071700
+        SQLITE_SHA=022ef41bd83a1333faf40dc8f1f8469205f4a18c30dc5e137889ba7ea924ef30
+        SRC="$STATE_DIR/build/sqlite-amalgamation-$SQLITE_VER"
+        if [ ! -f "$SRC/sqlite3.c" ]; then
+            mkdir -p "$STATE_DIR/build"
+            ( cd "$STATE_DIR/build"
+              curl -fsSL "https://www.sqlite.org/2013/sqlite-amalgamation-$SQLITE_VER.zip" -o sqlite.zip
+              echo "$SQLITE_SHA  sqlite.zip" | sha256sum -c -
+              # python3 is guaranteed by the base template; skip the unzip dep.
+              python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall()" sqlite.zip )
+        fi
+        A="$REPO_DIR/packages/analytics"
+        # -w: SQLite's amalgamation produces warnings that are not ours to fix.
+        # The build is logged; only a failure prints anything.
+        build_helpers() {
+            musl-gcc -w -std=c99 -Os -static -s -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC" \
+                "$A/zd1200-ping-monitor.c" "$SRC/sqlite3.c" -o "$A/zd1200-ping-monitor" || return 1
+            musl-gcc -w -std=c99 -Os -static -s -DSQLITE_OMIT_LOAD_EXTENSION -I"$SRC" \
+                "$A/zd1200-ping-export.c" "$SRC/sqlite3.c" -lm -o "$A/zd1200-ping-export" || return 1
+            musl-gcc -w -std=c99 -Os -static -s \
+                "$A/zd1200-local-getstat.c" -o "$A/zd1200-local-getstat" || return 1
+        }
+        run_logged "compiling the Network Monitor helpers (log: $INSTALL_LOG)" build_helpers
+    fi
+
+    # 3c. optional static dropbear (public-key root SSH on TCP 2222).  The
+    # vendored builder fetches its own musl.cc cross toolchain, so this is the
+    # slowest optional step and only runs when a public key was supplied.
+    #
+    # The key is written whenever one was supplied, even when the binary is
+    # already built, so rotating the key (or removing --skip-payloads) takes
+    # effect; nothing here deletes an existing key.
+    if [ -n "$ROOT_SSH_KEY" ]; then
+        mkdir -p "$STATE_DIR/provision"
+        printf '%s\n' "$ROOT_SSH_KEY" > "$STATE_DIR/provision/authorized_keys"
+        chmod 644 "$STATE_DIR/provision/authorized_keys"
+    fi
+    if [ -n "$ROOT_SSH_KEY" ] && [ ! -x "$REPO_DIR/packages/dropbear/dropbear" ]; then
+        log "building the static dropbear replacement (slow: cross toolchain + sources)"
+        sh "$REPO_DIR/packages/dropbear/build-zd1200-dropbear.sh" \
+            --work "$STATE_DIR/build/dropbear-work" \
+            --out "$REPO_DIR/packages/dropbear" \
+            >"$STATE_DIR/build/dropbear-build.log" 2>&1 \
+            || { tail -20 "$STATE_DIR/build/dropbear-build.log" >&2; die "dropbear build failed"; }
+    fi
+fi
+
+# --------------------------------------------------------------------------
+# 4. prepare the vendor image (firmware decrypt / CF-dump parse)
+# --------------------------------------------------------------------------
+if [ "$DO_IMAGE" = 1 ] && [ ! -f "$IMAGE_DIR/rootfs.ext2" ]; then
+    log "preparing the vendor image (decrypt/parse)"
+    [ -n "$SOURCE" ] || die "no source firmware/dump: pass --source or place it in $STATE_DIR/source/"
+    [ -f "$SOURCE" ] || die "source not found: $SOURCE"
+    prepare_args=("$SOURCE")
+    [ -n "$WRITABLE_FROM" ] && prepare_args+=(--writable-from "$WRITABLE_FROM")
+    [ -n "$WRITABLE_PARTITION" ] && prepare_args+=(--writable-partition "$WRITABLE_PARTITION")
+    # sys_* temp files must not land in the image dir: the script replaces its
+    # output directory's contents.  TMPDIR under $STATE_DIR keeps the extraction
+    # staging on the same filesystem (a rename-free copy, and enough room).
+    mkdir -p "$STATE_DIR/tmp"
+    TMPDIR="$STATE_DIR/tmp" \
+    IMAGE_DIR="$IMAGE_DIR" \
+        run_logged "decrypting/parsing the input (log: $INSTALL_LOG)" \
+        bash "$REPO_DIR/scripts/build/prepare-vendor-image.sh" "${prepare_args[@]}"
+    rm -rf "$STATE_DIR/tmp"
+fi
+
+# --------------------------------------------------------------------------
+# 4b. stage the configuration backup (--backup)
+# --------------------------------------------------------------------------
+# The guest's /etc/init.d/S48zd_restore applies image/backup.bak on its first
+# boot (scripts/container/build-synthetic-cf.py copies it into the /writable it
+# seeds).  Rewrite the operator's backup so it restores on the ZD1200 whatever
+# model produced it, and re-encrypt it so the guest's verify-backup still checks
+# the release.  --no-backup clears a backup a previous run staged, so a
+# factory-reset reinstall cannot silently pick it up.
+if [ -n "$BACKUP" ]; then
+    [ -f "$BACKUP" ] || die "--backup not found: $BACKUP"
+    python3 "$REPO_DIR/scripts/build/unlock-backup.py" "$BACKUP" "$IMAGE_DIR/backup.bak" \
+        || die "could not rewrite the configuration backup for the ZD1200: $BACKUP"
+    rm -f "$IMAGE_DIR/backup-management-ip"
+    log "staging the configuration backup for the guest's first-boot restore"
+elif [ "$BACKUP_MODE" = "clear" ]; then
+    rm -f "$IMAGE_DIR/backup.bak" "$IMAGE_DIR/backup-management-ip"
+fi
+
+# --------------------------------------------------------------------------
+# 5. configuration file consumed by the systemd unit
+# --------------------------------------------------------------------------
+# The identity is captured in $CONF on the first run.  Re-deriving it later
+# would change the appliance's serial and MAC, so keep an existing file unless
+# the operator explicitly asks for a reconfigure (or the disk was removed).
+NEED_CONF=1
+if [ -s "$CONF" ] && [ "$RECONFIGURE" != 1 ]; then
+    NEED_CONF=0
+    log "keeping the existing $CONF"
+fi
+[ "$NEED_CONF" = 1 ] && log "writing $CONF"
+SIGN_DIR="$IMAGE_DIR/signing-cert"
+
+if [ "$NEED_CONF" = 1 ]; then
+# The guest's board-data identity (serial + MAC1/MAC2), as
+# install-zd1200-docker.sh builds it from the ZD_CONTAINER_MAC it writes into
+# .env.
+#
+# Two rules, chosen by --share-mac:
+#
+#   * shared (--share-mac, what the LXC installer asks for): MAC1 is the
+#     container's own uplink MAC, verbatim, so the LAN sees exactly the identity
+#     Proxmox allocated and no invented MAC is on the wire.  The network setup
+#     cross-connects the uplink instead of enslaving it, so the shared MAC is not
+#     shadowed by a bridge port's own FDB entry (see zd1200-ct-net.sh).
+#   * unshared (the default here, and the Docker flow): $CONTAINER_MAC is an
+#     independent random MAC, kept distinct from the uplink's, and its last octet
+#     is cleared so MAC2 = MAC1 + 1 stays in the same prefix (see guest_mac_seed).
+#
+# $CONTAINER_MAC is the identity seed.  install-zd1200-lxc.sh supplies the
+# container's allocated MAC when sharing, or a fresh draw from PVE's random-MAC
+# function when not; --container-mac overrides it.
+if [ -z "$CONTAINER_MAC" ] && [ -r "$CONF" ]; then
+    # A reconfigure with no seed keeps the identity already installed.
+    CONTAINER_MAC="$(sed -n 's/^ZD_MAC1=//p' "$CONF" | head -1)"
+fi
+uplink_mac="$(ip link show "${ZD_HOST_IF:-eth0}" 2>/dev/null | awk '/ether/{print tolower($2); exit}')"
+if [ "$SHARE_MAC" = 1 ]; then
+    [ -n "$uplink_mac" ] || die "--share-mac needs the uplink (${ZD_HOST_IF:-eth0}) to exist with a MAC"
+    CONTAINER_MAC="$uplink_mac"
+    log "guest shares the container's uplink MAC: $CONTAINER_MAC"
+fi
+if [ -z "$CONTAINER_MAC" ]; then
+    CONTAINER_MAC="$(random_local_mac)"
+    warn "no guest MAC seed and no existing identity in $CONF; invented $CONTAINER_MAC"
+fi
+if printf '%s' "$CONTAINER_MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; then
+    if [ "$SHARE_MAC" = 1 ]; then
+        # The uplink's MAC is used exactly as it is: MAC1 must match the port.
+        seed="$CONTAINER_MAC"
+    else
+        seed="$(guest_mac_seed "$CONTAINER_MAC")"
+        # Guard: without sharing, a guest MAC equal to the container's own port
+        # MAC would have its replies delivered to the addressless uplink instead
+        # of its tap, and the guest would sit on its 192.168.0.2 fallback with no
+        # obvious cause.
+        if [ -n "$uplink_mac" ] && [ "$seed" = "$uplink_mac" ]; then
+            die "the guest MAC ($seed) equals the container's own port MAC; pass --container-mac with a different value"
+        fi
+    fi
+    eval "$(ZD_CONTAINER_MAC="$seed" "$CC/boarddata-from-mac.sh" 2>/dev/null)" \
+        || warn "could not derive the board identity from $seed"
+    log "guest board identity: MAC1=$MAC (seed $CONTAINER_MAC)"
+else
+    warn "no usable guest MAC seed ($CONTAINER_MAC); using the fixed fallback identity"
+fi
+ZD_SERIAL="${SERIAL:-123456000789}"
+ZD_MAC1="${MAC:-00:0c:e6:12:00:01}"
+ZD_MAC2="${MAC2:-}"
+{
+    printf '# ZD1200 LXC runtime configuration (written by zd1200-ct-bootstrap.sh).\n'
+    printf '# Sourced by zd1200.service; edit with `systemctl edit` or rerun the\n'
+    printf '# installer.  Keep the shell-quoting simple.\n'
+    printf 'NETWORK_MODE=bridge\n'
+    printf 'ZD_BRIDGE_IF=br-zd\n'
+    printf 'ZD_HOST_IF=eth0\n'
+    printf 'TAP_IF=tap-zd\n'
+    # Carries the guest's address for display in the Proxmox Summary (see
+    # scripts/container/proxmox/zd1200-guest-display); created ahead of the bridge
+    # by scripts/container/proxmox/zd1200-ct-net.sh so it enumerates first and
+    # gets shown first.
+    printf 'ZD_DISPLAY_IF=zd0\n'
+    printf 'STATE_DIR=%s\n' "$STATE_DIR"
+    printf 'IMAGE_DIR=%s\n' "$STATE_DIR/image"
+    printf 'SYNTHETIC_DISK=%s\n' "$STATE_DIR/synthetic-cf.img"
+    printf 'ZD_SIGN_CERT_DIR=%s\n' "$SIGN_DIR"
+    printf 'ZD_ROOT_SSH_AUTHORIZED_KEYS=%s/provision/authorized_keys\n' "$STATE_DIR"
+    printf 'ZD_ROOT_SSH=%s\n' "$([ -x "$REPO_DIR/packages/dropbear/dropbear" ] && echo 1 || echo 0)"
+    printf 'ZD_ECDSA_SSH=%s\n' "$ECDSA"
+    printf 'ZD_CONTAINER_CONTROL=1\n'
+    # A guest poweroff stops the container rather than leaving it up with no
+    # appliance in it; `pct start` brings the container (and the guest) back.
+    printf 'ZD_POWEROFF_CONTAINER=1\n'
+    printf 'ZD_STOP_TIMEOUT=240\n'
+    printf 'WEB_WAIT_SECONDS=900\n'
+    printf 'MEMORY_MB=2048\n'
+    printf 'CPU_MODEL=n270\n'
+    printf 'KERNEL_EXTRA=nohz=off\n'
+    # How the container itself is addressed (installer's CT net spec): the
+    # network unit waits for the lease/address before moving it onto the bridge.
+    case "${ZD_CT_ADDRESS:-dhcp}" in
+        dhcp|"") printf 'ZD_CT_DHCP=1\n' ;;
+        *)       printf 'ZD_CT_ADDRESS=%s\n' "$ZD_CT_ADDRESS" ;;
+    esac
+    # The container's own address is maintenance-only: the patch pipeline is
+    # local and the healthchecks use the guest's serial control channel.  By
+    # default the entrypoint releases it while QEMU runs and takes a fresh lease
+    # when QEMU exits (scripts/container/proxmox/zd1200-ct-address); 0 keeps it up
+    # at all times.
+    printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)"
+    # The entrypoint's high-CPU guard: QEMU sustained above 95% CPU means the
+    # guest is spinning, and a spinning guest is exactly how the appliance wedges
+    # (the Docker flow leaves this at its default of 4 samples / 20s).  Keep it on
+    # but allow a longer run than the default, because a legitimate boot and the
+    # first-boot key generation are bursty.  24 samples = 120s of continuous
+    # saturation before QEMU is stopped; systemd then restarts the stack, which
+    # reboots the guest.  Set ZD_CPU_GUARD=0 to disable.
+    printf 'ZD_CPU_GUARD=%s\n' "${ZD_CPU_GUARD:-24}"
+    # Auto-reboot the guest if it stops answering.  The appliance this replaced
+    # had its guest OS wedge solid (QEMU alive, guest silent, both LAN addresses
+    # dark) and nothing noticed for hours; this turns that into a self-healing
+    # event.  Set ZD_GUEST_WATCHDOG=0 to disable.
+    printf 'ZD_GUEST_WATCHDOG=%s\n' "${ZD_GUEST_WATCHDOG:-1}"
+    printf 'ZD_GUEST_WATCHDOG_FAILURES=%s\n' "${ZD_GUEST_WATCHDOG_FAILURES:-5}"
+    printf 'ZD_CONTAINER_MAC=%s\n' "$CONTAINER_MAC"
+    printf 'ZD_BOARDDATA_FROM_MAC=1\n'
+    # Informational (the topology is now always cross-connected): records that
+    # MAC1 is the container's own uplink MAC, which is the point of the
+    # cross-connect.
+    printf 'ZD_SHARE_UPLINK_MAC=%s\n' "$SHARE_MAC"
+    printf 'ZD_SERIAL=%s\n' "$ZD_SERIAL"
+    printf 'ZD_MAC1=%s\n' "$ZD_MAC1"
+    [ -n "$ZD_MAC2" ] && printf 'ZD_MAC2=%s\n' "$ZD_MAC2"
+    # The guest's address is not knowable until it leases one, so leave GUEST_IP
+    # unset unless the operator supplied it: the entrypoint then reads the
+    # recorded lease instead of probing a guessed default.
+    [ -n "$GUEST_IP" ] && printf 'GUEST_IP=%s\n' "$GUEST_IP"
+    [ -n "$HOST_IP" ] && printf 'ZD_HOST_IP=%s\n' "$HOST_IP"
+    printf 'ZD_NETWORK_MONITOR=%s\n' "$NETWORK_MONITOR"
+} > "$CONF"
+chmod 600 "$CONF"
+fi
+
+# The console-bridge keys are reconciled even when /etc/zd1200.conf already
+# exists, so re-running the bootstrap to pick up project changes can enable (or,
+# with --no-console-tty, disable) the guest console without --reconfigure --
+# which re-derives the container's MAC and is only for a fresh identity.  Keep
+# the first value of each key and rewrite it once, so repeated enable/disable
+# cycles are idempotent instead of growing the file.
+console_sock_line="$(grep -m1 '^ZD_CONSOLE_SOCK=' "$CONF" 2>/dev/null || true)"
+console_qemu_line="$(grep -m1 '^ZD_CONSOLE_QEMU_SOCK=' "$CONF" 2>/dev/null || true)"
+sed -i '/^ZD_CONSOLE_SOCK=/d; /^ZD_CONSOLE_QEMU_SOCK=/d' "$CONF"
+if [ "$CONSOLE_TTY" = 1 ]; then
+    printf '%s\n' "${console_sock_line:-ZD_CONSOLE_SOCK=/tmp/zd1200-console.sock}" \
+                  "${console_qemu_line:-ZD_CONSOLE_QEMU_SOCK=/tmp/zd1200-console.qemu.sock}" >> "$CONF"
+fi
+
+# The container-address key is written from the flag just like the console keys,
+# so a re-run without --keep-ct-address restores the default (the address is
+# released while the guest runs).  Never leave two of the key behind.
+sed -i '/^ZD_CT_ADDRESS_FOLLOW_QEMU=/d' "$CONF"
+printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)" >> "$CONF"
+
+# The feature switches are part of the rootfs patch signature, and the entrypoint
+# runs prepare-vm-disks.sh again when the service starts: it reads them from this
+# file.  Reconcile them here so an upgrade that changes a feature (say --no-ecdsa)
+# is not re-patched with the new value and then undone by the start.
+#
+# ZD_ROOT_SSH is derived rather than flagged, because the 2222 listener is
+# installed from the built payload: the switch must follow whether
+# packages/dropbear carries the binary, or an upgrade that builds (or drops) it
+# would leave the file claiming the old state.  Nothing at runtime reads it --
+# patch 60 decides from the payload and the authorized key.
+sed -i '/^ZD_ECDSA_SSH=/d; /^ZD_NETWORK_MONITOR=/d; /^ZD_ROOT_SSH=/d' "$CONF"
+printf 'ZD_ECDSA_SSH=%s\n' "$ECDSA" >> "$CONF"
+printf 'ZD_NETWORK_MONITOR=%s\n' "$NETWORK_MONITOR" >> "$CONF"
+printf 'ZD_ROOT_SSH=%s\n' "$([ -x "$REPO_DIR/packages/dropbear/dropbear" ] && echo 1 || echo 0)" >> "$CONF"
+
+# Single source of truth from here on: the file is what the service reads.
+set -a
+# shellcheck disable=SC1090
+. "$CONF"
+set +a
+
+# --------------------------------------------------------------------------
+# 5b. container-side units: the LAN bridge and the guest service
+# --------------------------------------------------------------------------
+log "installing the container units"
+install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-ct-net.sh" /usr/local/sbin/zd1200-ct-net
+install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-ct-address" /usr/local/sbin/zd1200-ct-address
+install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-guest-healthcheck" /usr/local/sbin/zd1200-guest-healthcheck
+install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-guest-address" /usr/local/sbin/zd1200-guest-address
+install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-guest-display" /usr/local/sbin/zd1200-guest-display
+install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-guest-watchdog" /usr/local/sbin/zd1200-guest-watchdog
+if ! getent group kvm >/dev/null 2>&1; then
+    groupadd -r kvm 2>/dev/null || true
+fi
+
+cat > /etc/systemd/system/zd1200-net.service <<'UNIT'
+[Unit]
+Description=ZD1200 LAN bridge (cross-connects the container uplink)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target zd1200.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/zd1200.conf
+ExecStart=/usr/local/sbin/zd1200-ct-net
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Live health, not a log marker.  The old check grepped the serial log for the
+# guest's READY line, which stays there forever: once the guest wedged (QEMU
+# alive, guest not answering, both interfaces dark) the container still reported
+# healthy.  Probe the running appliance instead -- reachability of its own
+# address at L2, its web port, and a fresh DHCP lease for its MAC.
+cat > /etc/systemd/system/zd1200-healthcheck.service <<'UNIT'
+[Unit]
+Description=Probe the running ZD1200 guest
+After=zd1200.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/zd1200.conf
+ExecStart=/usr/local/sbin/zd1200-guest-healthcheck
+UNIT
+
+cat > /etc/systemd/system/zd1200-healthcheck.timer <<'UNIT'
+[Unit]
+Description=Periodically probe the running ZD1200 guest
+
+[Timer]
+OnBootSec=8min
+OnUnitActiveSec=60s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+# Recovery: if the guest stops answering for a run of probes, reboot it.  A
+# wedged guest is invisible to Proxmox (QEMU stays up), so this is the only thing
+# that heals it without a human.
+
+cat > /etc/systemd/system/zd1200-watchdog.service <<'UNIT'
+[Unit]
+Description=Recover the ZD1200 guest if it stops answering
+After=zd1200.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/zd1200.conf
+ExecStart=/usr/local/sbin/zd1200-guest-watchdog
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/zd1200.service <<'UNIT'
+[Unit]
+Description=ZoneDirector ZD1200 virtual appliance (QEMU guest)
+Documentation=https://github.com/ms264556/dbro_zd1200
+After=network-online.target zd1200-net.service
+Wants=network-online.target zd1200-net.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/zd1200.conf
+WorkingDirectory=REPO_DIR_PLACEHOLDER
+ExecStart=REPO_DIR_PLACEHOLDER/scripts/container/entrypoint.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=300
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# The heredoc above is quoted so $ and backslashes stay literal; substitute the
+# repo path afterwards (the unit must not depend on the installer's shell).
+sed -i "s#REPO_DIR_PLACEHOLDER#$REPO_DIR#g" /etc/systemd/system/zd1200.service
+
+systemctl daemon-reload
+systemctl enable zd1200-net.service zd1200.service >/dev/null 2>&1 || true
+systemctl enable zd1200-healthcheck.timer zd1200-watchdog.service >/dev/null 2>&1 || true
+# Start them here as well as enabling them.  These units are created *after* the
+# container booted, so multi-user.target/timers.target have already been reached
+# and `enable` alone will never start them: the guest would run with no health
+# probing and no recovery until the next container reboot.
+# The watchdog is started only after step 6 below: it probes the guest, and the
+# guest is deliberately stopped while the disk is patched, so starting it here
+# would count the patch window as failures and could reboot mid-patch.
+# Restart rather than start: an upgrade re-installs zd1200-ct-net.sh, and the
+# unit is already active from container boot (RemainAfterExit), so `start` would
+# leave the old topology in place.  The guest is stopped whenever this runs, so
+# rebuilding the uplink's cross-connect here is safe.
+systemctl restart zd1200-net.service >/dev/null 2>&1 || true
+systemctl start zd1200-healthcheck.timer >/dev/null 2>&1 || true
+# NOTE: zd1200.service is deliberately NOT started here.  Its entrypoint runs
+# prepare-vm-disks.sh too, and doing that concurrently with step 6 below (each
+# rm -rf's the same scratch directory) corrupts the patch run.  The installer (or
+# the operator) starts the service once the disk is ready.
+
+# --------------------------------------------------------------------------
+# 5c. the Proxmox "Console" tab: guest serial console on the container's tty1
+# --------------------------------------------------------------------------
+# The Console tab runs `lxc-console -n <vmid>` (PVE's default cmode=tty), which
+# attaches to the container's first tty1-equivalent that no other console client
+# already holds.  Hand that tty to the guest's ttyS0 via the bridge, so the tab
+# shows the appliance's real serial console instead of a container login prompt.
+#
+# The container keeps its own getty on /dev/tty2 (PVE's default second tty),
+# reachable from the host with `lxc-console -n <vmid> -t 2`; `pct enter`/`pct
+# exec` do not use a console tty at all, so container debugging is unaffected.
+if [ "$CONSOLE_TTY" = 1 ]; then
+    install -m 0755 "$REPO_DIR/scripts/container/proxmox/zd1200-console-bridge.py" /usr/local/sbin/zd1200-console-bridge
+    # Free tty1 for the bridge.  Inside a container Debian runs
+    # `container-getty@1`; `getty@tty1` is masked too so a non-container image
+    # cannot race the bridge for the same tty.
+    systemctl disable --now container-getty@1.service >/dev/null 2>&1 || true
+    systemctl mask container-getty@1.service >/dev/null 2>&1 || true
+    systemctl mask getty@tty1.service >/dev/null 2>&1 || true
+
+    cat > /etc/systemd/system/zd1200-console-tty.service <<'UNIT'
+[Unit]
+Description=ZD1200 guest serial console on the container console tty
+Documentation=https://github.com/ms264556/dbro_zd1200
+After=zd1200.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/zd1200.conf
+ExecStart=/usr/local/sbin/zd1200-console-bridge
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # NOTE: no Wants=zd1200.service on purpose.  This unit is started here,
+    # before the guest disk exists; a Wants would pull zd1200.service in and
+    # fight step 6 below over the same scratch directory.
+    systemctl daemon-reload
+    systemctl enable zd1200-console-tty.service >/dev/null 2>&1 || true
+    systemctl start zd1200-console-tty.service >/dev/null 2>&1 || true
+else
+    systemctl disable --now zd1200-console-tty.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/zd1200-console-tty.service /usr/local/sbin/zd1200-console-bridge
+    # Restore the login prompt on the console tty if a previous run took it.
+    systemctl unmask getty@tty1.service >/dev/null 2>&1 || true
+    systemctl unmask container-getty@1.service >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl start container-getty@1.service >/dev/null 2>&1 || true
+fi
+
+# --------------------------------------------------------------------------
+# 6. boot the guest once so the disk is built and patched
+# --------------------------------------------------------------------------
+# prepare-vm-disks.sh builds the synthetic CF, writes the board data and applies
+# the ordered rootfs patches.  Run it here (rather than letting the first
+# service start do it) so the installer can report progress and so the guest IP
+# can be discovered before the service is enabled.
+if [ "$DO_DISKS" = 1 ]; then
+    log "building and customising the guest disk (a few minutes)"
+    STATE_DIR="$STATE_DIR" \
+    SYNTHETIC_DISK="$STATE_DIR/synthetic-cf.img" \
+    IMAGE_DIR="$IMAGE_DIR" \
+    ZD_SERIAL="$ZD_SERIAL" ZD_MAC1="$ZD_MAC1" \
+    ZD_MODEL="${ZD_MODEL:-ZD1200}" ZD_CUSTOMER="${ZD_CUSTOMER:-ruckus}" \
+    ZD_SIGN_CERT_DIR="$SIGN_DIR" \
+    ZD_ECDSA_SSH="$ECDSA" \
+    ZD_NETWORK_MONITOR="$NETWORK_MONITOR" \
+    ZD_R600_REPAIR="$R600_REPAIR" \
+    ZD_ROOT_SSH_AUTHORIZED_KEYS="$STATE_DIR/provision/authorized_keys" \
+    ZD_VIRTUAL_BUILD_ID="${ZD_VIRTUAL_BUILD_ID:-}" \
+        run_logged "building and patching the guest disk (several minutes; log: $INSTALL_LOG)" \
+        "$CC/prepare-vm-disks.sh"
+fi
+
+# Only now is it safe to let the watchdog probe: the disk is patched and the
+# guest is about to run again.
+systemctl start zd1200-watchdog.service >/dev/null 2>&1 || true
+
+log "bootstrap complete"

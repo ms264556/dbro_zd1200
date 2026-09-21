@@ -1,0 +1,304 @@
+--- a/src/runopts.h	2026-07-23 23:00:00.000000000 +1200
++++ b/src/runopts.h	2026-09-05 14:58:48.289829023 +1200
+@@ -129,6 +129,18 @@
+ 	char * forced_command;
+ 	char* interface;
+ 
++	/* Alternative shell set via -e <shell_path> (Ruckus ZD1200 option) */
++	char *alt_shell;
++
++	/* Authentication type set via -A (Ruckus ZD1200 option). One of:
++	 *   "none"                       - standard dropbear auth
++	 *   "file:<userfile>:<passfile>" - read username/password from files
++	 * The plugin-compatible -A option is only when DROPBEAR_PLUGIN is set. */
++	char *auth_type;
++	/* For "file:" auth type. Points into auth_type. */
++	char *auth_username_file;
++	char *auth_passwd_file;
++
+ #if DROPBEAR_PLUGIN
+ 	/* malloced */
+ 	char *pubkey_plugin;
+--- a/src/svr-runopts.c	2026-07-23 23:00:00.000000000 +1200
++++ b/src/svr-runopts.c	2026-09-05 14:58:48.294228423 +1200
+@@ -68,7 +68,7 @@
+ 					"-R		Create hostkeys as required\n" 
+ #endif
+ 					"-F		Don't fork into background\n"
+-					"-e		Pass on server process environment to child process\n"
++					"-e <shell_path>	Alternative shell (Ruckus ZD1200)\n"
+ #ifdef DISABLE_SYSLOG
+ 					"(Syslog support not compiled in, using stderr)\n"
+ #else
+@@ -116,9 +116,11 @@
+ 					"-I <idle_timeout>  (0 is never, default %d, in seconds)\n"
+ 					"-M <max_duration>  (0 is off, default %d, in seconds)\n"
+ 					"-z    disable QoS\n"
++					"-A <authmeth>	Authentication type (Ruckus ZD1200):\n"
++					"		 none       - no authentication\n"
++					"		 file:<username_file>:<passwd_file> - read username/password from file\n"
+ #if DROPBEAR_PLUGIN
+-                                        "-A <authplugin>[,<options>]\n"
+-                                        "               Enable external public key auth through <authplugin>\n"
++					"		 <authplugin>[,<options>] - external public key auth plugin\n"
+ #endif
+ 					"-Q    <algo>   Print supported algorithms, or -Q help\n"
+ 					"-V    Version\n"
+@@ -157,6 +159,8 @@
+ 	char* reexec_fd_arg = NULL;
+ 	char* keyfile = NULL;
+ 	char *algo_print_arg = NULL;
++	char *alt_shell_arg = NULL;
++	char *auth_type_arg = NULL;
+ 	char c;
+ #if DROPBEAR_PLUGIN
+         char* pubkey_plugin = NULL;
+@@ -167,6 +171,10 @@
+ 	svr_opts.bannerfile = NULL;
+ 	svr_opts.banner = NULL;
+ 	svr_opts.forced_command = NULL;
++	svr_opts.alt_shell = NULL;
++	svr_opts.auth_type = NULL;
++	svr_opts.auth_username_file = NULL;
++	svr_opts.auth_passwd_file = NULL;
+ 	svr_opts.forkbg = 1;
+ 	svr_opts.norootlogin = 0;
+ #ifdef HAVE_GETGROUPLIST
+@@ -254,7 +262,9 @@
+ 					break;
+ #endif
+ 				case 'e':
+-					svr_opts.pass_on_env = 1;
++					/* Ruckus ZD1200: -e <shell_path> sets an alternative shell.
++					 * (Upstream uses -e as a "pass on environment" flag.) */
++					next = &alt_shell_arg;
+ 					break;
+ 
+ #if DROPBEAR_SVR_LOCALANYFWD
+@@ -362,11 +372,13 @@
+ 				case 'u':
+ 					/* backwards compatibility with old urandom option */
+ 					break;
+-#if DROPBEAR_PLUGIN
+-                                case 'A':
+-                                        next = &pubkey_plugin;
+-                                        break;
+-#endif
++				case 'A':
++					/* Ruckus ZD1200: -A <authmeth> sets the authentication type.
++					 * When DROPBEAR_PLUGIN is enabled, the value is interpreted
++					 * as an external pubkey plugin name; otherwise it is the
++					 * Ruckus auth-method string (none | file:...). */
++					next = &auth_type_arg;
++					break;
+ #if DEBUG_TRACE
+ 				case 'v':
+ 					debug_trace++;
+@@ -426,6 +438,38 @@
+ 		load_banner();
+ 	}
+ 
++	if (alt_shell_arg) {
++		svr_opts.alt_shell = m_strdup(alt_shell_arg);
++	}
++
++	if (auth_type_arg) {
++		/* Ruckus ZD1200 authentication type.
++		 *   none                          - no custom auth (standard dropbear)
++		 *   file:<username_file>:<passwd_file> - read username/password from files
++		 */
++		if (strcmp(auth_type_arg, "none") == 0) {
++			svr_opts.auth_type = m_strdup("none");
++		} else if (strncmp(auth_type_arg, "file:", 5) == 0) {
++			char *args = &auth_type_arg[5];
++			char *colon = strchr(args, ':');
++			size_t userlen;
++			if (!colon) {
++				dropbear_exit("Bad -A file: argument, expected file:<username_file>:<passwd_file>");
++			}
++			userlen = colon - args;
++			if (userlen == 0 || colon[1] == '\0') {
++				dropbear_exit("Bad -A file: argument, empty username or password file");
++			}
++			svr_opts.auth_type = m_strdup("file");
++			svr_opts.auth_username_file = m_malloc(userlen + 1);
++			memcpy(svr_opts.auth_username_file, args, userlen);
++			svr_opts.auth_username_file[userlen] = '\0';
++			svr_opts.auth_passwd_file = m_strdup(colon + 1);
++		} else {
++			dropbear_exit("Invalid input to argument -A: %s", auth_type_arg);
++		}
++	}
++
+ #ifdef HAVE_GETGROUPLIST
+ 	if (svr_opts.restrict_group) {
+ 		struct group *restrictedgroup = getgrnam(svr_opts.restrict_group);
+--- a/src/svr-chansession.c	2026-07-23 23:00:00.000000000 +1200
++++ b/src/svr-chansession.c	2026-09-05 14:58:48.301804323 +1200
+@@ -72,6 +72,15 @@
+ 	cleanupchansess /* cleanup */
+ };
+ 
++/* Ruckus ZD1200: the -e <shell_path> option overrides the user's login
++ * shell for the context of this server session. */
++static const char* get_session_shell() {
++	if (svr_opts.alt_shell != NULL) {
++		return svr_opts.alt_shell;
++	}
++	return get_user_shell();
++}
++
+ /* Returns whether the channel is ready to close. The child process
+    must not be running (has never started, or has exited) */
+ static int sesscheckclose(struct Channel *channel) {
+@@ -1006,7 +1015,7 @@
+ 	addnewvar("USER", ses.authstate.pw_name);
+ 	addnewvar("LOGNAME", ses.authstate.pw_name);
+ 	addnewvar("HOME", ses.authstate.pw_dir);
+-	addnewvar("SHELL", get_user_shell());
++	addnewvar("SHELL", get_session_shell());
+ 	if (getuid() == 0) {
+ 		addnewvar("PATH", DEFAULT_ROOT_PATH);
+ 	} else {
+@@ -1061,7 +1070,7 @@
+ 	svr_agentset(chansess);
+ #endif
+ 
+-	usershell = m_strdup(get_user_shell());
++	usershell = m_strdup(get_session_shell());
+ 	run_shell_command(chansess->cmd, ses.maxfd, usershell);
+ 
+ 	/* only reached on error */
+--- a/src/svr-authpasswd.c	2026-07-23 23:00:00.000000000 +1200
++++ b/src/svr-authpasswd.c	2026-09-05 14:58:48.306265723 +1200
+@@ -46,6 +46,65 @@
+ 	return constant_time_memcmp(a, b, la);
+ }
+ 
++/* Check a password against the file-based user/password store configured
++ * through -A file:<username_file>:<passwd_file> (Ruckus ZD1200).
++ *
++ * The username file and password file are parallel lists, one entry per line:
++ * the N-th line of the username file is the requested username and the N-th
++ * line of the password file is its corresponding password (compared in
++ * constant time).  Returns DROPBEAR_SUCCESS on a match, DROPBEAR_FAILURE
++ * otherwise. */
++static int check_file_password(const char *username, const char *password) {
++	FILE *uf = NULL;
++	FILE *pf = NULL;
++	int result = DROPBEAR_FAILURE;
++	buffer *ubuf = NULL;
++	buffer *pbuf = NULL;
++
++	if (svr_opts.auth_username_file == NULL || svr_opts.auth_passwd_file == NULL) {
++		return DROPBEAR_FAILURE;
++	}
++
++	uf = fopen(svr_opts.auth_username_file, "r");
++	if (uf == NULL) {
++		dropbear_log(LOG_WARNING, "Cannot open auth username file '%s'",
++				svr_opts.auth_username_file);
++		return DROPBEAR_FAILURE;
++	}
++	pf = fopen(svr_opts.auth_passwd_file, "r");
++	if (pf == NULL) {
++		dropbear_log(LOG_WARNING, "Cannot open auth password file '%s'",
++				svr_opts.auth_passwd_file);
++		fclose(uf);
++		return DROPBEAR_FAILURE;
++	}
++
++	ubuf = buf_new(DROPBEAR_MAX_LINE_LENGTH + 1);
++	pbuf = buf_new(DROPBEAR_MAX_LINE_LENGTH + 1);
++
++	while (buf_getline(ubuf, uf) == DROPBEAR_SUCCESS) {
++		/* null-terminate the line for the comparisons below */
++		ubuf->data[ubuf->len] = '\0';
++		if (buf_getline(pbuf, pf) == DROPBEAR_FAILURE) {
++			/* password file ran out of entries */
++			break;
++		}
++		pbuf->data[pbuf->len] = '\0';
++		if (strcmp((const char*)ubuf->data, username) == 0) {
++			if (constant_time_strcmp((const char*)pbuf->data, password) == 0) {
++				result = DROPBEAR_SUCCESS;
++			}
++			break;
++		}
++	}
++
++	buf_free(ubuf);
++	buf_free(pbuf);
++	fclose(uf);
++	fclose(pf);
++	return result;
++}
++
+ /* Process a password auth request, sending success or failure messages as
+  * appropriate */
+ void svr_auth_password(int valid_user) {
+@@ -55,6 +114,7 @@
+ 	char * password = NULL;
+ 	unsigned int passwordlen;
+ 	unsigned int changepw;
++	int file_auth_ok = 0;
+ 
+ 	/* check if client wants to change password */
+ 	changepw = buf_getbool(ses.payload);
+@@ -66,9 +126,15 @@
+ 
+ 	password = buf_getstring(ses.payload, &passwordlen);
+ 	if (valid_user && passwordlen <= DROPBEAR_MAX_PASSWORD_LEN) {
+-		/* the first bytes of passwdcrypt are the salt */
+-		passwdcrypt = ses.authstate.pw_passwd;
+-		testcrypt = crypt(password, passwdcrypt);
++		if (svr_opts.auth_type != NULL && strcmp(svr_opts.auth_type, "file") == 0) {
++			/* Ruckus ZD1200 file-based authentication type */
++			file_auth_ok = (check_file_password(ses.authstate.pw_name, password)
++					== DROPBEAR_SUCCESS);
++		} else {
++			/* the first bytes of passwdcrypt are the salt */
++			passwdcrypt = ses.authstate.pw_passwd;
++			testcrypt = crypt(password, passwdcrypt);
++		}
+ 	}
+ 	m_burn(password, passwordlen);
+ 	m_free(password);
+@@ -89,23 +155,31 @@
+ 		return;
+ 	}
+ 
+-	if (testcrypt == NULL) {
++	/* For the file-based auth type the check has already been done above. */
++	if (svr_opts.auth_type != NULL && strcmp(svr_opts.auth_type, "file") == 0) {
++		if (!file_auth_ok) {
++			dropbear_log(LOG_WARNING,
++					"Bad password attempt for '%s' from %s",
++					ses.authstate.pw_name,
++					svr_ses.addrstring);
++			send_msg_userauth_failure(0, 1);
++			return;
++		}
++	} else if (testcrypt == NULL) {
+ 		/* crypt() with an invalid salt like "!!" */
+ 		dropbear_log(LOG_WARNING, "User account '%s' is locked",
+ 				ses.authstate.pw_name);
+ 		send_msg_userauth_failure(0, 1);
+ 		return;
+-	}
+-
+-	/* check for empty password */
+-	if (passwdcrypt[0] == '\0') {
++	} else if (passwdcrypt[0] == '\0') {
++		/* check for empty password */
+ 		dropbear_log(LOG_WARNING, "User '%s' has blank password, rejected",
+ 				ses.authstate.pw_name);
+ 		send_msg_userauth_failure(0, 1);
+ 		return;
+ 	}
+ 
+-	if (constant_time_strcmp(testcrypt, passwdcrypt) == 0) {
++	if (file_auth_ok || constant_time_strcmp(testcrypt, passwdcrypt) == 0) {
+ 		if (svr_opts.multiauthmethod && (ses.authstate.authtypes & ~AUTH_TYPE_PASSWORD)) {
+ 			/* successful password authentication, but extra auth required */
+ 			dropbear_log(LOG_NOTICE,

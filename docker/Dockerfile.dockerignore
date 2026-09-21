@@ -1,0 +1,18 @@
+.git
+.gitignore
+qemu-tmp/
+__pycache__/
+archive/
+rootfs/
+image/
+analysis-*/
+*.log
+*.tgz
+*.img
+*.qcow2
+*.qcow2.*
+*.runtime.gz
+*.runtime.gz.sha256
+synthetic-cf.img
+# Proxmox LXC-only container runtime; the Docker flow never uses it.
+scripts/container/proxmox/

@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# scripts/container/proxmox/zd1200-guest-address — the guest's current address.
+#
+# The guest is the authority on its own lease: it asked the LAN's DHCP server for
+# it, so it is asked here over the container control channel (ttyS1, the same
+# private port the orderly shutdown uses).  The guest replies "ZD-GUEST-IP=<addr>"
+# and the value is cached in $ZD_GUEST_IP_FILE for callers that only want to read
+# it (the watchdog probes on a timer).
+#
+# Nothing is inferred: no fixed default, no ARP sweep, no candidate probing.  If
+# the guest does not answer, there is no address to report.
+#
+# Prints the address on stdout, or nothing.
+# Exit 0 when known, 1 otherwise.
+#
+# Options:
+#   --ask         ask the guest now even if a cached value exists
+#   --probe       ask for the address AND whether the guest's management service
+#                 is bound, as "ZD-GUEST-IP=<addr>" / "ZD-SERVICE-443=<state>"
+#                 (state is "listening" or "-").  Used by the healthcheck: the
+#                 container cannot probe the guest over IP once the guest's
+#                 address is held locally for display, so the guest is asked
+#                 directly over the control channel instead.
+#   --timeout SEC budget for the guest's answer (default 10)
+#   --file PATH   cache file (default $ZD_GUEST_IP_FILE)
+#   --sock PATH   control socket (default $ZD_CONTROL_SOCK)
+#   --diag        print the guest's interfaces, addresses and bound drivers
+#                 instead of an address (for diagnosing a NIC change)
+set -u
+
+STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
+LEASE_FILE="${ZD_GUEST_IP_FILE:-$STATE_DIR/guest-ip}"
+CONTROL_SOCK="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
+# How long the guest is given to answer.  The healthcheck sets this to the
+# timer's budget (ZD_ADDRESS_TIMEOUT); an operator running the script by hand
+# gets the longer default.
+TIMEOUT="${ZD_ADDRESS_TIMEOUT:-10}"
+ASK=0
+DIAG=0
+PROBE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ask)  ASK=1; shift ;;
+        --probe) PROBE=1; shift ;;
+        --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
+        --diag) DIAG=1; shift ;;
+        --file) LEASE_FILE="${2:?}"; shift 2 ;;
+        --sock) CONTROL_SOCK="${2:?}"; shift 2 ;;
+        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+# The budget becomes an integer deadline in the guest query, so reject anything
+# else here rather than letting it be lost to a caller's stderr redirection.
+case "$TIMEOUT" in
+    ""|*[!0-9]*) echo "invalid timeout: $TIMEOUT" >&2; exit 2 ;;
+esac
+
+emit() {
+    [ -n "$1" ] || return 1
+    [ -n "$LEASE_FILE" ] && printf '%s\n' "$1" >"$LEASE_FILE" 2>/dev/null
+    printf '%s\n' "$1"
+}
+
+# Diagnostic mode: ask the guest what it has and print that verbatim.  This is what
+# makes a NIC change observable without logging into the appliance, whose console
+# needs credentials the operator may not have.
+if [ "$DIAG" = 1 ]; then
+    [ -S "$CONTROL_SOCK" ] || { echo "no control channel at $CONTROL_SOCK" >&2; exit 1; }
+    timeout 15 python3 - "$CONTROL_SOCK" <<'PYEOF'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(sys.argv[1])
+s.sendall(b"diag\n")
+buf, deadline = b"", time.time() + 10
+while time.time() < deadline:
+    try:
+        chunk = s.recv(512)
+    except socket.timeout:
+        break
+    if not chunk:
+        break
+    buf += chunk
+    if b"ZD-END=diag" in buf:
+        break
+s.close()
+for line in buf.decode("ascii", "replace").splitlines():
+    if line.startswith("ZD-"):
+        print(line)
+PYEOF
+    exit 0
+fi
+
+# An operator-pinned address wins, as does a cached answer.
+if [ -n "${ZD_GUEST_IP:-}" ]; then
+    emit "$ZD_GUEST_IP"
+    exit 0
+fi
+if [ "$ASK" = 0 ] && [ -r "$LEASE_FILE" ]; then
+    cached="$(head -n1 "$LEASE_FILE" 2>/dev/null | tr -d ' \r\n')"
+    case "$cached" in
+        ""|*[!0-9.]*) : ;;
+        *) emit "$cached"; exit 0 ;;
+    esac
+fi
+
+# Ask the guest.  It answers on the same serial port; QEMU's chardev echoes what
+# is sent, so the reply is identified by its marker rather than by order.  Reads
+# whole lines: the reply arrives in fragments (the serial chardev splits it), and
+# matching a partial buffer yields a truncated address such as "10".
+query_guest() { # query_guest <command> <marker>...
+    [ -S "$CONTROL_SOCK" ] || return 1
+    python3 - "$CONTROL_SOCK" "$TIMEOUT" "$@" <<'PY' 2>/dev/null || true
+import socket, sys, time
+
+sock_path, timeout, command = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+markers = tuple(m.encode() for m in sys.argv[4:])
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(sock_path)
+    s.sendall(command.encode() + b"\n")
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(512)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip().replace(b"\r", b"")
+            if line.startswith(markers):
+                value = line.split(b"=", 1)[1].decode("ascii", "replace").strip()
+                if value:
+                    print(value)
+                sys.exit(0)
+    s.close()
+except OSError:
+    pass
+PY
+}
+
+# One round trip for both facts health wants: the address and whether the guest's
+# management service is bound.  Asking together keeps a healthcheck tick to a
+# single serial query.
+if [ "$PROBE" = 1 ]; then
+    addr="$(query_guest address ZD-GUEST-IP= || true)"
+    svc="$(query_guest ready ZD-SERVICE-443= || true)"
+    [ -n "$addr" ] && printf 'ZD-GUEST-IP=%s\n' "$addr"
+    [ -n "$svc" ] && printf 'ZD-SERVICE-443=%s\n' "$svc"
+    [ -n "$addr" ] && exit 0
+    exit 1
+fi
+
+reply="$(query_guest address ZD-GUEST-IP= || true)"
+[ -n "$reply" ] && emit "$reply" && exit 0
+exit 1

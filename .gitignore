@@ -4,12 +4,20 @@ synthetic-cf.img
 *.qcow2.*
 qemu-tmp/
 image/
-runtime/
-vendor/
 archive/
 rootfs/
 bootinitramfs.runtime.gz
 bootinitramfs.runtime.gz.sha256
+
+# Dropbear provisioning inputs (keypair, hostkey, 2222 init) and patch work dirs
+dropbear-provision/
+.rootfs-patch-work/
+bzImage.patched
+
+# Built SquashFS tools and the runtime symlinks the LXC bootstrap adds to the
+# checkout (scripts/container/image is already covered by image/ above).
+ruckus-squashfs/
+scripts/container/packages
 
 # Original packages, diagnostics and logs
 *.img
@@ -33,6 +41,9 @@ __pycache__/
 *.key
 *.pem
 
-# Operator-provided diagnostic SSH material.  Never ship a reusable key.
-zd-dropbear2222/authorized_keys
-zd-dropbear2222/testkey*
+# Local agent and test state
+.reasonix/
+reasonix.toml
+
+# scripts/test/boot-test.sh state (synthetic CF, qcow2 overlay, serial log)
+.boot-test/

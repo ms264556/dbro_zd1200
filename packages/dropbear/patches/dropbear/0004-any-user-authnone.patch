@@ -1,0 +1,24 @@
+--- a/src/svr-auth.c	2026-07-23 11:00:00.000000000 +0000
++++ b/src/svr-auth.c
+@@ -266,6 +266,21 @@
+ 		}
+ 	}
+ 
++	/* Ruckus ZD1200: -A none means no SSH authentication, so accept *any*
++	 * username.  If it isn't a real system user, synthesize a root login so the
++	 * -e login shell (the ruckus CLI, /bin/login.sh) can start; that shell's
++	 * own /bin/login then performs the real credential check. */
++	if (!ses.authstate.pw_name
++			&& svr_opts.auth_type != NULL
++			&& strcmp(svr_opts.auth_type, "none") == 0) {
++		ses.authstate.pw_uid = 0;
++		ses.authstate.pw_gid = 0;
++		ses.authstate.pw_name = m_strdup("root");
++		ses.authstate.pw_dir = m_strdup("/root");
++		ses.authstate.pw_shell = m_strdup("/bin/sh");
++		ses.authstate.pw_passwd = m_strdup("*");
++	}
++
+ 	/* avoids cluttering logs with repeated failure messages from
+ 	consecutive authentication requests in a sesssion */
+ 	if (ses.authstate.checkusername_failed) {

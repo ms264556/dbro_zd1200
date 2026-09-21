@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# scripts/container/proxmox/zd1200-ct-address — hold or release the container's own LAN address.
+#
+# The container needs an address of its own for maintenance only: installing
+# packages, `git pull`, an operator shell.  Nothing that runs alongside the guest
+# does.  The patch pipeline (prepare-vm-disks.sh) is entirely local, and the
+# healthcheck, watchdog, guest-address and guest-display helpers all use the
+# guest's serial control channel, not IP.  So while QEMU runs the container can
+# hand its address back, leaving the appliance as the only thing on the LAN and
+# the Proxmox Summary showing only the guest (see scripts/container/proxmox/zd1200-ct-net.sh).
+#
+#   up      acquire the address if it is absent (a fresh DHCP transaction, or
+#           the configured static address)
+#   down    release it, sending the DHCP lease back
+#   status  print the address; exit 0 when present, 1 when absent
+#
+# The address lives on the container-side bridge ($ZD_BRIDGE_IF), never on the
+# uplink port.  A DHCP lease is never re-added from memory: the server may have
+# handed the address to somebody else while the guest was running, so `up` asks
+# again (observed: the same container came back on a different address).
+#
+# Configuration comes from /etc/zd1200.conf via the caller's environment
+# (ZD_BRIDGE_IF, ZD_CT_DHCP, ZD_CT_ADDRESS).
+set -euo pipefail
+
+# The systemd service passes /etc/zd1200.conf in the environment, but a manual
+# `pct exec <id> -- zd1200-ct-address up` does not, so load it here too.  Without
+# this the helper would not know the container is DHCP-addressed and would fall
+# back to re-adding a remembered address.
+ZD_CONFIG_FILE="${ZD_CONFIG_FILE:-/etc/zd1200.conf}"
+if [ -r "$ZD_CONFIG_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ZD_CONFIG_FILE"
+    set +a
+fi
+
+BRIDGE_IF="${ZD_BRIDGE_IF:-br-zd}"
+HOST_IF="${ZD_HOST_IF:-eth0}"
+STATE_FILE="${ZD_CT_ADDRESS_STATE:-/run/zd1200-net.address}"
+DHCLIENT_PID="${ZD_DHCLIENT_PID:-/run/zd1200-dhclient.pid}"
+DHCLIENT_LEASE="${ZD_DHCLIENT_LEASE:-/run/zd1200-dhclient.leases}"
+DHCLIENT_TIMEOUT="${ZD_CT_ADDRESS_TIMEOUT:-30}"
+SHARE_UPLINK_MAC="${ZD_SHARE_UPLINK_MAC:-0}"
+BRIDGE_MAC_ADDRESS="${ZD_BRIDGE_MAC_ADDRESS:-02:00:00:00:00:01}"
+
+log() { printf 'zd1200-ct-address: %s\n' "$*"; }
+
+# Give the bridge the MAC of whoever currently owns the hypervisor-allocated
+# address.  With the shared MAC the container and the guest take turns: the
+# container holds the address on the bridge while the guest is down, so the
+# bridge wears the uplink's MAC; for as long as QEMU runs the bridge wears its
+# own distinct MAC and the guest wears the shared one.  `up`/`down` are called
+# around QEMU by the entrypoint, so this is where the handover happens.  A
+# no-op without sharing (the container has its own distinct identity then).
+set_owner_mac() {   # container | guest
+    [ "$SHARE_UPLINK_MAC" = 1 ] || return 0
+    local want current
+    if [ "$1" = container ]; then
+        want="$(cat "/sys/class/net/$HOST_IF/address" 2>/dev/null || true)"
+    else
+        want="$BRIDGE_MAC_ADDRESS"
+    fi
+    [ -n "$want" ] || return 0
+    current="$(cat "/sys/class/net/$BRIDGE_IF/address" 2>/dev/null || true)"
+    if [ "$current" != "$want" ]; then
+        ip link set "$BRIDGE_IF" address "$want" 2>/dev/null || true
+        log "bridge MAC ${current:-?} -> $want ($1 holds the shared MAC)"
+    fi
+}
+
+addresses() {
+    ip -4 -o addr show dev "$BRIDGE_IF" scope global 2>/dev/null \
+        | awk '{ print $4 }' || true
+}
+
+gateway() {
+    ip -4 route show default 2>/dev/null | awk '/via/ { print $3; exit }' || true
+}
+
+# Remember the address and gateway so a later re-run of zd1200-ct-net.sh (or an
+# `up` that cannot reach DHCP) has something to fall back to.
+record() {
+    local addrs="$1" gw="$2"
+    [ -n "$addrs" ] || return 0
+    {
+        printf 'ADDRS=%s\n' "$(printf '%s' "$addrs" | tr '\n' ' ')"
+        [ -n "$gw" ] && printf 'GATEWAY=%s\n' "$gw"
+    } >"$STATE_FILE" 2>/dev/null || true
+}
+
+# Release the lease and stop the client, so the DHCP server may reuse the
+# address while the guest runs.  Best effort: there may be no client running,
+# and a container that never had a DHCP lease must still come down cleanly.
+stop_client() {
+    if command -v dhclient >/dev/null 2>&1; then
+        timeout 10 dhclient -r -pf "$DHCLIENT_PID" -lf "$DHCLIENT_LEASE" \
+            "$BRIDGE_IF" >/dev/null 2>&1 || true
+    fi
+    pkill -f "dhclient.*$BRIDGE_IF" 2>/dev/null || true
+    rm -f "$DHCLIENT_PID" 2>/dev/null || true
+}
+
+up() {
+    local addrs gw recorded
+    # The container is about to hold the address, so it takes the shared MAC
+    # back (before the lease is requested, so DHCP sees the shared identity).
+    set_owner_mac container
+    addrs="$(addresses)"
+    if [ -n "$addrs" ]; then
+        log "$BRIDGE_IF already holds $(printf '%s' "$addrs" | tr '\n' ' ')"
+        record "$addrs" "$(gateway)"
+        return 0
+    fi
+
+    if [ "${ZD_CT_DHCP:-0}" = 1 ] || [ -r /etc/zd1200-net.want-address ]; then
+        if command -v dhclient >/dev/null 2>&1; then
+            log "requesting a lease on $BRIDGE_IF"
+            # -1: one attempt.  No -r/-x: acquiring must not release anything.
+            if ! timeout "$DHCLIENT_TIMEOUT" dhclient -1 -4 \
+                    -pf "$DHCLIENT_PID" -lf "$DHCLIENT_LEASE" "$BRIDGE_IF" \
+                    >/dev/null 2>&1; then
+                log "dhclient did not get a lease within ${DHCLIENT_TIMEOUT}s"
+            fi
+        else
+            log "no dhclient in this container"
+        fi
+    fi
+    addrs="$(addresses)"
+
+    if [ -z "$addrs" ] && [ -n "${ZD_CT_ADDRESS:-}" ]; then
+        ip addr replace "$ZD_CT_ADDRESS" dev "$BRIDGE_IF"
+        addrs="$(addresses)"
+    fi
+    if [ -z "$addrs" ]; then
+        # Last resort: the address recorded when the bridge was last up.  Only
+        # used when there is no DHCP client and no static address configured.
+        recorded="$(sed -n 's/^ADDRS=//p' "$STATE_FILE" 2>/dev/null | head -n1)"
+        for a in $recorded; do
+            ip addr replace "$a" dev "$BRIDGE_IF" 2>/dev/null || true
+        done
+        addrs="$(addresses)"
+    fi
+
+    gw="$(gateway)"
+    if [ -z "$gw" ]; then
+        gw="$(sed -n 's/^GATEWAY=//p' "$STATE_FILE" 2>/dev/null | head -n1)"
+    fi
+    if [ -n "$addrs" ] && [ -n "$gw" ]; then
+        ip route replace default via "$gw" dev "$BRIDGE_IF" 2>/dev/null || true
+    fi
+    record "$addrs" "$gw"
+
+    if [ -n "$addrs" ]; then
+        log "$BRIDGE_IF now holds $(printf '%s' "$addrs" | tr '\n' ' ')"
+        return 0
+    fi
+    log "could not put an address on $BRIDGE_IF"
+    return 1
+}
+
+down() {
+    local addrs gw
+    addrs="$(addresses)"
+    gw="$(gateway)"
+    record "$addrs" "$gw"
+    stop_client
+    if [ -n "$addrs" ]; then
+        ip addr flush dev "$BRIDGE_IF" scope global 2>/dev/null || true
+        log "released $(printf '%s' "$addrs" | tr '\n' ' ') on $BRIDGE_IF"
+    else
+        log "$BRIDGE_IF already has no address"
+    fi
+    ip route del default 2>/dev/null || true
+    # Hand the shared MAC to the guest: with the address gone, the bridge moves
+    # to its own distinct MAC so it cannot collide with the guest that is about
+    # to wear the shared one.
+    set_owner_mac guest
+    return 0
+}
+
+case "${1:-}" in
+    up)     up ;;
+    down)   down ;;
+    status)
+        addrs="$(addresses)"
+        [ -n "$addrs" ] || exit 1
+        printf '%s\n' "$addrs"
+        ;;
+    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) echo "usage: $(basename "$0") up|down|status" >&2; exit 2 ;;
+esac

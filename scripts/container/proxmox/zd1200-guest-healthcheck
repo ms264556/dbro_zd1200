@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+#
+# scripts/container/proxmox/zd1200-guest-healthcheck — ask the running ZD1200 guest whether it is
+# healthy, over the serial control channel and nothing else.
+#
+# Exit 0 = the guest answered and says it is up; non-zero = it did not, and
+# systemd records the failure.  Run by zd1200-healthcheck.service on a timer
+# (and by hand for diagnostics).
+#
+# Why serial only
+# ---------------
+# The container must not probe the guest over the network:
+#
+#   * the guest's address is held locally on the display interface so Proxmox
+#     can show it (see zd1200-guest-display).  An address held locally
+#     is answered by this container, not the guest, so an ICMP/ARP probe from
+#     here tests the container's own stack -- it passes even when the guest is
+#     dead, which is worse than no check at all;
+#   * the appliance is the authority on itself.  It can see things the container
+#     cannot: whether its management service is answering, on whatever address
+#     and family it chose to bind.
+#
+# TtyS1 is a private, non-networked channel, so a reply that comes back proves
+# the guest's kernel, its init and its userspace are all still running.  The
+# guest answers two questions in one round trip:
+#
+#   address  -> its current address (a DHCP lease, so it may change)
+#   ready    -> whether its management service answers a request to itself
+#
+# The guest performs that request locally (see the `ready` command in
+# scripts/container/patches/70-container-control.sh): a real HTTPS request
+# against 127.0.0.1, not a socket-table read.  A table read was tried and was
+# wrong in the dangerous direction -- it reported "not listening" on an
+# appliance that was demonstrably serving the wizard.
+set -u
+
+STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
+GUEST_IP_FILE="${ZD_GUEST_IP_FILE:-$STATE_DIR/guest-ip}"
+HELPER="${ZD_ADDRESS_HELPER:-/usr/local/sbin/zd1200-guest-address}"
+DISPLAY_HELPER="${ZD_DISPLAY_HELPER:-/usr/local/sbin/zd1200-guest-display}"
+TIMEOUT="${ZD_ADDRESS_TIMEOUT:-6}"
+VERBOSE="${ZD_HEALTHCHECK_VERBOSE:-0}"
+
+say() { printf 'zd1200-healthcheck: %s\n' "$*"; }
+note() { [ "$VERBOSE" = 1 ] && say "$*" || true; }
+
+case "$TIMEOUT" in
+    ""|*[!0-9]*)
+        say "ZD_ADDRESS_TIMEOUT is not an integer: $TIMEOUT"
+        exit 2
+        ;;
+esac
+
+# --- 1. ask the guest, over the serial channel only --------------------------
+# Any failure to reach the control channel, or a silent guest, is the same
+# verdict: the appliance did not answer.
+if [ ! -x "$HELPER" ]; then
+    say "address helper $HELPER is missing or not executable"
+    exit 1
+fi
+
+# The address first.  Accept the marked form ("ZD-GUEST-IP=...") and a bare
+# address: the helper has emitted both, and a healthcheck should not turn a
+# helper's formatting choice into "the guest is dead".
+err_file="$(mktemp 2>/dev/null || echo /dev/null)"
+probe_out="$("$HELPER" --timeout "$TIMEOUT" 2>"$err_file" || true)"
+probe_err="$(head -n1 "$err_file" 2>/dev/null || true)"
+[ "$err_file" = "/dev/null" ] || rm -f "$err_file"
+
+guest_ip=""
+guest_service=""
+while IFS= read -r line; do
+    case "$line" in
+        ZD-GUEST-IP=*)    guest_ip="${line#ZD-GUEST-IP=}" ;;
+        ZD-SERVICE-443=*) guest_service="${line#ZD-SERVICE-443=}" ;;
+        *[!0-9.]*|"")     ;;
+        *)                [ -z "$guest_ip" ] && guest_ip="$line" ;;
+    esac
+done <<EOF
+$probe_out
+EOF
+
+if [ -z "$guest_ip" ]; then
+    say "the guest did not answer on the control channel (ttyS1): it is not responding"
+    [ -n "$probe_err" ] && say "the address helper reported: $probe_err"
+    exit 1
+fi
+
+case "$guest_ip" in
+    *[!0-9.]*) say "guest address '$guest_ip' is not an IPv4 address"; exit 1 ;;
+esac
+
+# Then whether its management service is answering.  `--diag` is used rather
+# than a second `--probe`: it is the same serial channel and the guest has been
+# observed answering it even when `--probe`'s service query returns nothing.  A
+# failure here is not fatal on its own -- an older guest build may not report a
+# state at all, and the reply we already got proves the guest is running.
+if [ -z "$guest_service" ]; then
+    err_file="$(mktemp 2>/dev/null || echo /dev/null)"
+    diag_out="$("$HELPER" --diag 2>"$err_file" || true)"
+    [ "$err_file" = "/dev/null" ] || rm -f "$err_file"
+    guest_service="$(printf '%s\n' "$diag_out" | sed -n 's/^ZD-SERVICE-443=//p' | head -n1)"
+fi
+
+# The appliance answers for itself: if it says its management service is up, it
+# is up.
+case "$guest_service" in
+    listening)
+        note "the guest reports its management service is answering on 443"
+        ;;
+    "")
+        note "the guest did not report a service state (older guest build?)"
+        ;;
+    *)
+        say "the guest answered but reports its management service is NOT answering on 443"
+        exit 1
+        ;;
+esac
+
+# --- 2. publish the address for the Proxmox Summary --------------------------
+# The guest's address is a lease, so this is re-asserted every tick: a renewal
+# onto a different address moves the displayed value with it.  A failure here is
+# not a health failure -- the appliance can be perfectly healthy while the
+# displayed value is wrong.
+if [ -n "$guest_ip" ]; then
+    printf '%s\n' "$guest_ip" > "$GUEST_IP_FILE" 2>/dev/null || true
+    if [ -x "$DISPLAY_HELPER" ]; then
+        "$DISPLAY_HELPER" --quiet >/dev/null 2>&1 || note "could not update the displayed address"
+    fi
+fi
+
+say "guest ${guest_ip:-unknown} is healthy"
+exit 0

@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# NOTE: This is the container's ENTRYPOINT. It is run by Docker Compose as the
+# zd1200 container command — do NOT run it directly on the host as a standalone
+# flow. The supported way to run this project is `sudo ./install-zd1200-docker.sh`
+# (= docker compose up -d --build). See README.md.
+set -euo pipefail
+
+# Exit status prepare-vm-disks.sh returns when the saved GRUB entry is a rescue
+# entry (it has already printed how to rebuild the machinery).  This entrypoint
+# stops the container cleanly rather than letting Compose restart it.
+RET_RESCUE_ACTIVE=4
+
+work_dir="$(cd "$(dirname "$0")" && pwd)"
+log_file="${LOG_FILE:-/tmp/zd1200-console.log}"
+control_sock="${ZD_CONTROL_SOCK:-/tmp/zd1200-control.sock}"
+qemu_pid=""
+limiter_pid=""
+started_at=$SECONDS
+high_cpu_samples=0
+ready=0
+http_status=""
+http_port="${HTTP_PORT:-38080}"
+https_port="${HTTPS_PORT-38443}"
+network_mode="${NETWORK_MODE:-user}"
+# The guest's address is whatever the LAN's DHCP server leased it, so it is asked
+# for it on the control channel (see scripts/container/proxmox/zd1200-guest-address)
+# or taken from an explicitly configured GUEST_IP.  There is deliberately no
+# guessed default:
+# probing an address that may not be the guest's makes a healthy guest look dead,
+# and then the readiness deadline restarts it.
+guest_ip="${GUEST_IP:-}"
+address_helper="${ZD_ADDRESS_HELPER:-$work_dir/zd1200-guest-address}"
+state_dir="${STATE_DIR:-$work_dir}"
+synthetic_disk="${SYNTHETIC_DISK:-$state_dir/synthetic-cf.img}"
+vm_snapshot="${VM_SNAPSHOT:-0}"
+cpu_limit="${CPU_LIMIT:-}"
+# Consecutive >95% CPU samples (5s each) before the supervisor stops QEMU.
+# The 2.6.32 guest can legitimately spin during TCG boot/keygen phases, which
+# false-triggers this watchdog; set 0/off/none to disable it.
+cpu_guard="${ZD_CPU_GUARD:-4}"
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    vm_accel=kvm
+else
+    vm_accel=tcg
+fi
+
+# The container's own LAN address is maintenance-only: the patch pipeline is
+# local, and the healthcheck/watchdog/address helpers use the guest's serial
+# control channel rather than IP.  With ZD_CT_ADDRESS_FOLLOW_QEMU=1 the
+# entrypoint hands the address back just before QEMU starts and takes a fresh
+# lease again when QEMU exits, so the appliance is the only thing on the LAN
+# while it runs (and the Proxmox Summary shows only the guest).  See
+# scripts/container/proxmox/zd1200-ct-address; a no-op in the Docker flow, which
+# sets neither the flag nor the helper.
+ct_address_helper="${ZD_CT_ADDRESS_HELPER:-/usr/local/sbin/zd1200-ct-address}"
+# The guest shares the container's uplink MAC, so default to releasing the
+# container's own address while the guest runs.  The bootstrap writes
+# ZD_CT_ADDRESS_FOLLOW_QEMU explicitly, but a conf that predates (or has lost)
+# the key must not silently hold an address under the shared MAC.
+follow_qemu_address="${ZD_CT_ADDRESS_FOLLOW_QEMU:-1}"
+ct_address() {
+    [ "$follow_qemu_address" = 1 ] || return 0
+    [ "$network_mode" = bridge ] || return 0
+    [ -x "$ct_address_helper" ] || return 0
+    "$ct_address_helper" "$1" >&2 || true
+}
+
+cleanup() {
+    # $1 = 1 for a signal (docker stop/down): try an orderly guest shutdown
+    # first so the guest unmounts and flushes /writable.  0 (normal exit) just
+    # tears QEMU down.
+    local graceful="${1:-0}"
+    trap - EXIT INT TERM
+    if [[ "$limiter_pid" =~ ^[0-9]+$ ]] && (( limiter_pid > 1 )); then
+        kill "$limiter_pid" 2>/dev/null || true
+        wait "$limiter_pid" 2>/dev/null || true
+    fi
+    if [[ "$qemu_pid" =~ ^[0-9]+$ ]] && (( qemu_pid > 1 )); then
+        if [ "$graceful" = 1 ] && [ "${ZD_CONTAINER_CONTROL:-1}" != "0" ] \
+           && kill -0 "$qemu_pid" 2>/dev/null; then
+            echo "Requesting an orderly guest shutdown (unmounts /writable)..."
+            # launch-vm.sh sees this and exits after the guest's reboot-reset
+            # instead of relaunching QEMU.
+            : > "$state_dir/.stop-after-reset" 2>/dev/null || true
+            # The guest's control hook starts late in init (its init script is
+            # near the end), so a stop requested in the first seconds after a
+            # boot can arrive before anything is listening on ttyS1 and be lost.
+            # Send once, then resend every 5s until QEMU exits: a healthy guest
+            # reboots on the first command (seconds), and a guest that is still
+            # booting gets it on a later one instead of making the container wait
+            # out the whole grace period.
+            send_guest_reboot() {
+                [ -S "$control_sock" ] || return 0
+                python3 - "$control_sock" <<'PY' 2>/dev/null || true
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall(b"reboot\n")
+s.close()
+PY
+            }
+            send_guest_reboot
+            ticks=0
+            # The guest's reboot path flushes the data partition; allow the same
+            # grace the appliance itself needs after an unclean stop.
+            for _ in $(seq 1 "${ZD_STOP_TIMEOUT:-240}"); do
+                kill -0 "$qemu_pid" 2>/dev/null || break
+                ticks=$((ticks + 1))
+                if [ $((ticks % 10)) -eq 0 ]; then send_guest_reboot; fi
+                sleep 0.5
+            done
+            if kill -0 "$qemu_pid" 2>/dev/null; then
+                echo "Guest did not shut down in time; stopping QEMU." >&2
+            else
+                echo "Guest shut down cleanly."
+            fi
+        fi
+        kill -CONT -- "-$qemu_pid" 2>/dev/null || true
+        kill -TERM -- "-$qemu_pid" 2>/dev/null || true
+        for _ in {1..20}; do
+            kill -0 "$qemu_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$qemu_pid" 2>/dev/null || true
+        wait "$qemu_pid" 2>/dev/null || true
+    fi
+    # The guest's macvtap lives in the host's network namespace (this container
+    # runs with network_mode: host), so nothing else removes it when the
+    # container goes away.  Take it down with the guest: otherwise every
+    # `docker rm -f` leaves a stray interface carrying the dead guest's MAC,
+    # and a later install inherits it.  launch-vm.sh recreates what it needs.
+    if [ "$network_mode" = macvtap ]; then
+        macvtap_if="${ZD_MACVTAP_IF:-mvt0}"
+        if [ -e "/sys/class/net/$macvtap_if" ]; then
+            ip link del "$macvtap_if" 2>/dev/null || true
+        fi
+    fi
+    # The guest is down (or going down).  A guest-initiated poweroff stops the
+    # container too (see the qemu_rc branch at the end); every other exit puts the
+    # container's own address back for maintenance.
+    if [ "${stop_container:-0}" = 1 ]; then
+        echo "Shutting the container down with the appliance."
+        systemctl --no-block poweroff 2>/dev/null || true
+        return 0
+    fi
+    ct_address up
+}
+trap 'cleanup 1' INT TERM
+trap 'cleanup 0' EXIT
+
+cd "$work_dir" || exit 1
+mkdir -p "$state_dir"
+# A stale orderly-stop marker from a previous run must not suppress a reboot.
+rm -f "$state_dir/.stop-after-reset" 2>/dev/null || true
+
+# Maintenance work below may want the network, and a previous run that crashed
+# hard could have left the address down: make sure it is up before starting.
+ct_address up
+
+if [ ! -f image/bzImage ]; then
+    echo "Missing image/bzImage" >&2
+    exit 1
+fi
+# The lab boots the statically patched kernel (patch-kernel.py applies the
+# QEMU hardware accommodations; no gdb attach is needed).  image/ is mounted
+# read-only in the container, so the patched kernel lands in the writable
+# state dir and is passed via KERNEL=.
+patched_kernel="${PATCHED_KERNEL:-$state_dir/bzImage.patched}"
+if [ ! -f "$patched_kernel" ] || [ ! -s "$patched_kernel" ]; then
+    echo "Building patched kernel $patched_kernel ..."
+    python3 "$work_dir/patch-kernel.py" \
+        --in "$work_dir/image/bzImage" \
+        --out "$patched_kernel"
+fi
+# The serial number and MACs live in the board-data records on the CF image
+# (read by the kernel's v54bsp driver; NOT patched into the kernel).  This block
+# only computes the identity to WRITE when the synthetic base is first built
+# (see prepare-vm-disks.sh below); on every start the board data is read
+# back afterwards and takes precedence.
+# By default the identity is derived from ZD_CONTAINER_MAC, a unique
+# locally-administered MAC generated into .env by install-zd1200-docker.sh
+# (scripts/container/boarddata-from-mac.sh: MAC1 = ZD_CONTAINER_MAC, serial hashed
+# from MAC1); MAC2 = MAC1 + 1.  Set ZD_BOARDDATA_FROM_MAC=0 to pin the fixed
+# ZD_SERIAL/ZD_MAC1 instead.
+if { [ "${NETWORK_MODE:-user}" = macvtap ] || [ "${NETWORK_MODE:-user}" = bridge ]; } \
+   && [ "${ZD_BOARDDATA_FROM_MAC:-1}" != "0" ]; then
+    eval "$("$work_dir/boarddata-from-mac.sh")"
+    zd_serial="$SERIAL"
+    zd_mac1="$MAC"
+    zd_mac2="$MAC2"
+else
+    zd_serial="${ZD_SERIAL:-123456000789}"
+    zd_mac1="${ZD_MAC1:-00:0c:e6:12:00:01}"
+    zd_mac2="${ZD_MAC2:-}"
+fi
+# A CF-dump image carries the appliance's own board serial (extracted by
+# prepare-vendor-image.sh); reuse it.  The MAC still comes from
+# ZD_CONTAINER_MAC so a clone does not collide on the LAN.
+if [ -f "$work_dir/image/dump-boarddata" ]; then
+    dump_serial="$(sed -n 's/^SERIAL=//p' "$work_dir/image/dump-boarddata" | head -n1)"
+    if [ -n "$dump_serial" ]; then
+        echo "board data: using the CF-dump serial $dump_serial"
+        zd_serial="$dump_serial"
+    fi
+fi
+# Build the flat synthetic disk if missing, write the board data, and run the
+# kernel + rootfs customisations on whichever root partitions still need them
+# (see prepare-vm-disks.sh).  It is the ONLY place that builds or patches the disk.
+STATE_DIR="$state_dir" \
+SYNTHETIC_DISK="$synthetic_disk" \
+WORK="$state_dir/.rootfs-patch-work" \
+ZD_SERIAL="$zd_serial" \
+ZD_MAC1="$zd_mac1" \
+ZD_MODEL="${ZD_MODEL:-ZD1200}" \
+ZD_CUSTOMER="${ZD_CUSTOMER:-ruckus}" \
+ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
+"$work_dir/prepare-vm-disks.sh" || prepare_rc=$?
+prepare_rc="${prepare_rc:-0}"
+if [ "$prepare_rc" -eq "$RET_RESCUE_ACTIVE" ]; then
+    echo "The saved GRUB entry is a rescue entry; stopping the container." >&2
+    if [ "${ZD_POWEROFF_CONTAINER:-0}" = 1 ]; then stop_container=1; fi
+    exit 0
+fi
+if [ "$prepare_rc" -ne 0 ]; then
+    exit "$prepare_rc"
+fi
+
+: > "$log_file"
+
+# The board data is authoritative: a ZD1200 can change its MAC in the web UI and
+# the firmware writes it back into the board-data record.  Read it back now and
+# use it for the macvtap, the QEMU NIC and the DHCP sniffer, so a MAC changed
+# inside the guest is honoured on the next start.  Only a freshly built base disk
+# gets the identity derived above written into it (prepare-vm-disks.sh).
+if [ -f "$work_dir/read-boarddata.py" ]; then
+    if boarddata="$(python3 "$work_dir/read-boarddata.py" "$synthetic_disk" 2>>"$log_file")"; then
+        eval "$boarddata"
+        zd_serial="${SERIAL:-$zd_serial}"
+        zd_mac1="${MAC:-$zd_mac1}"
+        zd_mac2="${MAC2:-$zd_mac2}"
+        echo "board data: serial=$zd_serial MAC1=$zd_mac1 MAC2=$zd_mac2" >>"$log_file"
+    else
+        echo "warning: no board data read from $synthetic_disk; using the derived identity" >>"$log_file"
+    fi
+fi
+
+# macvlan: obtain the container's LAN IP from the DHCP server.  The macvlan
+# network carries no useful Docker-assigned address (Docker only pools a
+# vestigial subnet; udhcpc's deconfig flushes it), so udhcpc keeps retrying
+# in the background until the LAN grants a lease - which also gives mDNS
+# multicast a real L2 path.
+#
+# The lease sniffer below matters in bridge mode too: the LXC guest is a normal
+# bridge port with its own MAC and still takes its address from the LAN's DHCP
+# server, so the same broadcast-reply observation is how the container learns
+# the guest's dynamic address.
+if [ "${NETWORK_MODE:-user}" = macvtap ] || [ "${NETWORK_MODE:-user}" = bridge ]; then
+    # In host-netns mode eth0 is the host's own interface and already carries
+    # the host's IP; running udhcpc on it would try to re-lease and could
+    # disturb the host's connectivity.  Skip it unless explicitly asked.
+    if [ "${NETWORK_MODE:-user}" = macvtap ] && [ "${ZD_HOST_NET:-0}" != "1" ]; then
+        udhcpc -i eth0 -b -q -p /var/run/udhcpc.pid >>"$log_file" 2>&1 || true
+    fi
+fi
+# Interactive serial console (see launch-vm.sh): the chardev logfile must be
+# the SAME file the READY detect + healthcheck grep, and the socket path is where
+# you attach to the guest's /dev/console login (set ZD_CONSOLE=0 to disable).
+# Everything that wanted the container's own address is finished; release it for
+# as long as QEMU runs.
+ct_address down
+setsid env KERNEL="$patched_kernel" \
+    INITRD="" \
+    DISK_IMAGE="$synthetic_disk" DISK_FORMAT=raw DISK_CACHE=writeback SNAPSHOT="$vm_snapshot" PACE_GUEST=0 \
+    ACCEL="$vm_accel" \
+    STATE_DIR="$state_dir" \
+    SYNTHETIC_DISK="$synthetic_disk" \
+    WORK="$state_dir/.rootfs-patch-work" \
+    ZD_SERIAL="$zd_serial" \
+    ZD_MAC1="$zd_mac1" \
+    ZD_MODEL="${ZD_MODEL:-ZD1200}" \
+    ZD_CUSTOMER="${ZD_CUSTOMER:-ruckus}" \
+    ZD_SIGN_CERT_DIR="${ZD_SIGN_CERT_DIR:-/opt/zd1200/signing-cert}" \
+    HTTP_PORT="$http_port" \
+    HTTPS_PORT="$https_port" \
+    NETWORK_MODE="$network_mode" \
+    EXTRA_HOSTFWD="$(printf '%s' "${EXTRA_HOSTFWD:-}")" \
+    TAP_IF="${TAP_IF:-tap-zd}" \
+    ZD_MAC1="$zd_mac1" \
+    ZD_MAC2="$zd_mac2" \
+    ZD_CONSOLE="${ZD_CONSOLE:-1}" \
+    ZD_CONSOLE_LOG="$log_file" \
+    ZD_CONSOLE_SOCK="${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}" \
+    ZD_CONSOLE_QEMU_SOCK="${ZD_CONSOLE_QEMU_SOCK:-}" \
+    nice -n 10 ./launch-vm.sh \
+    >>"$log_file" 2>&1 </dev/null &
+qemu_pid=$!
+
+sleep 3
+
+# CPU_LIMIT is opt-in for KVM. TCG retains its historical 60% safety cap
+# unless CPU_LIMIT is set to 0/off/none (no duty-cycle limiting at all).
+if [ -z "$cpu_limit" ] && [ "$vm_accel" = tcg ]; then
+    cpu_limit=60
+fi
+case "$cpu_limit" in
+    0|off|none) cpu_limit="" ;;
+esac
+if [ -n "$cpu_limit" ]; then
+    if ! [[ "$cpu_limit" =~ ^[0-9]+$ ]] || (( cpu_limit < 1 || cpu_limit > 95 )); then
+        echo "CPU_LIMIT must be an integer from 1 through 95, or 0/off/none to disable." >&2
+        exit 2
+    fi
+    python3 "$work_dir/limit-process-cpu.py" "$qemu_pid" "$cpu_limit" &
+    limiter_pid=$!
+    echo "QEMU CPU duty cycle capped at ${cpu_limit}% while the VM runs."
+fi
+case "$cpu_guard" in
+    0|off|none) cpu_guard="" ;;
+esac
+if [ -n "$cpu_guard" ]; then
+    if ! [[ "$cpu_guard" =~ ^[0-9]+$ ]] || (( cpu_guard < 1 )); then
+        echo "ZD_CPU_GUARD must be a positive integer, or 0/off/none to disable." >&2
+        exit 2
+    fi
+    echo "High-CPU watchdog: stopping QEMU after ${cpu_guard} samples (${cpu_guard}x5s) above 95% CPU."
+fi
+
+echo "ZD1200 is starting; waiting for the web service..."
+wait_seconds="${WEB_WAIT_SECONDS:-${WEB_WAIT_LOOPS:-180}}"
+if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]] || (( wait_seconds < 1 )); then
+    echo "WEB_WAIT_SECONDS must be a positive integer." >&2
+    exit 2
+fi
+if [ -n "$cpu_limit" ]; then
+    echo "Startup is CPU-limited and has a ${wait_seconds}s readiness deadline."
+else
+    echo "Startup runs at full speed and has a ${wait_seconds}s readiness deadline."
+fi
+refreshed_guest_ip() {
+    # Ask the guest (or read its cached answer).  It may lease after startup, and
+    # it may renew onto a different address.
+    if [ -z "${GUEST_IP:-}" ] && [ -x "$address_helper" ]; then
+        guest_ip="$("$address_helper" --ask 2>/dev/null || true)"
+    fi
+}
+if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ] || [ "$network_mode" = bridge ]; then
+    # No lease means no address to probe yet; the loop waits for one.
+    probe_base=""
+else
+    probe_base="https://127.0.0.1:$https_port"
+fi
+# A macvlan parent does not loop broadcasts back to its own port, so an
+# macvtap guest (a sibling macvlan on the same parent) is NOT reachable from
+# this container by its LAN IP: curling $guest_ip would always time out.  In
+# macvtap mode detect readiness from the guest's serial console instead, which
+# this entrypoint writes to $log_file.  Other modes keep the HTTP probe.
+# The guest announces readiness itself, on the console the appliance prints to:
+# "System go into READY status."  That is the authority in every mode -- it needs
+# no address, and a container that cannot yet see a lease still knows the
+# controller came up.  Downloading an address is a *display* concern (the URL) and
+# must never gate readiness: doing so once made a healthy guest look dead and the
+# readiness deadline restart it.
+probe_method=console
+ready_marker="System go into READY status."
+deadline=$((SECONDS + wait_seconds))
+next_notice=$((SECONDS + 30))
+while (( SECONDS < deadline )); do
+    if [ "$probe_method" = console ]; then
+        # The guest's own announcement, written to $log_file by the console
+        # chardev.  No address is involved, so no lease or DHCP state can make a
+        # healthy controller look absent.
+        if rg -qF "$ready_marker" "$log_file" 2>/dev/null; then
+            # Best effort, for the printed URL only: ask the guest for its
+            # address.  A failure here changes nothing about readiness.
+            refreshed_guest_ip
+            ready_ip="${guest_ip:-}"
+            ready_url="https://$ready_ip/admin10/login.jsp"
+            ready_kind="web service"
+            echo "ZD1200 $ready_kind is ready (guest console reported: '$ready_marker')."
+            if [ -n "$ready_ip" ]; then
+                echo "HTTPS: $ready_url"
+            else
+                echo "The guest has not reported an address yet; it takes one from your"
+                echo "LAN's DHCP server. Check later with:"
+                echo "  $address_helper"
+            fi
+            if [ "$vm_accel" = kvm ]; then
+                echo "Hardware acceleration: KVM"
+            fi
+            echo "Press Ctrl-C to stop the virtual ZoneDirector."
+            ready=1
+            break
+        fi
+    else
+        http_status="$(curl -ksS --max-time 3 -o /tmp/zd1200-login.html \
+            -w '%{http_code}' \
+            "$probe_base/admin10/login.jsp" \
+            2>/dev/null || true)"
+        if { [ "$http_status" = 302 ] && rg -q 'wizard\.jsp' /tmp/zd1200-login.html; } \
+            || { [ "$http_status" = 200 ] \
+                && [ "$(wc -c < /tmp/zd1200-login.html)" -gt 1000 ] \
+                && ! rg -q '~(SystemName|Username|GP_Login)~' /tmp/zd1200-login.html; }; then
+            if [ "$http_status" = 302 ] || rg -q 'form-wizard|Setup Wizard' /tmp/zd1200-login.html; then
+                # Seeing HTML is insufficient: the stock factory session has an
+                # empty CID, while its AJAX modules still enforce a CSRF match.
+                # Confirm that our factory-only compatibility patch reaches the
+                # backend before inviting the user to complete the wizard.
+                cookie_jar="/tmp/zd1200-web-cookie.$qemu_pid"
+                factory_reply="/tmp/zd1200-factory-probe.$qemu_pid.xml"
+                curl -ksS --max-time 5 -c "$cookie_jar" -b "$cookie_jar" \
+                    -o /dev/null "$probe_base/admin10/wizard.jsp" 2>/dev/null || true
+                curl -ksS --max-time 8 -c "$cookie_jar" -b "$cookie_jar" \
+                    -H 'X-Requested-With: XMLHttpRequest' \
+                    -H 'X-Rico-Version: 1.1.2' -H 'X-CSRF-Token;' \
+                    -H 'Content-Type: text/xml' \
+                    --data-binary '<ajax-request action="getconf" comp="system" updater="readiness-probe"/>' \
+                    -o "$factory_reply" "$probe_base/admin10/_conf.jsp" 2>/dev/null || true
+                if ! rg -q '<ajax-response>.*<system>' "$factory_reply" 2>/dev/null; then
+                    rm -f "$cookie_jar" "$factory_reply"
+                    sleep 1
+                    continue
+                fi
+                rm -f "$cookie_jar" "$factory_reply"
+                ready_url="$probe_base/admin10/wizard.jsp"
+                ready_kind="factory setup wizard"
+            else
+                ready_url="$probe_base/admin10/login.jsp"
+                ready_kind="login page"
+            fi
+            echo "ZD1200 $ready_kind is ready:"
+            if [ "$network_mode" = tap ] || [ "$network_mode" = macvtap ] || [ "$network_mode" = bridge ]; then
+                [ -n "$guest_ip" ] && echo "HTTPS: $ready_url"
+            else
+                echo "HTTP:  http://127.0.0.1:$http_port/"
+                echo "HTTPS: $ready_url"
+            fi
+            if [ "$vm_accel" = kvm ]; then
+                echo "Hardware acceleration: KVM"
+            fi
+            echo "Press Ctrl-C to stop the virtual ZoneDirector."
+            ready=1
+            break
+        fi
+    fi
+    if ! kill -0 "$qemu_pid" 2>/dev/null; then
+        echo "QEMU exited before the web service became ready." >&2
+        tail -160 "$log_file" >&2
+        exit 1
+    fi
+    if (( SECONDS >= next_notice )); then
+        echo "Still initializing ($((SECONDS - started_at))s elapsed since launch)..."
+        next_notice=$((next_notice + 30))
+    fi
+    sleep 1
+done
+
+if (( ready == 0 )); then
+    echo "Timed out waiting for the web service." >&2
+    tail -160 "$log_file" >&2
+    exit 1
+fi
+
+# Keep supervising the VM instead of blocking in wait(1).  The old embedded
+# kernel should idle with HLT; sustained full-core TCG use indicates a guest
+# spin loop and is not acceptable on a laptop.
+clock_ticks="$(getconf CLK_TCK)"
+previous_ticks="$(awk '{print $14 + $15}' "/proc/$qemu_pid/stat")"
+previous_sample=$SECONDS
+while kill -0 "$qemu_pid" 2>/dev/null; do
+    sleep 5
+    current_ticks="$(awk '{print $14 + $15}' "/proc/$qemu_pid/stat" 2>/dev/null || echo "$previous_ticks")"
+    current_sample=$SECONDS
+    sample_seconds=$((current_sample - previous_sample))
+    (( sample_seconds > 0 )) || sample_seconds=1
+    cpu=$(( (current_ticks - previous_ticks) * 100 / clock_ticks / sample_seconds ))
+    previous_ticks="$current_ticks"
+    previous_sample="$current_sample"
+    if (( cpu >= 95 )); then
+        high_cpu_samples=$((high_cpu_samples + 1))
+    else
+        high_cpu_samples=0
+    fi
+    if [ -n "$cpu_guard" ] && (( high_cpu_samples >= cpu_guard )); then
+        echo "QEMU stayed above 95% CPU for $((cpu_guard * 5)) seconds; stopping it to protect the host." >&2
+        exit 3
+    fi
+done
+
+qemu_rc=0
+wait "$qemu_pid" 2>/dev/null || qemu_rc=$?
+if [ "$qemu_rc" -eq "$RET_RESCUE_ACTIVE" ]; then
+    echo "The saved GRUB entry is a rescue entry; stopping the container." >&2
+    if [ "${ZD_POWEROFF_CONTAINER:-0}" = 1 ]; then stop_container=1; fi
+    exit 0
+fi
+if [ "$qemu_rc" -eq 0 ]; then
+    echo "Guest powered off; stopping the container."
+    # Under Compose this exit is the container's, and restart: on-failure leaves a
+    # clean exit stopped.  The LXC flow runs this entrypoint as zd1200.service
+    # inside the container, where exiting would leave the container up with no
+    # appliance in it, so the EXIT trap shuts the container down as well.
+    if [ "${ZD_POWEROFF_CONTAINER:-0}" = 1 ]; then
+        stop_container=1
+    fi
+    exit 0
+fi
+echo "QEMU exited (status $qemu_rc)." >&2
+exit 1
