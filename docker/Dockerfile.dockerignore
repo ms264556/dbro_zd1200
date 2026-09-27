@@ -15,4 +15,12 @@ analysis-*/
 *.runtime.gz.sha256
 synthetic-cf.img
 # Proxmox LXC-only container runtime; the Docker flow never uses it.
+#
+# The one LXC-side helper the Docker flow does use, the guest's own address over
+# the ttyS1 control channel, deliberately does NOT live here:
+# scripts/container/zd1200-guest-address is at the top level, the path the
+# entrypoint computes ("$work_dir/zd1200-guest-address"), so COPY of
+# scripts/container/ carries it (docker/Dockerfile).  Moving it back under this
+# directory would exclude it from the image and the entrypoint would silently
+# print the static GUEST_IP again, which is the defect this note prevents.
 scripts/container/proxmox/

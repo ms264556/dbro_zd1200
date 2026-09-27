@@ -161,7 +161,40 @@ case "${NETWORK_MODE:-user}" in
         # the guest) is dropped before it reaches the guest — the guest never
         # completes DHCP.  Set it before the interface is brought up.
         if [ -n "$macvtap_want" ]; then
-            ip link set "$macvtap_if" address "$macvtap_want"
+            # The kernel refuses the address when another interface on the same
+            # parent already owns it ("RTNETLINK answers: Address already in
+            # use"), and ip's exit status alone is not the answer: what matters
+            # is the address the interface actually carries afterwards.  A
+            # macvtap that kept its auto-generated MAC boots the guest to READY
+            # and lets it pass its own healthcheck while every unicast frame
+            # addressed to the guest's MAC is delivered to the other interface,
+            # so the guest is unreachable and that one RTNETLINK line is the only
+            # symptom.  Stop here instead of booting a guest nobody can reach.
+            macvtap_set_err="$(ip link set "$macvtap_if" address "$macvtap_want" 2>&1)" || true
+            macvtap_now="$(cat "/sys/class/net/$macvtap_if/address" 2>/dev/null || true)"
+            if [ "$macvtap_now" != "$macvtap_want" ]; then
+                # Best effort, and never fatal on its own: name the interface
+                # that owns the address so the message says what to change.  A
+                # diagnostic that cannot run (or cannot find an owner) must not
+                # change the outcome below.
+                macvtap_owner=""
+                for macvtap_peer in /sys/class/net/*; do
+                    [ "$macvtap_peer" = "/sys/class/net/$macvtap_if" ] && continue
+                    if [ "$(cat "$macvtap_peer/address" 2>/dev/null || true)" = "$macvtap_want" ]; then
+                        macvtap_owner="${macvtap_peer##*/}"
+                        break
+                    fi
+                done
+                echo "Cannot start the guest: $macvtap_if did not take the guest MAC $macvtap_want (it is ${macvtap_now:-unreadable})." >&2
+                [ -z "$macvtap_set_err" ] || echo "  ip link set said: $macvtap_set_err" >&2
+                if [ -n "$macvtap_owner" ]; then
+                    echo "  $macvtap_owner already owns $macvtap_want on this host." >&2
+                else
+                    echo "  could not identify an interface that owns $macvtap_want; most likely another macvtap on the same parent (another ZD1200 instance?) or a host interface." >&2
+                fi
+                echo "  The guest would boot and look healthy while being unreachable: the LAN's unicast replies to $macvtap_want go to that other interface.  Give this instance its own ZD_CONTAINER_MAC, or remove the interface that owns the address." >&2
+                exit 1
+            fi
         fi
         ip link set "$macvtap_if" up
         tap_idx="$(cat "/sys/class/net/$macvtap_if/ifindex")"

@@ -227,7 +227,34 @@ log "uplink $HOST_IF is cross-connected to $BRIDGE_IF through $WIRE_IF"
 if [ -n "${ZD_CT_DHCP:-}" ]; then
     if command -v dhclient >/dev/null 2>&1; then
         dhclient -r "$HOST_IF" >/dev/null 2>&1 || true
-        pkill -f "dhclient.*$HOST_IF" 2>/dev/null || true
+        # Stop the client that still holds this uplink -- by PID, never by
+        # pattern.  `pkill -f "dhclient.*$HOST_IF"` matched the full command
+        # line of every process on the host, so any unrelated process whose
+        # arguments merely contained that text -- a shell running this script
+        # with --host-if among its arguments, for one -- was killed too
+        # (HANDOFF.md 8.8 item 11).  Walk /proc instead, and require both
+        # halves to hold of the process itself: its own executable is dhclient
+        # and $HOST_IF is one of its own arguments.  Anything unreadable, gone,
+        # or not matching is skipped, so this is a no-op when there is nothing
+        # to stop.
+        for _pid_dir in /proc/[0-9]*; do
+            _pid="${_pid_dir#/proc/}"
+            _exe="$(readlink "$_pid_dir/exe" 2>/dev/null || true)"
+            [ "${_exe##*/}" = dhclient ] || continue
+            # One argument per line; a vanished or unreadable cmdline is empty.
+            _args="$(tr '\0' '\n' 2>/dev/null < "$_pid_dir/cmdline" || true)"
+            _match=0
+            while IFS= read -r _arg; do
+                if [ "$_arg" = "$HOST_IF" ]; then
+                    _match=1
+                    break
+                fi
+            done <<EOF
+$_args
+EOF
+            [ "$_match" = 1 ] || continue
+            kill -TERM "$_pid" 2>/dev/null || true
+        done
     fi
 fi
 ip addr flush dev "$HOST_IF" 2>/dev/null || true

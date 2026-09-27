@@ -534,6 +534,50 @@ if [ "$INTERACTIVE" = 1 ] && [ "$ADVANCED" = 1 ]; then
     fi
 fi
 
+# --------------------------------------------------------------------------
+# 2d. one installer at a time on this host
+# --------------------------------------------------------------------------
+# Two installs started together on one Proxmox host share host state: the free
+# container id (scanned at the next line, checked below, and made real by
+# `pct create`) and, later, the summary helper with its two systemd units, which
+# every install rewrites.  Without the lock both runs scanned, both saw the same
+# id free, and the loser died "container N already exists" at the check or in
+# `pct create`.
+#
+# The lock is held across the allocation and the creation only -- released
+# before the install itself, which takes minutes -- and taken again for the
+# helper install.  When another install holds it, this one says so and then
+# waits: a second accidental install should still succeed with an id of its own
+# rather than fail.  If flock is missing, or the lock file cannot be opened, it
+# warns and continues unlocked -- an install must never abort over a lock.
+LOCK_FILE=/run/zd1200-lxc-install.lock
+LOCK_FD=""
+lock_host() {
+    if [ -z "$LOCK_FD" ]; then
+        if ! command -v flock >/dev/null 2>&1; then
+            warn "flock is not available: two installs started together may pick the same container id"
+            return 0
+        fi
+        if ! exec {LOCK_FD}>"$LOCK_FILE" 2>/dev/null; then
+            LOCK_FD=""
+            warn "cannot open $LOCK_FILE: two installs started together may pick the same container id; continuing unlocked"
+            return 0
+        fi
+    fi
+    if ! flock -n "$LOCK_FD" 2>/dev/null; then
+        info "another install on this host holds $LOCK_FILE; waiting for it to release it"
+        flock "$LOCK_FD" 2>/dev/null \
+            || warn "could not take $LOCK_FILE; continuing unlocked"
+    fi
+    return 0
+}
+unlock_host() {
+    [ -n "$LOCK_FD" ] || return 0
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    return 0
+}
+
+lock_host
 [ -n "$CTID" ] || CTID="$(next_free_ctid)"
 [ -n "$STORAGE" ] || STORAGE="${STORAGES[0]}"
 [ -n "$BRIDGE" ] || BRIDGE="${BRIDGES[0]}"
@@ -644,6 +688,11 @@ pct create "$CTID" "$TEMPLATE" \
     --unprivileged 1 --ostype debian \
     --onboot "$ONBOOT" \
     --description "Ruckus ZD1200 virtual appliance (installed by dbro_zd1200/install-zd1200-lxc.sh)"
+
+# The id is real now (Proxmox has written /etc/pve/lxc/$CTID.conf), so another
+# install may scan for a free one again -- and the install itself (the slow part
+# below) runs unlocked.
+unlock_host
 
 # Device passthrough: /dev/kvm for hardware acceleration and /dev/net/tun for
 # QEMU's tap device.  Proxmox's `dev0:` syntax (PVE 8.2+) creates the node in the
@@ -837,6 +886,10 @@ fi
 # on the host keeps it current from the address the guest reported; it only touches
 # CTs that have a state dir (i.e. ones this project installed).
 step "installing the Proxmox summary helper on the host"
+# Host-global too: the helper and both units are the same paths for every
+# install on this host.  Under the lock the three files (and the daemon-reload
+# that picks them up) are written as one set rather than interleaved.
+lock_host
 install -m 0755 "$REPO_ROOT/scripts/build/proxmox/zd1200-pve-summary-host.sh" /usr/local/sbin/zd1200-pve-summary-host
 cat > /etc/systemd/system/zd1200-pve-summary.service <<'UNIT'
 [Unit]
@@ -862,6 +915,7 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now zd1200-pve-summary.timer >/dev/null 2>&1 || true
 /usr/local/sbin/zd1200-pve-summary-host "$CTID" >/dev/null 2>&1 || true
+unlock_host
 
 # --------------------------------------------------------------------------
 # 8. systemd service
@@ -924,7 +978,7 @@ ${bold}Installation complete.${reset}
 
   Guest URL ....... $guest_url
   Address ......... pct exec $CTID -- cat /var/lib/zd1200/guest-ip
-  From another LAN machine:  curl -kI https://<guest-ip>/admin10/login.jsp
+  From another LAN machine:  curl -kI https://<guest-ip>/
 
   First boot runs the factory setup wizard; complete it, reboot once (so the
   appliance generates its SSH host key), then log in.

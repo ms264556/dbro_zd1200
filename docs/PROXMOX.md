@@ -92,7 +92,7 @@ pct exec 120 -- python3 /opt/zd1200/scripts/container/attach-console.py
 Open `https://<guest-ip>/` from any LAN machine. The first boot runs the factory
 setup wizard; complete it, reboot the guest once so it generates its SSH host
 key, then log in. The Proxmox host itself can reach the guest (unlike the Docker
-macvtap setup) — `curl -kI https://<guest-ip>/admin10/login.jsp`.
+macvtap setup) — `curl -kI https://<guest-ip>/`.
 
 With `--root-ssh-key`: `ssh -p 2222 -i <key> root@<guest-ip>`.
 

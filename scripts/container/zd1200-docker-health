@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# zd1200-docker-health — the Docker flow's container health verdict.
+#
+# Exit 0 healthy, 1 unhealthy.  Written to be the answer to "is this appliance
+# actually working right now", which the Docker flow previously did not have:
+# its healthcheck grepped the console log for the guest's READY marker, and that
+# line stays in the file forever once a boot has succeeded, so the container
+# reported healthy for the rest of its life -- including while the guest was
+# wedged.  Anything reading that status (an operator, `docker ps`, an
+# orchestrator, or this project's own docs) was being told something that could
+# not change.
+#
+# It asks the guest over the ttyS1 control channel, the same way the LXC flow's
+# healthcheck does, because macvlan/macvtap isolates the container from its own
+# guest: the guest's HTTPS is not reachable from here, and an ICMP/ARP probe of a
+# locally-held address would be answered by this container, not the guest.
+#
+# Three states, and only one of them is a failure:
+#
+#   the guest answers and its management service is listening
+#       -> healthy.  Its kernel, init, userspace and web service are all up.
+#   the guest answers but the service is not listening yet
+#       -> healthy while the container is still young enough to be generating its
+#          first-boot keys, unhealthy after that.  Saying "unhealthy" during key
+#          generation would flap every first boot; saying "healthy" forever would
+#          recreate the defect above.
+#   the guest does not answer at all
+#       -> unhealthy.  Its kernel or userspace has stopped running, which is the
+#          silent wedge this status exists to expose.
+#
+# Usage: zd1200-docker-health [--verbose]
+set -u
+
+STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
+# The helper lives beside this script in every flow (both the Docker image and
+# the checkout), so default to that rather than a path that only exists in one
+# layout.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+HELPER="${ZD_ADDRESS_HELPER:-$HERE/zd1200-guest-address}"
+TIMEOUT="${ZD_HEALTH_PROBE_TIMEOUT:-${ZD_ADDRESS_TIMEOUT:-6}}"
+# How long a guest that answers but has not bound 443 yet is still given the
+# benefit of the doubt.  First boot generates the appliance's keys; measured on
+# the lab guest that phase is a couple of minutes, and this is generously above
+# it while staying far below the readiness deadline.
+KEYGEN_GRACE="${ZD_HEALTH_KEYGEN_GRACE:-600}"
+PID_FILE="${ZD_QEMU_PID_FILE:-$STATE_DIR/qemu.pid}"
+VERBOSE=0
+[ "${1:-}" = "--verbose" ] && VERBOSE=1
+
+say() { printf '%s\n' "$*" >&2; }
+note() { [ "$VERBOSE" = 1 ] && say "$*" || true; }
+
+# Resolve the address helper the way the entrypoint does, so this works whether
+# it sits beside the entrypoint or in a helper directory.
+if [ ! -x "$HELPER" ]; then
+    for cand in "$HERE/zd1200-guest-address" /usr/local/sbin/zd1200-guest-address; do
+        [ -x "$cand" ] && { HELPER="$cand"; break; }
+    done
+fi
+if [ ! -x "$HELPER" ]; then
+    say "unhealthy: no executable address helper (looked for $HELPER)"
+    exit 1
+fi
+
+# Seconds since the emulator was launched, or empty when that cannot be told.
+emulator_uptime() {
+    [ -r "$PID_FILE" ] || return 1
+    local mt now
+    mt="$(stat -c %Y "$PID_FILE" 2>/dev/null)" || return 1
+    now="$(date +%s)"
+    [ "$mt" -le "$now" ] || return 1
+    printf '%s' "$(( now - mt ))"
+}
+
+answer="$("$HELPER" --timeout "$TIMEOUT" 2>/dev/null || true)"
+guest_ip=""
+guest_service=""
+while IFS= read -r line; do
+    case "$line" in
+        ZD-GUEST-IP=*)    guest_ip="${line#ZD-GUEST-IP=}" ;;
+        ZD-SERVICE-443=*) guest_service="${line#ZD-SERVICE-443=}" ;;
+        # The helper emits both the marked form and a bare address, and a
+        # healthcheck must not turn a helper's formatting choice into "the guest
+        # is dead" -- which is what the first version of this did: it accepted
+        # only the marked form, discarded a good bare address, and called a
+        # demonstrably answering guest unhealthy.  Accept the bare form as well,
+        # taking the first address-like line and ignoring anything else.
+        *[!0-9.]*|"")     ;;
+        *)                [ -z "$guest_ip" ] && guest_ip="$line" ;;
+    esac
+done <<EOF
+$answer
+EOF
+
+if [ -z "$guest_ip" ]; then
+    say "unhealthy: the guest did not answer on the control channel (ttyS1)"
+    exit 1
+fi
+
+case "$guest_service" in
+    listening)
+        note "healthy: guest $guest_ip answered and its management service is listening"
+        exit 0
+        ;;
+    "")
+        # Older guest builds do not report a service state.  A reply proves the
+        # guest's userspace is running, which is all this verdict can honestly
+        # assert about them.
+        note "healthy: guest $guest_ip answered (it does not report a service state)"
+        exit 0
+        ;;
+esac
+
+# The guest answered but says its management service is not listening.  That is
+# legitimate while it is still starting up and a failure once it should have.
+uptime="$(emulator_uptime || true)"
+if [ -n "$uptime" ] && [ "$uptime" -lt "$KEYGEN_GRACE" ]; then
+    note "healthy: guest $guest_ip answered; its management service is not listening yet (${uptime}s since launch, grace ${KEYGEN_GRACE}s)"
+    exit 0
+fi
+
+if [ -n "$uptime" ]; then
+    say "unhealthy: guest $guest_ip answered but its management service is not listening (${uptime}s since launch, past the ${KEYGEN_GRACE}s grace)"
+else
+    say "unhealthy: guest $guest_ip answered but its management service is not listening, and the emulator's age could not be read to apply the grace"
+fi
+exit 1

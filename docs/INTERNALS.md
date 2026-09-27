@@ -564,7 +564,7 @@ down rather than leaving it running with no appliance in it.
 On `docker compose stop`/`down`, the entrypoint asks the guest to shut down over
 a private second serial port (ttyS1) and `S98zd_container_control` runs the stock
 reboot path, so the controller flushes and the kernel unmounts `/writable` before
-QEMU is torn down. That is why `stop_grace_period` is 180s — do not lower it. The
+QEMU is torn down. That is why `stop_grace_period` is 260s — do not lower it. The
 request is resent every 5s until QEMU exits: that init script starts late in the
 guest's init, so a stop issued in the first seconds after a boot could otherwise
 arrive before anything was reading ttyS1 and cost the whole grace period

@@ -49,6 +49,13 @@ services:
       MEMORY_MB: "2048"
       NETWORK_MODE: macvtap
       ZD_HOST_NET: "1"
+      # Which accelerator to boot the guest with.  `auto` (the default) probes
+      # /dev/kvm exactly as the entrypoint always did; `tcg` forces software
+      # emulation on a host that has KVM, which is how the slow-boot paths are
+      # exercised on a machine like the test host.  Listed in this block because
+      # Compose passes only the keys it names: a value in .env alone reaches
+      # nothing here, so `ACCEL=tcg` used to do nothing at all.
+      ACCEL: ${ACCEL:-auto}
       ZD_SIGN_CERT_DIR: /opt/zd1200/signing-cert
       GUEST_IP: ${ZD_GUEST_IP:-192.168.50.10}
       # Board data written into the CF image: serial + base MAC (MAC2=MAC1+1).
@@ -87,13 +94,22 @@ services:
       # (install-zd1200-docker.sh --no-r600-repair).
       ZD_R600_REPAIR: ${ZD_R600_REPAIR:-1}
       # Work around the 2.6.32 tickless-idle spin demonstrated in cpu-study.
-      KERNEL_EXTRA: nohz=off
       WEB_WAIT_SECONDS: "600"
       VM_SNAPSHOT: "0"
       # On stop, ask the guest to run its stock reboot path (unmount + flush
       # /writable) over the ttyS1 control channel before QEMU is torn down.
       ZD_CONTAINER_CONTROL: "1"
       ZD_STOP_TIMEOUT: "240"
+      # The CPU guard's shared default is 4 samples (20s at >=95% CPU).  This is
+      # a KVM-accelerated guest here, and a healthy one that has just reached
+      # READY false-triggered that: the guard stopped QEMU and Compose restarted
+      # the container on a ~60s cycle.  The LXC bootstrap
+      # (zd1200-ct-bootstrap.sh) chooses 24, so this is parity with it rather
+      # than a Docker-specific tweak.  It matters more now than it did: the
+      # guard used to sample the launch-vm.sh wrapper, which owns none of QEMU's
+      # CPU, so the trip could never fire; it now samples the emulator itself, so
+      # a low threshold is a live one.
+      ZD_CPU_GUARD: "24"
       # Per-instance names.  network_mode: host makes the macvtap interface and
       # the /tmp chardev sockets global to the host, so two ZD1200 containers
       # with the default names would share (and clobber) each other's tap and
@@ -129,11 +145,15 @@ services:
     stop_grace_period: 260s
 
     healthcheck:
-      # macvlan isolates the container from its own macvtap guest, so the
-      # guest's HTTPS is not reachable from inside the container.  Mark healthy
-      # on the guest's READY marker in the serial-console log (written by
-      # entrypoint.sh) instead of curling an unreachable static IP.
-      test: ["CMD-SHELL", "rg -qF 'System go into READY status.' ${LOG_FILE:-/tmp/zd1200-console.log} 2>/dev/null || exit 1"]
+      # Ask the guest, over the control channel, whether it is actually working.
+      # This used to grep the console log for the READY marker, which is written
+      # once and stays in the file forever: the container therefore reported
+      # healthy for the rest of its life, including while the guest was wedged,
+      # so the status could never tell an operator anything.  A network probe is
+      # not an option here -- macvlan/macvtap isolates the container from its own
+      # guest, and a locally-held guest address would be answered by this
+      # container rather than the guest.
+      test: ["CMD-SHELL", "/opt/zd1200/zd1200-docker-health || exit 1"]
       interval: 30s
       timeout: 8s
       start_period: 10m

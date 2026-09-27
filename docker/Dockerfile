@@ -225,6 +225,7 @@ COPY --from=ruckus-squashfs-tools \
      /opt/zd1200/ruckus-squashfs/
 
 RUN chmod +x /opt/zd1200/*.sh /opt/zd1200/*.py /opt/zd1200/patches/*.sh \
+        /opt/zd1200/zd1200-guest-* /opt/zd1200/zd1200-docker-health \
         /opt/zd1200/packages/analytics/*.sh \
         /opt/zd1200/packages/analytics/zd1200-ping-monitor \
         /opt/zd1200/packages/analytics/zd1200-ping-export \
@@ -242,7 +243,7 @@ ENV STATE_DIR=/var/lib/zd1200 \
 
 VOLUME ["/var/lib/zd1200"]
 
-HEALTHCHECK --interval=30s --timeout=8s --start-period=10m --retries=3 \
-    CMD rg -qF 'System go into READY status.' /tmp/zd1200-console.log || exit 1
+HEALTHCHECK --interval=30s --timeout=15s --start-period=10m --retries=3 \
+    CMD ./zd1200-docker-health || exit 1
 
 CMD ["./entrypoint.sh"]

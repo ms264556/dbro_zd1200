@@ -84,7 +84,7 @@ pct exec <id> -- cat /var/lib/zd1200/.backup-seeded                # the seed re
 |---|---|
 | web UI unreachable from the **Docker host** | expected: the guest is a macvtap sibling, so the host cannot reach it. Test from another LAN machine |
 | web UI unreachable from anywhere | the guest has no lease yet, or the LAN interface cannot pass foreign MACs. Read the lease from your DHCP server; *(Proxmox)* `pct exec <id> -- cat /var/lib/zd1200/guest-ip` has it too |
-| *(Docker)* a second ZD1200 container starts and an existing guest goes dark | `network_mode: host` shares the host netns, so both containers used the same `mvt0` and `/tmp` sockets (the second overwrote the first's macvtap MAC). Give each instance its own `ZD_CONTAINER_NAME` in its own checkout; `install-zd1200-docker.sh` writes per-instance `ZD_MACVTAP_IF`, `ZD_CONTROL_SOCK`, `ZD_CONSOLE_SOCK` and `LOG_FILE` into `.env`. Recreate the containers (`compose up -d --force-recreate`) for the new names to take effect |
+| *(Docker)* a second ZD1200 container starts and an existing guest goes dark | `network_mode: host` shares the host netns, so two containers named the same share `mvt0` and the `/tmp` sockets (the second overwrites the first's macvtap MAC). Give each instance its own `ZD_CONTAINER_NAME` in its own checkout; `install-zd1200-docker.sh` writes per-instance `ZD_MACVTAP_IF`, `ZD_CONTROL_SOCK`, `ZD_CONSOLE_SOCK` and `LOG_FILE` into `.env`. Recreate the containers (`compose up -d --force-recreate`) for the new names to take effect. A checkout with no `.env` gets its own instance name (the checkout's directory name) on its first run, so two fresh checkouts no longer collide by default; two `.env` files that both name `zd1200` still do, and then they also share the `zd1200-image-zd1200` and `zd1200-state-zd1200` volumes — the image volume's publish step replaces the guest the other checkout built, and the state volume holds the appliance's `/writable` |
 | *(Proxmox)* `cat: /var/lib/zd1200/guest-ip: No such file` | no lease has been recorded yet: the guest has not taken one, or it cannot be asked over the control channel. `pct exec <id> -- /usr/local/sbin/zd1200-guest-address --ask` queries it directly; the LAN must have a DHCP server |
 | web UI redirects to the setup wizard | expected on a fresh volume. Complete the wizard, then reboot the guest |
 | `ssh admin@<ip>` refused after the first boot | finish the wizard and reboot once, so the appliance generates its SSH host key |
@@ -199,13 +199,127 @@ container log when the condition is detected.
 | symptom | cause and fix |
 |---|---|
 | `Up (unhealthy)` for a long time | no usable `/dev/kvm`, so the guest runs under TCG. Enable KVM or wait longer |
-| boot is very slow, host fans spin up | as above, or the CPU duty-cycle cap is in effect (`CPU_LIMIT` / `ZD_CPU_GUARD`) |
+| boot is very slow, host fans spin up | the guest is running under TCG (no usable `/dev/kvm`), so the emulator does the guest's work in software: expect a slow boot and a busy host. Measured in the guard's own window, the emulator sits at 27-32% of one core on both hosts now that `40-skip-integrity.sh` has removed the vendor's boot-time fork storm, so a 95% sample would be an anomaly under TCG too; what keeps the trip unarmed there is the boot burst below, not the steady state (see "What the CPU guard is now for"). There is no CPU cap any more, and `ZD_CPU_GUARD` deliberately does not arm under TCG — a TCG boot does cross 95% (measured 141/160/125% over three consecutive 5 s samples), and whether the guard's window sees it depends on when the guest's web service answers, so arming there can only cost a healthy boot (see [Why there is no CPU cap](#why-there-is-no-cpu-cap)). The guard is a KVM-only backstop: this guest settles near 50% of one core on the nested test host and near 4% on the bare-metal PVE node, so on either host a 95% sample is genuinely abnormal. Either way it samples the emulator's own CPU (the pid `qemu-once.py` publishes, not the launcher's, which stays at ~0), and only after the guest has reached READY, so during startup the readiness deadline is the only bound |
 | the guest stopped answering | it may have wedged (QEMU alive, guest silent). On Proxmox: `pct exec <id> -- /usr/local/sbin/zd1200-guest-healthcheck`; the watchdog reboots it after repeated failures (see `docs/PROXMOX.md`) |
 | the guest only ever has one CPU | ACPI must be on (`-machine pc`) for the second vCPU to be enumerated; `ZD_MACHINE=pc,acpi=off` (or `ZD_SMP=1`) forces the single-CPU model. With one CPU the vendor watchdog's tick collapses and every boot looks like a fault |
 | the guest boots the backup image after a reboot | the kernel watchdog timed out (the `'9'` kflag) and the in-box IPMI BMC reset the guest, so GRUB advanced to the spare and that boot's `flag_reset` cloned the spare back over the primary. A healthy guest with two vCPUs leaves the kflag at `'8'` |
 | the container logs `the saved GRUB entry is a rescue entry` and stops | the failover ladder reached the vendor rescue image. Rebuild from a firmware image keeping `/writable`: see [Recovering from the rescue entry](#recovering-from-the-rescue-entry) |
 | the container is `Up` but the appliance is unreachable, and the console shows `Error 25: Disk read error` / `Booting 'System rescue from image'` | both root entries failed to load and GRUB's `fallback 1 2` reached the rescue inside QEMU (the pre-QEMU guard cannot see this). Rebuild from firmware keeping `/writable`: see [Recovering from the rescue entry](#recovering-from-the-rescue-entry) |
 | container stops taking a long time | expected: the guest is asked to flush `/writable` before QEMU is torn down. Do not lower the grace period |
+
+## Why there is no CPU cap
+
+`CPU_LIMIT` used to duty-cycle the guest's CPU (SIGSTOP for 40 ms out of every
+100 ms) and has been removed rather than repaired. Historical record, measured on
+.250 with the same image, the same built disk and the guest QEMU under TCG:
+
+| then | result |
+|---|---|
+| a 60% duty-cycle cap (the old TCG default) | the vendor guest never reaches READY; its console fills with `write_kflag: *** Write to CF card failed, device /dev/sda2 not ready ***` plus repeating `__wake_up_common` traces, i.e. block I/O stops completing. The identical guest under KVM on the lab host logs none of that and reaches READY. **The same signature is not unique to throttling:** measured on 2026-09-27 with `CPU_LIMIT` unset, no container CPU limits and an idle host (load 0.39 on 4 vCPUs), a TCG boot of 10.5.1.0.282 produced 60+ `write_kflag` lines and 3 `__wake_up_common` traces with the **emulator at 2% of one core** -- block I/O failing in time under plain TCG slowness, with the guest blocked rather than working, so the emulator has nothing to run |
+| no cap | the same guest and disk reaches READY (`ZD1200 web service is ready (guest console reported: 'System go into READY status.')`) about 104 s after launch, with 0 `write_kflag` failures and 0 `__wake_up_common` traces |
+
+That measurement cannot be reproduced with today's code: at its call site the cap
+SIGSTOPped the `launch-vm.sh` wrapper, which owns none of QEMU's CPU, so it
+protected nothing at all — and once the supervisor learned to sample the
+emulator's own pid, the same duty cycle would have stopped the emulator itself,
+which is the wedging case above. Inert as written, harmful once fixed, so the
+knob and `scripts/container/limit-process-cpu.py` are gone. A `CPU_LIMIT` left in
+an operator's `/etc/zd1200.conf` is reported once in the container log and
+ignored.
+
+### What the CPU guard is now for
+
+`ZD_CPU_GUARD` is a **KVM-only backstop**, and the recorded measurements say it
+has never been needed. Across the KVM arms of this project's own matrix (three
+releases -- 9.10.2.0.130, 10.3.1.0.45, 10.5.1.0.282 -- through both flows, fresh
+state per boot, each arm sampled from the moment its web service answered until
+the guest was stopped), plus four earlier Docker KVM first boots (which also cover
+9.9.1.0.52, 9.13.3.0.164 and 10.1.2.0.318) and a long-lived appliance, the
+emulator's highest single 5 s sample was **76%** of one core (the appliance over
+ten hours, 7260 samples when this was written; the ten nested boot arms peaked at 53-60%, while the three bare-metal
+arms peaked at 4%), the longest run at or
+above 95% was **0 samples** in every arm, and nothing ever tripped. The one trip
+on record -- the port's own commit (`e1dc92e`) and Compose both report a fresh KVM
+guest tripping the shared 4-sample default 20 s after READY, but no log of it
+survives -- is not reproduced anywhere in this evidence: all ten boot arms in the
+record (six from this campaign, four from the earlier aborted attempt) sampled the
+emulator every 5 s across their whole ~300 s post-READY window, 59 or 60 samples
+each, without one reading at 95%, and the ten-hour appliance adds 7260 more.
+So no measured boot would have tripped at 4, at 24, or at any N >= 1: the 24 is a margin against an unreproduced event, not a calibrated
+threshold, and the trip's own configuration is now unknown (what the port session
+was running was not archived). Note that the baseline is a property of the HOST,
+not of the guest: on the bare-metal PVE node this guest halts when idle (~4% of
+one core, and 27-32% under TCG), while on the nested test host it does not (~50%,
+and 27-30% under TCG). What the guard is actually for is narrower than it looks:
+the guest watchdog already recovers a guest that has gone **silent**, while the
+guard exists for a guest that is pinning a core **and still answering ttyS1**, and
+no instance of that has been observed in this project. It is an unproven backstop,
+not protection anyone has watched work.
+
+The measurements behind that, oldest first. Measured on a real boot — outer QEMU under KVM with the vendor
+guest deliberately under TCG, the configuration this project must support:
+
+| measurement | result |
+|---|---|
+| nested emulator CPU after READY, guest under TCG | ~101% of one core for about 410 s, then 25-45% and flat. **This was the vendor's boot-time rootfs integrity check** (`S70resetflag` -> `chk_integrity.sh`) burning system time in a fork storm, not a property of TCG: `40-skip-integrity.sh` fixes it at the source, and with it applied the same configuration measures ~28-32% in the guard's window, profiling an arm from launch at the guard's own 5 s cadence caught three consecutive samples at 141/160/125% (above one core because `-smp 2`, pid 16984, ~21 s), but the window -- which opens at READY -- saw none of it (that arm's window peaked at 28%) |
+| the same vendor guest under KVM (a separate long-lived appliance on the test host, `-smp 2`) | ~50% of one core instantaneously and 50.4% averaged over two days: this guest does not idle with HLT under either accelerator. **That is the nested test host**: on the bare-metal PVE node the same guest with the same flags settles at ~4% (measured twice, `peak=4%`) |
+| a TCG guest with the old 24-sample (120 s) trip armed | it fires on **every** boot, because the 410 s busy phase outlasts the window — two runs tripped 160 s and 120 s after arming, and the appliance then relaunched the guest forever (`board data:` recurring, console frozen, no progress). **That busy phase was the integrity storm** (see the row above): on today's image the matrix's TCG arms (three releases, both flows) report `would_have_tripped=0` with in-window peaks of 27-32%, so the trip would not have fired on any of them, and this row is history rather than current behaviour |
+| the same guest 29+ minutes post-READY with `ZD_CPU_GUARD=0` | 0 trips, 1 guest launch |
+
+So `>=95% of one core` only discriminates where the guest has a core's worth of
+headroom to be abnormal in, and that headroom is a property of the host: this
+guest settles near 4% of one core on the bare-metal PVE node and near 50% on the
+nested test host under KVM, so a 95% sample is a ~24x anomaly on the first and a
+~1.9x one on the second. Under TCG the same guest now measures 27-32% in the
+guard's window (three releases through both flows), so a 95% sample is an anomaly
+there too: **the old rationale here -- that under TCG "one emulated vCPU holding a
+full core *is* the steady state" -- described the vendor's boot-time integrity
+storm, not the accelerator, and `40-skip-integrity.sh` removed it.** The trip
+still stays unarmed under TCG, for a different reason: a TCG boot crosses 95% in
+its own right (profiling an arm from launch at the guard's own 5 s cadence caught
+three consecutive samples at 141/160/125% -- above one core, because of `-smp 2`,
+~21 s, pid 16984); the sampling window opens when
+the guest's own web service answers, and TCG is the fallback path where stopping
+a healthy boot is the expensive failure. That is a **rationale correction, not a
+behaviour change**: arming under TCG remains unmeasured. It still samples every
+5 s, and writes a greppable accounting line for the
+launch it is sampling — at a guest relaunch, immediately before a trip's exit,
+once when the supervisor loop ends, and every 60 samples (about 5 minutes) while
+the launch is still running, so the numbers are visible mid-run and survive an
+abrupt stop:
+
+```
+High-CPU watchdog record: accel=kvm armed=24 emulator_pid=10649 samples=60 peak=56% longest_run=0 samples (0s) samples_above_95=0 would_have_tripped=0 trips=0
+High-CPU watchdog record: accel=tcg armed=no emulator_pid=16984 samples=30 peak=28% longest_run=0 samples (0s) samples_above_95=0 would_have_tripped=0 trips=0
+```
+
+`armed` is `no` when the trip is not armed and otherwise the configured sample
+count (so `armed=24` and `armed=no` above are the KVM and TCG cases), `peak` is
+the highest single-sample CPU seen, `longest_run` the longest consecutive run at
+or above 95% (in samples and in seconds), `samples_above_95` the number of samples
+at or above 95%, `would_have_tripped` the number of continuous runs that reached
+the configured sample count, and `trips` the number of times QEMU was actually
+stopped. On today's image `would_have_tripped` is **0 in every arm measured, under
+both accelerators** -- it was the pre-fix TCG boot that reached it on every launch
+-- and even the longest run at or above 95% is 0 samples, so no measured arm would
+have tripped at *any* threshold. The line exists so that "has this backstop ever
+been needed?" can be answered from the archived console log alone. A launch therefore produces several
+lines, each a snapshot of that launch's counters as they stood when it was
+written: **the last line for a given `emulator_pid` is the authoritative one, and
+an earlier line for that pid is a partial answer rather than a different launch's.**
+The mid-run line matters because a normal container stop is an outer `SIGTERM`,
+and the cleanup that follows can be killed before the post-loop line is reached;
+trips are unaffected, because their line is written immediately before the stop.
+For a KVM guest the trip is unchanged. The old premise in the entrypoint's comment
+— that the embedded kernel "should idle with HLT", so a full core meant a spin
+loop — was false and has been corrected.
+
+The record is now archived for every arm of the matrix, not only written to the
+flow's log: the test harness stops each guest gracefully so the entrypoint's TERM
+trap writes the launch's final line, then stores it as `supervision.log` beside the
+arm's `console.log` (Docker: from `docker logs` plus the container's console log;
+LXC: from the journal). `guard-record-report.sh` tabulates those lines and
+`guard-necessity.sh` applies the rule above to all of them at once.
 
 ## APs and firmware
 

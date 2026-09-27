@@ -21,6 +21,45 @@ import tempfile
 
 REBOOT_EXIT = 10
 SOCK_TIMEOUT = 120.0
+# How long to wait for a QEMU that closed its QMP socket to be reaped, so the
+# pid file can be removed with it.
+REAP_TIMEOUT = 30.0
+
+
+def publish_pid(path: str, pid: int) -> None:
+    """Record the emulator's pid in PATH for the entrypoint's CPU supervisor.
+
+    QEMU is a grandchild of the entrypoint (launch-vm.sh -> this script ->
+    qemu-system-i386), and /proc/<pid>/stat's utime+stime count a process's own
+    CPU time only, so the supervisor has to sample QEMU itself rather than the
+    launcher.  A temp file plus rename, so a reader never sees a partial pid.
+    """
+    if not path:
+        return
+    tmp = f"{path}.{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            f.write(f"{pid}\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"warning: cannot write {path}: {exc}", file=sys.stderr)
+
+
+def unpublish_pid(path: str, pid: int) -> None:
+    """Remove PATH once this QEMU has exited.
+
+    Only while it still names this QEMU: a relaunch after a guest reset writes a
+    new pid there, and the previous launch exiting must not remove that file.
+    """
+    if not path:
+        return
+    try:
+        with open(path) as f:
+            if f.read().strip() != str(pid):
+                return
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -40,6 +79,11 @@ def main() -> int:
     # close_fds=False: launch-vm.sh opens the macvtap device on fd 3 and
     # passes it as -net tap,fd=3; Python's default would close it before exec.
     proc = subprocess.Popen(cmd, close_fds=False)
+    # The entrypoint's CPU supervisor samples and stops the pid in this file.
+    # Written on every launch -- launch-vm.sh relaunches QEMU after each guest
+    # reset -- and removed when this QEMU exits, so it never names a dead one.
+    pid_file = os.environ.get("ZD_QEMU_PID_FILE", "")
+    publish_pid(pid_file, proc.pid)
 
     reason = "unknown"
     try:
@@ -48,6 +92,7 @@ def main() -> int:
         except socket.timeout:
             # QEMU never connected: it failed to start or exited immediately.
             proc.wait()
+            unpublish_pid(pid_file, proc.pid)
             return proc.returncode or 1
         with conn, conn.makefile("rw") as f:
             f.readline()  # QMP greeting
@@ -62,6 +107,20 @@ def main() -> int:
                 if msg.get("event") == "SHUTDOWN":
                     reason = msg.get("data", {}).get("reason", "unknown")
                     break
+    except ConnectionError:
+        # QEMU died while this process was talking to it -- a kill racing the
+        # handshake above gives BrokenPipeError here -- which is a QEMU outcome,
+        # not a failure of this script.  It must still reap QEMU and drop the
+        # pid file: the wait is bounded because the socket closes a moment
+        # before the process is reapable, and a QEMU that somehow kept running
+        # must not hang this script (its pid file then stays, correctly naming
+        # a live emulator).
+        try:
+            proc.wait(timeout=REAP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return 1
+        unpublish_pid(pid_file, proc.pid)
+        return proc.returncode or 1
     finally:
         srv.close()
         try:
@@ -70,6 +129,7 @@ def main() -> int:
             pass
 
     proc.wait()
+    unpublish_pid(pid_file, proc.pid)
     if reason == "guest-reset":
         return REBOOT_EXIT
     if reason == "guest-shutdown":

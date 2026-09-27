@@ -483,6 +483,25 @@ fi
 ZD_SERIAL="${SERIAL:-123456000789}"
 ZD_MAC1="${MAC:-00:0c:e6:12:00:01}"
 ZD_MAC2="${MAC2:-}"
+# dump_board_serial <dump-boarddata>: the board serial a card dump carries, or
+# nothing.  A card dump's board record is written to $IMAGE_DIR/dump-boarddata by
+# step 3 (prepare-vendor-image.sh), and the normal path in entrypoint.sh already
+# reuses it so a restored appliance keeps the identity the dead unit had.  An LXC
+# install that did not would restore the same unit under a different serial --
+# visible to Ruckus licensing and support.  The MAC still comes from this
+# instance's seed, so a clone does not collide on the LAN.  No record, or a
+# record without a serial, is not an error: the caller's own serial stands.
+dump_board_serial() {
+    local record="$1" serial=""
+    [ -f "$record" ] || return 0
+    serial="$(sed -n 's/^SERIAL=//p' "$record" | head -n1)"
+    printf '%s\n' "$serial"
+}
+dump_serial="$(dump_board_serial "$IMAGE_DIR/dump-boarddata")"
+if [ -n "$dump_serial" ]; then
+    ZD_SERIAL="$dump_serial"
+    log "board data: using the CF-dump serial $dump_serial"
+fi
 {
     printf '# ZD1200 LXC runtime configuration (written by zd1200-ct-bootstrap.sh).\n'
     printf '# Sourced by zd1200.service; edit with `systemctl edit` or rerun the\n'
@@ -511,7 +530,6 @@ ZD_MAC2="${MAC2:-}"
     printf 'WEB_WAIT_SECONDS=900\n'
     printf 'MEMORY_MB=2048\n'
     printf 'CPU_MODEL=n270\n'
-    printf 'KERNEL_EXTRA=nohz=off\n'
     # How the container itself is addressed (installer's CT net spec): the
     # network unit waits for the lease/address before moving it onto the bridge.
     case "${ZD_CT_ADDRESS:-dhcp}" in
@@ -525,12 +543,13 @@ ZD_MAC2="${MAC2:-}"
     # at all times.
     printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)"
     # The entrypoint's high-CPU guard: QEMU sustained above 95% CPU means the
-    # guest is spinning, and a spinning guest is exactly how the appliance wedges
-    # (the Docker flow leaves this at its default of 4 samples / 20s).  Keep it on
-    # but allow a longer run than the default, because a legitimate boot and the
-    # first-boot key generation are bursty.  24 samples = 120s of continuous
-    # saturation before QEMU is stopped; systemd then restarts the stack, which
-    # reboots the guest.  Set ZD_CPU_GUARD=0 to disable.
+    # guest is spinning, and a spinning guest is exactly how the appliance wedges.
+    # Both flows ship 24 samples -- the Docker flow sets the same value in
+    # docker/docker-compose.yml, and the entrypoint's own fallback of 4 is used by
+    # neither flow.  Keep it on, because a legitimate boot and the first-boot key
+    # generation are bursty.  24 samples = 120s of continuous saturation before
+    # QEMU is stopped; systemd then restarts the stack, which reboots the guest.
+    # Set ZD_CPU_GUARD=0 to disable.
     printf 'ZD_CPU_GUARD=%s\n' "${ZD_CPU_GUARD:-24}"
     # Auto-reboot the guest if it stops answering.  The appliance this replaced
     # had its guest OS wedge solid (QEMU alive, guest silent, both LAN addresses
@@ -538,6 +557,12 @@ ZD_MAC2="${MAC2:-}"
     # event.  Set ZD_GUEST_WATCHDOG=0 to disable.
     printf 'ZD_GUEST_WATCHDOG=%s\n' "${ZD_GUEST_WATCHDOG:-1}"
     printf 'ZD_GUEST_WATCHDOG_FAILURES=%s\n' "${ZD_GUEST_WATCHDOG_FAILURES:-5}"
+    # This flow supervises the watchdog as zd1200-watchdog.service, so the
+    # entrypoint must NOT start a second copy: its child would use the Docker
+    # flow's macvtap-shaped L2 lookup (iface/eth0) instead of the bridge one
+    # (br-zd), share the run state with the real watchdog, and duplicate the
+    # recovery.  ZD_GUEST_WATCHDOG=0 still disables both.
+    printf 'ZD_GUEST_WATCHDOG_CHILD=0\n'
     printf 'ZD_CONTAINER_MAC=%s\n' "$CONTAINER_MAC"
     printf 'ZD_BOARDDATA_FROM_MAC=1\n'
     # Informational (the topology is now always cross-connected): records that
