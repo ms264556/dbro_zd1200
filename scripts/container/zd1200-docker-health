@@ -73,7 +73,9 @@ emulator_uptime() {
     printf '%s' "$(( now - mt ))"
 }
 
-answer="$("$HELPER" --timeout "$TIMEOUT" 2>/dev/null || true)"
+# --probe: the verdict is about whether the guest answers now, so the helper
+# must ask it rather than return the address it cached on an earlier tick.
+answer="$("$HELPER" --probe --timeout "$TIMEOUT" 2>/dev/null || true)"
 guest_ip=""
 guest_service=""
 while IFS= read -r line; do

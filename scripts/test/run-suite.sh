@@ -2,66 +2,37 @@
 #
 # run-suite.sh — run the offline suite and say how many tests actually ran.
 #
-# Why this exists: the suite used to be an ad-hoc shell loop that printed
-# `===== <script>` and the exit code per test and nothing else.  Six of the 26
-# tests at b48d8ab print a `skipped:`/`skip:` marker and exit 0 having evaluated
-# nothing (boot-test.sh, patch-matrix-test.sh, wizard-e2e-lxc.sh,
-# xlink-mac-test.sh) or only part of their subject (chk-integrity-cost-test.sh,
-# skip-integrity-test.sh; HANDOFF.md 7.4, review-session7/REPORT.md class 3).  A
-# transcript in which every exit code is 0 therefore reads green while only 20
-# of the 26 evaluated their subject.  This runner keeps the transcript format
-# (`===== <script>` ... `exit=N`) and the exit-code contract, and adds the
-# missing summary:
+# Why this exists: several tests print a `skipped:`/`skip:` marker and exit 0
+# having evaluated nothing (no lab, no root, no vendor material) or only part of
+# their subject.  A transcript in which every exit code is 0 therefore reads
+# green while some tests evaluated nothing.  This runner prints each test's
+# output between `===== <script>` and a bare `exit=N` line, then adds the missing
+# summary:
 #
 #     ran 20 of 26 tests
 #     not run  scripts/test/boot-test.sh: skipped: this aarch64 host cannot ...
 #
-# The exit line is the BARE `exit=N` of the most recent recorded transcript
-# (wizard-e2e-9x/session7/offline-suite-after-fix.txt), so the two can be
-# diffed line-for-line.  The older wizard-e2e-9x/offline-suite-after.txt wrote
-# `----- exit=N`; that dashed form is gone and must not be "fixed" back.  The
-# runner's own summary is opened by `##### suite summary`, not by another
-# `===== ` line, so `grep -c '^===== '` still counts test scripts and nothing
-# else, and its lines (`ran ...`, `not run  ...`, `partial  ...`, `failed  ...`)
-# cannot be mistaken for a test's own ok/FAIL output.
+# The summary is opened by `##### suite summary`, not by another `===== ` line,
+# so `grep -c '^===== '` counts test scripts and nothing else, and its lines
+# (`ran ...`, `not run  ...`, `partial  ...`, `failed  ...`) cannot be mistaken
+# for a test's own ok/FAIL output.
 #
 # Membership and order are `scripts/test/*.sh` plus every `scripts/test/*-test.py`
 # in LC_ALL=C order over the whole set -- except run-suite.sh itself and
-# run-suite-test.sh, which drive this script and would recurse.  No test count is
-# hard-coded anywhere: the set is whatever the glob finds at run time.
-#
-# What this does to the recorded-transcript comparison, stated plainly.  The
-# recorded transcript (wizard-e2e-9x/session7/offline-suite-after-fix.txt) has 26
-# `===== ` headers, all of them `*.sh`; the runner's own earlier header described
-# that run as `ran 20 of 26`, and named the five `*-test.py` tests as a
-# `coverage gap:` instead of running them.  This runner's member set is a SUPERSET
-# of that one -- the same `*.sh` members, in the same order, plus the
-# `*-test.py` members now that they run -- so:
-#
-#   * `ran 20 of 26` is NOT reproducible by construction any more, and it is not
-#     meant to be: M is now the whole globbed set, so the same tree reads a
-#     larger M and a larger numerator.  The old number is history, not a target,
-#     and no member is excluded to preserve it.
-#   * `grep -c '^===== '` still counts members exactly, and `===== <name>` /
-#     bare `exit=N` are unchanged, so a transcript can still be diffed against
-#     an older one -- the `*.sh` portion of a new transcript is line-for-line the
-#     old one, with the `*-test.py` members appended in glob order.
-#   * Because a `partial:` test is counted as run (below) and the integrity tests
-#     now print `partial:` rather than `skipped:`, a run at a given tree reads a
-#     numerator two higher than the same run under the previous runner.
+# run-suite-test.sh, which drive this script and would recurse, and lib.sh, a
+# helper the tests source: run on its own it evaluates nothing, so counting it
+# would inflate `ran N of M`.  No test count is hard-coded: the set is whatever
+# the glob finds at run time.
 #
 # How each test is invoked: a `*.sh` test with `bash`, a `*-test.py` test with
-# `python3` -- the interpreter its own shebang (`#!/usr/bin/env python3`) and
-# header name, and the same command its Usage line documents (`python3
-# scripts/test/<name>`).  A `.py` test whose own output cannot be read is warned
-# about below; one that cannot evaluate its subject must print its own
-# `skipped:`/`skip:` marker and exit 0, exactly as the shell tests do.  Where
-# python3 itself is absent from PATH, every `*-test.py` is recorded not run with
-# a `skipped:` line of this runner's own rather than being counted as a failure:
-# a missing interpreter is an environment shortfall, not a defect in the test.
-# (That is the one interpreter check made here; the `*.sh` members are driven by
-# the bash already running this script, and their own tool preconditions are
-# theirs to skip on, as they already do.)
+# `python3`, the command its own Usage line documents.  A test that cannot
+# evaluate its subject must print its own `skipped:`/`skip:` marker and exit 0.
+# Where python3 itself is absent from PATH, every `*-test.py` is recorded not run
+# with a `skipped:` line of this runner's own rather than counted as a failure: a
+# missing interpreter is an environment shortfall, not a defect in the test.  (It
+# is the one interpreter check made here; the `*.sh` members run under the bash
+# already running this script, and their own tool preconditions are theirs to
+# skip on.)
 #
 # Usage:
 #   scripts/test/run-suite.sh [TEST ...]
@@ -80,12 +51,11 @@
 # Exit status: 0 when every test that ran exited 0; 1 when any test failed (the
 # failing tests are named by the `failed  <script>` lines of the summary); 2 for
 # a usage or setup error (no such test, no tests found, no scratch directory).
-# A test that skips still exits 0 and does not change the aggregate, exactly as
-# before -- it is only the `ran N of M` line that makes it visible.  Output that
-# cannot be read is recorded as not run and the suite continues; nothing here
-# aborts a run part-way.  The test output and the summary both go to stdout (the
-# transcript is one stream); the runner's own warnings and usage errors go to
-# stderr with a `run-suite:` prefix.
+# A test that skips still exits 0 and does not change the aggregate; only the
+# `ran N of M` line makes it visible.  Output that cannot be read is recorded as
+# not run and the suite continues; nothing here aborts a run part-way.  The test
+# output and the summary both go to stdout (the transcript is one stream); the
+# runner's own warnings and usage errors go to stderr with a `run-suite:` prefix.
 #
 # The three test classifications, as markers a test prints on its own stdout or
 # stderr.  For the lowercase markers the first line matching, in this precedence
@@ -103,18 +73,13 @@
 #                   carry (chk-integrity-cost-test.sh and skip-integrity-test.sh
 #                   without AS_CHKINT).  Counted RAN (it does not reduce the
 #                   numerator), and named under `partial  <test>: <marker line>`
-#                   so what it could not evaluate stays visible.  Before this
-#                   marker existed those two tests were counted NOT RUN while
-#                   having evaluated a fixture (HANDOFF.md 8.8 item 5).
+#                   so what it could not evaluate stays visible.
 #   neither         a full run of its subject.
 #
 # The all-caps `SKIP:` form, and why it is recognised only on the first line.
 # Several tests' own tool gates print `SKIP: <tool> not found` and `exit 0`
-# before doing any work, so without this the runner counts a test that evaluated
-# nothing as RAN (HANDOFF.md 9.2, 9.8 item 6; the gates are in file-list-test.sh,
-# dump-rootfs-version-test.sh, grub-effective-entry-test.sh,
-# webs-header-limit-test.sh, chk-integrity-cost-test.sh and
-# skip-integrity-test.sh).  But `SKIP:` in a test's output is not always a
+# before doing any work, so without this the runner would count a test that
+# evaluated nothing as RAN.  But `SKIP:` in a test's output is not always a
 # verdict about the test: ct-address-test.py prints one for a single optional
 # section whose precondition is missing and then evaluates everything else, and
 # the integrity tests write `SKIP:<path>` LINES INTO A FIXTURE /file_list.txt,
@@ -123,15 +88,14 @@
 # test's output, while a section skip or fixture content is emitted only after
 # the test has begun reporting.  An all-caps `SKIP:` therefore counts as a skip
 # only when it is that first non-blank line.  The lowercase `skipped:`/`skip:`
-# forms are deliberately unchanged: they are still recognised anywhere in the
-# output, because tests that print them after their own `ok` lines depend on
-# that (and on being counted NOT RUN).
+# forms are recognised anywhere in the output, because tests that print them
+# after their own `ok` lines depend on that (and on being counted NOT RUN).
 #
 # The markers are unambiguous to grep: each is anchored at the start of a line
 # (`^skipped: `, `^skip: `, `^partial: `, and `^SKIP: ` in the first-line-only
-# form above), and every summary line is prefixed
-# with `not run  ` or `partial  `, so neither a marker nor a summary line can be
-# mistaken for a test's own `ok`/`FAIL` output.
+# form above), and every summary line is prefixed with `not run  ` or
+# `partial  `, so neither a marker nor a summary line can be mistaken for a
+# test's own `ok`/`FAIL` output.
 #
 
 set -uo pipefail
@@ -139,8 +103,9 @@ set -uo pipefail
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$self_dir/../.." && pwd)"
 suite_dir="${ZD_SUITE_DIR:-$self_dir}"
-# Running either of these from the suite would recurse: they drive this runner.
-excluded_names="run-suite.sh run-suite-test.sh"
+# The first two drive this runner, so running them from the suite would recurse;
+# lib.sh is sourced by tests and is not one.
+excluded_names="run-suite.sh run-suite-test.sh lib.sh"
 
 usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 

@@ -25,24 +25,14 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
 TARGET="/bin/rbd.sh"
 
 # Both roots carry a copy (A/B failover), and a firmware upgrade installs a
 # fresh vendor rootfs into the spare one, so guard both.
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
-
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
-
-rm -rf "$WORK"; mkdir -p "$WORK"
 
 # Build the guarded copy of the vendor script from one root's own vendor content.
 # Any selected root can supply it: every root in the selection is unpatched by
@@ -52,7 +42,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 #
 # Returns non-zero when the root has nothing to do; the caller decides whether
 # that is "already guarded" (fine) or "not the script we expect" (a failure).
-build_guarded_script() {   # <name> -> $WORK/rbd.sh.patched, $WORK/rbd.mode
+build_guarded_script() {   # <name> -> $WORK/rbd.sh.patched
     local name="$1"
     if ! fs_read "$WORK/$name.img" "$TARGET" "$WORK/rbd.sh.orig"; then
         echo "  [$name] no $TARGET; nothing to patch here"
@@ -97,70 +87,18 @@ build_guarded_script() {   # <name> -> $WORK/rbd.sh.patched, $WORK/rbd.mode
         return 1
     fi
     # Preserve the vendor mode (0755) and ownership.
-    rbd_mode="$(fs_stat_meta "$WORK/$name.img" "$TARGET" | awk '{print $2}')"
-    printf '%s' "${rbd_mode:-0100755}" > "$WORK/rbd.mode"
     return 0
 }
 
-patched_any=0
-missing_any=0
-patched_parts=()
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] installing the MAC guard into $TARGET"
-    # Check before snapshotting: nothing has been modified yet, so a root with
-    # no work to do must not leave a snapshot behind.
-    extract_part "$name" "$start" "$sectors"
-    if ! build_guarded_script "$name"; then
-        # Absent target and an already-guarded root are both "no action", but
-        # absent is worth reporting at the end: it means this firmware release
-        # has no such script and the guard is not protecting anything.
-        fs_exists "$WORK/$name.img" "$TARGET" || missing_any=1
-        continue
-    fi
+apply() { # <name> <img>
+    build_guarded_script "$1" || return 0
+    # write_local keeps the vendor script's mode and ownership.
+    write_local "$2" "$TARGET" "$WORK/rbd.sh.patched"
+    PATCH_APPLIED=1
+}
 
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-    # shellcheck disable=SC2046  # mode is a single "0MMM" token
-    write_local "$IMG" "$TARGET" "$WORK/rbd.sh.patched" "$(cat "$WORK/rbd.mode")"
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-        patched_parts+=("$part")
-        echo "  OK   $name: MAC guard installed"
-    else
-        echo "  no byte changes for $name"
-    fi
-done
+verify() { # <name> <img>
+    fs_read "$2" "$TARGET" "$WORK/rbd.disk" && grep -q 'ZD-MAC-GUARD' "$WORK/rbd.disk"
+}
 
-if [ "$patched_any" = 0 ]; then
-    if [ "$missing_any" = 1 ]; then
-        say "no $TARGET in any selected root; this firmware release needs no guard"
-    else
-        say "no patch produced changes; nothing written to the disk"
-    fi
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each patched partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${patched_parts[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-    fs_read "$WORK/$name.verify.img" "$TARGET" "$WORK/$name.rbd.disk" || true
-    if grep -q 'ZD-MAC-GUARD' "$WORK/$name.rbd.disk" 2>/dev/null; then
-        echo "OK   $name: $TARGET carries the guard"
-    else
-        echo "FAIL $name: $TARGET on the disk has no guard" >&2
-        exit 1
-    fi
-done
-
-say "done — MAC guard installed in $QCOW"
+patch_main apply verify

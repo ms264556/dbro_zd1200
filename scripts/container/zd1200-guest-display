@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# scripts/container/proxmox/zd1200-guest-display — put the guest's address on the container's
-# display interface so Proxmox shows it in the Summary.
+# scripts/container/zd1200-guest-display — put the guest's address on the
+# container's display interface so Proxmox shows it in the Summary.
 #
 # The appliance's address is a DHCP lease, so it is not known once and forgotten:
 # it can move on renewal, and the displayed value has to move with it.  This
@@ -20,7 +20,7 @@
 #
 # While the address is held here, the guest's address is local to the container,
 # so the container itself can no longer reach the guest at that address.  That is
-# why the container no longer probes the guest over IP, and why the ARP policy in
+# why the container does not probe the guest over IP, and why the ARP policy in
 # zd1200-ct-net.sh matters: without it this container would answer ARP for the
 # appliance's address and race the guest for its traffic.
 #
@@ -31,6 +31,7 @@
 #   --check       report what is displayed, change nothing
 #
 # Exit 0 on success, 1 if the address is unknown (and --clear was not given).
+
 set -u
 
 IFACE="${ZD_DISPLAY_IF:-zd0}"
@@ -47,7 +48,7 @@ while [ $# -gt 0 ]; do
         --clear) CLEAR=1; shift ;;
         --quiet) QUIET=1; shift ;;
         --check) CHECK=1; shift ;;
-        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -101,9 +102,9 @@ case "$guest_ip" in
         ;;
 esac
 
-# Guard the exact failure this project has already hit: the container's own
-# lease and the guest's come from the same DHCP server, and if the bridge holds
-# the guest's address every packet for the appliance is delivered to the
+# Refuse an address the container itself holds: the container's own lease and
+# the guest's come from the same DHCP server, and if the bridge holds the
+# guest's address every packet for the appliance is delivered to the
 # container.  The bridge must win that contest -- it is the container's real
 # address -- so the display copy is dropped rather than shown.
 container_ip=""

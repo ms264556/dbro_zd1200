@@ -40,27 +40,16 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ANALYTICS_DIR="${ANALYTICS_DIR:-$(dirname "$BASE")/packages/analytics}"
-# Set ZD_NETWORK_MONITOR=0 to install nothing (the LXC installer's
-# --no-network-monitor): the fresh image then has no page and no collectors, as
-# if the feature did not exist.  Its value is part of the patch signature, so
-# changing it re-customises the roots.
-ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
+ANALYTICS_DIR="${ANALYTICS_DIR:-$(dirname "$BASE")/packages/analytics}"
+ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
 
 if [ "$ZD_NETWORK_MONITOR" = "0" ]; then
     echo "50-network-monitor: disabled (ZD_NETWORK_MONITOR=0); nothing to install"
     exit 0
 fi
-
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
 
 # --- payload -----------------------------------------------------------------
 PAYLOAD_BIN=(
@@ -87,7 +76,6 @@ for entry in "${PAYLOAD_SCRIPTS[@]}"; do
     [ -f "$ANALYTICS_DIR/${entry%%:*}" ] \
         || { echo "50-network-monitor: missing payload file $ANALYTICS_DIR/${entry%%:*}" >&2; exit 1; }
 done
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
 
 # Optional: label the admin console version with a source revision.  Disabled
 # unless a 7-character lowercase-hex value is supplied (install-zd1200-docker.sh
@@ -137,8 +125,6 @@ if [ -n "$ping_targets" ]; then
         echo "  expected 'MAC|IP|NAME' records separated by ';'" >&2
     fi
 fi
-
-rm -rf "$WORK"; mkdir -p "$WORK"
 
 # The ext2/store helpers (fs_stat_meta, write_local, mkdir_p, symlink_force,
 # write_deltas) come from patch-lib.sh: every file this patch
@@ -438,19 +424,9 @@ process_bundle() {
     return 0
 }
 
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
-
-patched_any=0
 menu_missing=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     say "[$name] installing the Network Monitor payload"
     mkdir_p "$WORK/$name.img" /usr/local/sbin
 
@@ -553,45 +529,25 @@ for part in "${PARTITIONS[@]}"; do
             fi
             ;;
     esac
+    PATCH_APPLIED=1
+}
 
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-    IFS='|' read -r V_FLAVOR V_ROOT <<< "$(ui_layout_of "$WORK/$name.verify.img")"
+verify() { # <name> <img>: the root as re-read from the disk
+    local name="$1"
+    IFS='|' read -r V_FLAVOR V_ROOT <<< "$(ui_layout_of "$2")"
     for bin in zd1200-ping-monitor zd1200-ping-export zd1200-local-getstat \
                zd1200-network-snapshot-collect zd1200-snapshot-index-publish \
                zd1200-ping-daily-publish zd1200-ping-monitor-settings-sync; do
-        read -r t _ u g <<< "$(fs_stat_meta "$WORK/$name.verify.img" "/usr/local/sbin/$bin")"
-        [ "$t" = "regular" ] || { echo "FAIL $name: /usr/local/sbin/$bin missing" >&2; exit 1; }
+        read -r t _ u g <<< "$(fs_stat_meta "$2" "/usr/local/sbin/$bin")"
+        [ "$t" = "regular" ] || { echo "FAIL $name: /usr/local/sbin/$bin missing" >&2; return 1; }
     done
-    read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$V_ROOT/zd1200-network-monitor.html")"
-    [ "$t" = "regular" ] || { echo "FAIL $name: monitor page missing" >&2; exit 1; }
-    read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" /etc/init.d/S99zd_ping_monitor)"
-    [ "$t" = "regular" ] || { echo "FAIL $name: collector init script missing" >&2; exit 1; }
+    read -r t _ _ _ <<< "$(fs_stat_meta "$2" "$V_ROOT/zd1200-network-monitor.html")"
+    [ "$t" = "regular" ] || { echo "FAIL $name: monitor page missing" >&2; return 1; }
+    read -r t _ _ _ <<< "$(fs_stat_meta "$2" /etc/init.d/S99zd_ping_monitor)"
+    [ "$t" = "regular" ] || { echo "FAIL $name: collector init script missing" >&2; return 1; }
     case "$V_FLAVOR" in
         10)
-            if debugfs -R "dump /web/build/ruckus.js $WORK/ruckus.final" "$WORK/$name.verify.img" >/dev/null 2>&1 \
+            if debugfs -R "dump /web/build/ruckus.js $WORK/ruckus.final" "$2" >/dev/null 2>&1 \
                && grep -q "$PANEL_MARKER" "$WORK/ruckus.final"; then
                 echo "OK   $name: ruckus.js carries the Network Monitor panel"
             else
@@ -599,16 +555,16 @@ for part in "${PARTITIONS[@]}"; do
             fi
             ;;
         9edison)
-            debugfs -R "dump $V_ROOT/edison/js/common/systemMenu.js $WORK/systemMenu.final" "$WORK/$name.verify.img" >/dev/null 2>&1
+            debugfs -R "dump $V_ROOT/edison/js/common/systemMenu.js $WORK/systemMenu.final" "$2" >/dev/null 2>&1
             if grep -q 'zd1200NetworkMonitorControl' "$WORK/systemMenu.final" 2>/dev/null; then
                 echo "OK   $name: Edison systemMenu.js carries the Network Monitor entry"
             else
                 echo "  ! $name: Edison menu entry not found after patch" >&2
             fi
-            read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$V_ROOT/edison/js/mon/zd1200NetworkMonitor.js")"
-            [ "$t" = "regular" ] || { echo "FAIL $name: Edison monitor module missing" >&2; exit 1; }
-            if [ -n "$(fs_stat_meta "$WORK/$name.verify.img" /web/admin/admin_template.mod)" ]; then
-                debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$WORK/$name.verify.img" >/dev/null 2>&1
+            read -r t _ _ _ <<< "$(fs_stat_meta "$2" "$V_ROOT/edison/js/mon/zd1200NetworkMonitor.js")"
+            [ "$t" = "regular" ] || { echo "FAIL $name: Edison monitor module missing" >&2; return 1; }
+            if [ -n "$(fs_stat_meta "$2" /web/admin/admin_template.mod)" ]; then
+                debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$2" >/dev/null 2>&1
                 if grep -q 'zd1200NetworkMonitorControl' "$WORK/util.final" 2>/dev/null; then
                     echo "OK   $name: classic util.js carries the Network Monitor menu hook"
                 else
@@ -617,7 +573,7 @@ for part in "${PARTITIONS[@]}"; do
             fi
             ;;
         9classic)
-            debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$WORK/$name.verify.img" >/dev/null 2>&1
+            debugfs -R "dump /web/scripts/util.js $WORK/util.final" "$2" >/dev/null 2>&1
             if grep -q 'zd1200NetworkMonitorControl' "$WORK/util.final" 2>/dev/null; then
                 echo "OK   $name: classic util.js carries the Network Monitor menu hook"
             else
@@ -625,12 +581,13 @@ for part in "${PARTITIONS[@]}"; do
             fi
             ;;
     esac
-done
+    return 0
+}
+
+patch_main apply verify
 
 if [ "$menu_missing" = 1 ]; then
     echo "  ! Network Monitor menu entry could not be added to this release's" >&2
     echo "    admin console; the page and collectors are installed and reachable" >&2
     echo "    directly, but not linked from the menu." >&2
 fi
-
-say "done — Network Monitor installed in $QCOW"

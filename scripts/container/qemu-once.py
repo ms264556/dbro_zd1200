@@ -10,16 +10,23 @@ QEMU emit SHUTDOWN with reason "guest-reset"; a guest poweroff emits
     10  guest rebooted     -> the caller should relaunch QEMU
     n   anything else (QEMU error, host signal, unknown reason)
 
+SIGUSR1 hard-resets the guest: it sends QMP `system_reset`, which under
+-no-reboot ends QEMU with reason "host-qmp-system-reset", reported as 10 like
+any other reset.  It is the guest watchdog's recovery for a guest that no
+longer runs the userspace a reboot request would need.
+
 Usage: qemu-once.py [QEMU arguments...]
 """
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 
 REBOOT_EXIT = 10
+RESET_REASONS = ("guest-reset", "host-qmp-system-reset")
 SOCK_TIMEOUT = 120.0
 # How long to wait for a QEMU that closed its QMP socket to be reaped, so the
 # pid file can be removed with it.
@@ -62,7 +69,24 @@ def unpublish_pid(path: str, pid: int) -> None:
         pass
 
 
+# The QMP connection, once QEMU has made it, for the SIGUSR1 handler.
+_qmp = None
+
+
+def hard_reset(_signum, _frame) -> None:
+    """SIGUSR1: ask QEMU to reset the machine.  A no-op before QMP is up."""
+    if _qmp is None:
+        return
+    try:
+        _qmp.sendall(json.dumps({"execute": "system_reset"}).encode() + b"\n")
+    except OSError:
+        pass
+
+
 def main() -> int:
+    global _qmp
+    # Before QEMU exists: the default action for SIGUSR1 would kill this script.
+    signal.signal(signal.SIGUSR1, hard_reset)
     sock_path = os.path.join(tempfile.gettempdir(), f"zd1200-qmp.{os.getpid()}.sock")
     if os.path.exists(sock_path):
         os.unlink(sock_path)
@@ -91,7 +115,13 @@ def main() -> int:
             conn, _ = srv.accept()
         except socket.timeout:
             # QEMU never connected: it failed to start or exited immediately.
-            proc.wait()
+            # Or it is alive but never connected QMP; the wait is bounded so a
+            # hung QEMU cannot block the launcher (and the relaunch) forever.
+            try:
+                proc.wait(timeout=REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             unpublish_pid(pid_file, proc.pid)
             return proc.returncode or 1
         with conn, conn.makefile("rw") as f:
@@ -99,6 +129,7 @@ def main() -> int:
             f.write(json.dumps({"execute": "qmp_capabilities"}) + "\n")
             f.flush()
             f.readline()  # capabilities reply
+            _qmp = conn
             for line in f:
                 try:
                     msg = json.loads(line)
@@ -122,6 +153,7 @@ def main() -> int:
         unpublish_pid(pid_file, proc.pid)
         return proc.returncode or 1
     finally:
+        _qmp = None
         srv.close()
         try:
             os.unlink(sock_path)
@@ -130,7 +162,7 @@ def main() -> int:
 
     proc.wait()
     unpublish_pid(pid_file, proc.pid)
-    if reason == "guest-reset":
+    if reason in RESET_REASONS:
         return REBOOT_EXIT
     if reason == "guest-shutdown":
         return 0

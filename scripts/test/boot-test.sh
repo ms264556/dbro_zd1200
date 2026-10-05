@@ -151,11 +151,17 @@ fi
 
 # Missing tooling or an unreachable daemon is this workstation's environment, not
 # a boot failure: say so visibly and leave the suite green.  This is the project's
-# skip idiom (patch-matrix-test.sh:43-47, wizard-e2e-lxc.sh:99-115).
+# skip idiom (see patch-matrix-test.sh).
 for tool in docker qemu-system-i386; do
   command -v "$tool" >/dev/null 2>&1 || skip "$tool not found on PATH"
 done
 docker info >/dev/null 2>&1 || skip "cannot reach the Docker daemon"
+# Without a prepared image/ and without a firmware to prepare one from there is nothing to boot, and
+# install-zd1200-docker.sh would refuse: that is a missing input, not a failed boot (the vendor files are
+# not in this repository), so say so and skip like the other tests that need them.
+if [ -z "$firmware" ] && [ ! -f "$repo/image/rootfs.ext2" ]; then
+  skip "no prepared image/ in this tree and no --firmware to prepare it from"
+fi
 
 # --- 1. build the container image (and image/ on first run) ------------------
 if [ "$do_build" = 1 ]; then
@@ -229,7 +235,7 @@ if [ "$do_prepare" = 1 ]; then
     -v "$cert_dir:/opt/zd1200/signing-cert:ro" \
     "${seed_args[@]}" \
     -v "$state_dir:/var/lib/zd1200" \
-    --entrypoint /opt/zd1200/scripts/container/prepare-vm-disks.sh \
+    --entrypoint /opt/zd1200/prepare-vm-disks.sh \
     "$image"
 fi
 

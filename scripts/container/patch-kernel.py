@@ -50,12 +50,17 @@ left byte-for-byte alone.
 
 import argparse
 import gzip
-import re
+import os
 import struct
 import sys
 import zlib
 from pathlib import Path
-from typing import NamedTuple
+
+# The signature engine lives beside this script (binpatch.py) and is shared with
+# patch-file.py.  The directory is put on the path explicitly because the tests
+# load this file by path (importlib), where sys.path[0] is not this directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import binpatch  # noqa: E402
 
 # Each patch is (name, signature_hex, patch_offset, patch_hex, description,
 # rel32_exit, group).  signature_hex is matched against the kernel ELF with "??"
@@ -78,6 +83,7 @@ from typing import NamedTuple
 #
 # The comment above each entry says what the target does and when it runs, since
 # that is what decides whether the patch is still needed after a firmware bump.
+
 PATCHES = [
     # kernel_halt() is the standard "halt this machine" routine (kernel/sys.c):
     # run the shutdown path, print "System halted.", stop the CPU.  The vendor
@@ -110,74 +116,45 @@ PATCHES = [
      + "e8????????b801000000e8????????b8????????e8????????e9????????",
      9, bytes.fromhex("eb0a"),
      "nar5520_wdt_thread(): undo the older broad skip of the timeout block", 0, ""),
-    # addrconf_dev_config() must not configure the vendor's `dhcp0` interface.
+    # addrconf_dev_config() must not configure the vendor's `dhcp0` interface, or
+    # the guest crash-loops before it ever reaches READY.
     #
-    # The `af` module builds dhcp0 in create_dhcp(): register_netdevice()
-    # (dhcp.c:314), dev_open() (dhcp.c:319), then `dev_dhcp = dev` (dhcp.c:328).
-    # dev_open() fires the IPv6 addrconf notifier's NETDEV_UP case, which reaches
-    # addrconf_dev_config() and adds dhcp0's link-local address.  That address
-    # joins its solicited-node multicast group, and igmp6_group_added() responds
-    # with mld_ifc_event() -> mld_ifc_start_timer(idev, 1), i.e. a timer 2 jiffies
-    # out.  When it expires it transmits an MLD report over dhcp0, whose
-    # ndo_start_xmit is the module's dhcp_xmit().  dhcp_xmit() loads the module
-    # global `dev_dhcp` and dereferences it with no NULL check, and at that moment
-    # dev_dhcp is still NULL because create_dhcp() has not reached dhcp.c:328:
+    # The `af` module's create_dhcp() register_netdevice()s dhcp0 and dev_open()s
+    # it (dhcp.c:314,319) before it sets the module global `dev_dhcp = dev`
+    # (dhcp.c:328).  dev_open() fires the IPv6 addrconf NETDEV_UP notifier, which
+    # reaches addrconf_dev_config() and adds dhcp0's link-local address; that
+    # address joins its solicited-node group, igmp6_group_added() arms an MLD
+    # timer 2 jiffies out, and when it fires it transmits an MLD report through
+    # dhcp0's ndo_start_xmit (the module's dhcp_xmit()).  dhcp_xmit() dereferences
+    # the still-NULL dev_dhcp -- create_dhcp() has not reached line 328 yet:
+    #     BUG: ... NULL pointer dereference ... dhcp_xmit+0x9e/0x210 [af]
+    #     mld_ifc_timer_expire -> mld_sendpack -> ... -> dhcp_xmit
+    # and the vendor's oops guard reboots the guest, forever.
     #
-    #     BUG: unable to handle kernel NULL pointer dereference at 000003b8
-    #     IP: [<...>] dhcp_xmit+0x9e/0x210 [af]
-    #     ... mld_ifc_timer_expire -> mld_sendpack -> ... -> dhcp_xmit ...
-    #     [<...>] ? create_dhcp+0x130/0x1c0 [af]   (the dev_open() call site)
+    # Suppressing only dhcp0's IPv6 configuration removes the trigger: with no
+    # link-local address there is no solicited-node group and so no MLD timer.
+    # Measured against 2.6.32's addrconf.c/mcast.c, ipv6_add_dev() otherwise joins
+    # only the all-nodes group, which mca_alloc() flags MAF_NOREPORT and
+    # igmp6_group_added() skips -- so every other interface stays byte-identical,
+    # and the IPv6 stack itself stays up.  Two blunter fixes were rejected:
+    # `ipv6.disable=1` works but breaks the vendor's TAC/RADIUS proxy ("Address
+    # family not supported by protocol"), and an in-module NULL guard does not fit
+    # (dhcp_xmit's 18-byte window is pinned by two R_386_32 relocations, so a guard
+    # that keeps the dev_dhcp->ifindex store needs 21 bytes).
     #
-    # The vendor's oops guard then reboots the guest, so the boot loops forever
-    # instead of reaching READY.  The shape: a vendor virtual net_device,
-    # IPv6 MLD, and a half-built device.
+    # The write must stop before +0x0d so the stock 7-byte `movzx eax,[ebx+0xdc]`
+    # -- the device type the ARPHRD switch dispatches on -- survives untouched: a
+    # wider write that nops its tail leaves the switch running on the ASSERT_RTNL
+    # helper's return value (0 or 1), so every device looks like ARPHRD_ETHER.
+    # That is a silent IPv6-config change for non-Ethernet devices that no boot
+    # test can see; only disassembly catches it.  13 bytes is what fits before
+    # +0x0d -- too few for a full name test (10 bytes + a 2-byte branch + the
+    # 5-byte jump = 17), so only dhcp0's first four name bytes are compared.
     #
-    # Suppressing only dhcp0's IPv6 configuration removes the trigger, because
-    # with no link-local address there is no solicited-node group and therefore
-    # no MLD timer -- measured against 2.6.32's addrconf.c/mcast.c:
-    # ipv6_add_dev() joins only the all-nodes group, which mca_alloc() flags
-    # MAF_NOREPORT, and igmp6_group_added() returns early for it (and again while
-    # !(dev->flags & IFF_UP), which is the case during NETDEV_REGISTER anyway).
-    # Every other interface keeps byte-identical behaviour.
-    #
-    # The IPv6 stack itself stays available, which is the point: disabling it
-    # wholesale (`ipv6.disable=1`) was measured to work but breaks the vendor's
-    # TAC/RADIUS-proxy components with "Address family not supported by protocol".
-    #
-    # An in-module fix was tried and abandoned: the faulting site needs a NULL
-    # guard that does not fit.  dhcp_xmit's window is .text+0x116ac..0x116bd (18
-    # bytes) and its layout is pinned by two existing R_386_32 relocations
-    # (outdev at +0x8c, dev_dhcp at +0x94, with the dev_dhcp->ifindex store at
-    # +0x91), so a guard that keeps that store needs 21 bytes.
-    #
-    # The replacement here was 20 bytes once, and the 20-byte version was
-    # defective: it was not only the ASSERT_RTNL block.  The stock `movzx
-    # eax,word [ebx+0xdc]` (the device type the ARPHRD switch dispatches on)
-    # sits at sig_start+0x0d..+0x13, so the six nops of that version overwrote
-    # its last six bytes.  The `jne` landed on the dispatch at +0x14, which
-    # then compared `ax` against 1/0x306/0x320/7/0x20 using whatever eax the
-    # ASSERT_RTNL helper left there -- and that helper (0xc125d440: `mov
-    # eax,[global]; sub eax,1; setne al; movzx eax,al; ret`) returns 0 or 1, so
-    # `cmp ax,1` matched for a healthy lock and every interface was treated as
-    # ARPHRD_ETHER.  That was a silent IPv6 address-configuration change for
-    # non-Ethernet devices on the four group-A releases, and no boot test could
-    # see it (the guest still came up).  Disassembling the patched kernels is
-    # what found it.
-    #
-    # The 13-byte replacement below is the fix.  It stops before +0x0d, so the
-    # `movzx` and the dispatch at +0x14 stay byte-for-byte intact, and dhcp0
-    # alone is branched past them to the epilogue at +0x33.  13 bytes cannot
-    # also carry the old 10-byte name test: a 2-byte conditional plus the
-    # 5-byte near jump that exit uses plus that test is 17 bytes, so the entry
-    # below tests only the first four bytes of the name.
-    #
-    # The signature still locates the site by masking the 20 bytes the old patch
-    # replaced, but this entry writes only the first 13 of them, so
-    # sig_start+0x0d..+0x13 -- the whole 7-byte `movzx` -- stays byte-for-byte
-    # stock.  That is the control-flow change: a non-dhcp0 device takes
-    # `jne +0x05` to the untouched `movzx` and runs the stock ARPHRD switch
-    # verbatim, while dhcp0 takes `jmp +0x26` to the function's own epilogue at
-    # +0x33 without configuring anything.
+    # The signature masks the 20 bytes the site spans but this entry writes only
+    # 13, leaving +0x0d..+0x13 stock: a non-dhcp0 device takes `jne +0x05` to that
+    # untouched `movzx` and runs the stock ARPHRD switch, while dhcp0 takes
+    # `jmp +0x26` to the function's own epilogue at +0x33, configuring nothing.
     ("addrconf_dev_config_dhcp0",
      "??" * 20 + "6683f8017431663d0603742b663d200374256683f80790741e6683f82074188b",
      0, bytes.fromhex("813b64686370"     # cmp dword [ebx], "dhcp"
@@ -186,110 +163,84 @@ PATCHES = [
      "addrconf_dev_config(): do not configure IPv6 on the vendor dhcp0 interface",
      0, "dhcp0_variant"),
     # The same fix for the releases whose compiler inlined addrconf_dev_config()
-    # into addrconf_notify() instead of emitting it as a function: the code has
-    # no prologue, prologue stores or epilogue of its own, and everything from
-    # the stock `movzx eax,[ecx+0xdc]` on is byte-identical to the standalone
-    # shape (the movzx sits at +0x14 here, not +0x0d).
+    # into addrconf_notify() instead of emitting it as a function: no prologue or
+    # epilogue of its own, and everything from the stock `movzx eax,[ecx+0xdc]` on
+    # is byte-identical to the standalone shape -- but the movzx sits at +0x14
+    # here, not +0x0d.
     #
-    # The geometry, and why the write is at +0x14 and nowhere else.  The match
-    # starts at a `jne`'s rel32 displacement -- the instruction containing the
-    # match begins two bytes before it -- so the first four matched bytes are
-    # displacement bytes, not an instruction boundary, and match+0x04 is the
-    # fall-through target of that `jne`, i.e. LIVE code (`mov eax,[esp+0x18]`;
-    # `mov edx,ebx`; a call; a jmp).  The address this code path actually
-    # reaches is match+0x14, where the ASSERT_RTNL call sits: on all five
-    # releases exactly one branch targets it (`je <match+0x14>` inside the
-    # enclosing addrconf_notify), and it is an instruction boundary.  The stock
-    # block there is:
+    # Geometry, and why the write is at +0x14.  The match starts at a `jne`'s rel32
+    # (the instruction begins two bytes before it), so match+0x00..+0x03 are
+    # displacement bytes and match+0x04 is that `jne`'s fall-through -- LIVE code
+    # (`mov eax,[esp+0x18]`; `mov edx,ebx`; a call; a jmp).  The address the path
+    # actually reaches is match+0x14, the ASSERT_RTNL call: on all five releases
+    # exactly one branch (`je <match+0x14>` in the enclosing addrconf_notify)
+    # targets it, and it is an instruction boundary.  The stock block there:
     #
-    #   +0x00 call <ASSERT_RTNL helper>   } ASSERT_RTNL, whose result the caller
-    #   +0x05 test eax,eax                } discards (addrconf_dev_config returns
-    #   +0x07 lea esi,[esi]               } void), plus its failure path
+    #   +0x00 call <ASSERT_RTNL helper>   } ASSERT_RTNL (result discarded;
+    #   +0x05 test eax,eax                } addrconf_dev_config returns void) and
+    #   +0x07 lea esi,[esi]               } its failure path
     #   +0x0a je  <WARN block>            }
-    #   +0x10 mov ecx,[esp+0xc]           <- the device pointer reloaded after
-    #   +0x14 movzx eax,word [ecx+0xdc]   <- the device type, STOCK, not touched
+    #   +0x10 mov ecx,[esp+0xc]           <- device pointer reloaded after the call
+    #   +0x14 movzx eax,word [ecx+0xdc]   <- device type, STOCK, not touched
     #   +0x19 (stock ARPHRD dispatch)
     #
-    # An earlier version of this entry wrote its 20 bytes at match+0x00 instead.
-    # Nothing branches there, so its first instruction was unreachable; the
-    # fall-through of the `jne` at match+0x02 landed in the middle of it; and
-    # the ASSERT block, the device reload and the dispatch were left stock, so
-    # dhcp0 was still configured.  It also overwrote the live fall-through code
-    # at match+0x04..+0x13.  patch_off is therefore 0x14: the write lands on the
-    # block the enclosing flow actually reaches.
+    # patch_off is 0x14 because that is the block the enclosing flow reaches.  A
+    # write at match+0x00 is unreachable (nothing branches there): its first
+    # instruction never runs, the `jne` fall-through lands mid-instruction, the
+    # ASSERT block / reload / dispatch stay stock so dhcp0 is still configured, and
+    # it clobbers the live code at +0x04..+0x13.
     #
-    # The replacement, 20 bytes ending exactly where the stock `movzx` begins:
+    # The 20-byte replacement, ending exactly where the stock `movzx` begins:
     #
-    #   +0x00 mov ecx,[esp+0xc]       } the device pointer, loaded HERE rather
-    #                                 } than assumed to be live in ecx
+    #   +0x00 mov ecx,[esp+0xc]       } the device pointer, loaded HERE, not
+    #                                 } assumed live in ecx
     #   +0x04 cmp dword [ecx],"dhcp"  }
     #   +0x0a jne +0x08               -> +0x14, the stock movzx (non-dhcp0)
-    #   +0x0c nop; nop; nop           } pad
-    #   +0x0f jmp match-0x6fd         <- dhcp0 leaves HERE, for the epilogue
+    #   +0x0c nop; nop; nop           } pad, so the jump ENDS at +0x14
+    #   +0x0f jmp match-0x6fd         <- dhcp0 leaves here, for the epilogue
     #   +0x14 (stock movzx: every other device enters here)
     #
-    # ecx is loaded rather than assumed.  It is not a free choice: the compiler
-    # reloads the device pointer after the ASSERT_RTNL call precisely because a
-    # call clobbers the caller-saved registers, and whether ecx happens to hold
-    # it at the anchor is a control-flow property of the vendor binary that this
-    # byte-signature cannot check at patch time.  `mov ecx,[esp+0xc]` is the
-    # same instruction, on the same esp, that stock runs at +0x10, so a
-    # non-dhcp0 device sees stock behaviour bit-for-bit: `jne` reaches the
-    # untouched movzx and the stock ARPHRD switch runs on dev->type.  The cost
-    # is 4 bytes, which leaves room for only the first four name bytes: 4 + 6
-    # (the name compare) + 2 (the branch) + 5 (the jump) = 17, and a fifth-byte
-    # compare plus a second branch would need 23.  (On 10.2.1.0.236 ecx CAN be
-    # shown to hold the device: the anchor's only incoming branch is inside a
-    # straight run whose head is `mov ecx,[esp+0xc]` and whose interior has no
-    # other entry and no call.  That invariant is not used -- group A's 13-byte
-    # entry accepts the same four-byte test, so both shapes now mean the same
-    # thing.)
+    # ecx is loaded, not assumed: the compiler reloads the device pointer after the
+    # call precisely because a call clobbers caller-saved registers, and whether
+    # ecx holds it at the anchor is a property this byte-signature cannot check.
+    # `mov ecx,[esp+0xc]` is the same instruction on the same esp that stock runs
+    # at +0x10, so a non-dhcp0 device sees stock behaviour bit-for-bit.  Those 4
+    # bytes leave room for only the first four name bytes (4 + 6 name-compare + 2
+    # branch + 5 jump = 17; a fifth byte would need 23).  The `jne` must END at
+    # +0x14 so a non-dhcp0 device enters the stock code on an instruction boundary
+    # (the locator masks through +0x13 at width 20), which is why the pad precedes
+    # the jump.
     #
-    # The `jne` must land on the stock `movzx` at +0x14, so the jump has to be
-    # the last instruction and has to END at +0x14: a non-dhcp0 device enters
-    # the stock code there, the last byte the locator masks at mask width 20, so
-    # anything at or after +0x14 would either be entered mid-instruction or
-    # never run.  That is why the pad sits before the jump.
+    # dhcp0's exit is the inlined function's own epilogue at match-0x6fd, the `mov
+    # eax,edx` after `mov edx,1` -- the jump skips `mov edx,1` and returns whatever
+    # edx held (the caller ignores it: void).  Unlike every other jump this file
+    # writes, the -0x725 displacement is a CONSTANT in the patch bytes, not one
+    # re-derived from the match or pinned by the signature (which covers only
+    # match+0 on): the epilogue sits 0x702 bytes before the match.  All five
+    # inlined releases carry the same bytes there, so it is correct for them, and
+    # inlined_dhcp0_landing_error() re-checks the landing before any write, so a
+    # release with different geometry is refused rather than silently miswritten.
     #
-    # dhcp0's exit is the inlined function's own epilogue at match-0x6fd, the
-    # `mov eax,edx` that follows `mov edx,1` -- the jump deliberately skips the
-    # `mov edx,1` and the return value is whatever edx already held (the caller
-    # ignores it: addrconf_dev_config returns void).  This is the same
-    # convergence point the group-A patch uses, so both shapes mean the same
-    # thing.  The displacement is position-dependent and re-derived from THIS
-    # anchor: the jump is at match+0x23 and ends at match+0x28, so the
-    # displacement to match-0x6fd is -0x725, not the -0x711 a write at +0x0f
-    # needed.
+    # The write also covers match+0x24, the stock `mov ecx,[esp+0xc]`, whose only
+    # incoming branch is the ASSERT-failure WARN block's back-jump (`jmp
+    # match+0x24`).  That is safe only because the WARN block's sole entry is the
+    # `je +0x0a` this entry overwrites and the instruction before it is an
+    # unconditional jmp: with the `je` gone the block is unreachable and its
+    # back-jump never runs.  A release that showed a second entry into the block
+    # would have to keep match+0x24 an instruction boundary (20 bytes cannot,
+    # alongside the 5-byte back-jump) and would have to be escalated.
     #
-    # The old write also covered match+0x24, the stock `mov ecx,[esp+0xc]`, and
-    # that address has an incoming branch: the ASSERT-failure WARN block (the
-    # `je +0x0a` target) ends with `jmp match+0x24`.  That is safe because the
-    # WARN block's only entry is that `je` -- the instruction this entry
-    # overwrites -- and the instruction before the block is an unconditional
-    # jmp, so there is no fall-through either: with the `je` gone the whole
-    # block is unreachable and its back-jump never runs.  Measured on all five
-    # releases; if a release ever showed a second entry into the block, the
-    # patch would have to keep match+0x24 an instruction boundary, which 20
-    # bytes cannot do alongside the 5-byte backward jump, and that release
-    # would have to be escalated rather than patched.
+    # Do NOT "simplify" the target to the caller's tail at match-0x4ba: ebp is live
+    # there (`test ebp,ebp`/`je`, then `cmp [ebp+0x98],...`), so arriving runs IPv6
+    # code for whatever ebp points at instead of returning.
     #
-    # Do NOT "simplify" the target back to the caller's tail at match-0x4ba.
-    # That tail is not a safe exit: ebp is live there (`test ebp,ebp` / `je`, and
-    # the fall-through does `cmp [ebp+0x98],...`).  The anchor's only entry is
-    # the `je` taken when `[0xc14b8e68]+0x54` is NULL, while ebp was set from
-    # `[ecx+0x13c]` -- so arriving at the tail runs IPv6 code for whatever ebp
-    # points at, instead of returning.
-    #
-    # Size-neutral (20 for 20).  The 20 bytes written are the ASSERT block, its
-    # failure path and the device reload -- all of them replaced by the name
-    # test and the exit -- and the stock `movzx` and ARPHRD dispatch from +0x14
-    # are untouched, so every non-dhcp0 device is unaffected.
-    #
-    # The signature's first four bytes stay wildcards (the containing `jne`'s
-    # rel32), but match+0x04..+0x13 are pinned to the live fall-through code the
-    # old entry used to clobber: all five releases carry `mov eax,[esp+0x18]`,
-    # `mov edx,ebx`, a call and a jmp there, identical apart from the two
-    # displacements, which stay wildcards per this file's convention.
+    # Size-neutral (20 for 20): the ASSERT block, its failure path and the device
+    # reload are replaced by the name test and the exit; the stock `movzx` and
+    # ARPHRD dispatch from +0x14 are untouched.  The signature's first four bytes
+    # stay wildcards (the `jne`'s rel32), but match+0x04..+0x13 pin the live
+    # fall-through (`mov eax,[esp+0x18]`, `mov edx,ebx`, a call, a jmp -- identical
+    # across the five apart from the two masked displacements) the old entry used
+    # to clobber.
     ("addrconf_dev_config_dhcp0_inlined",
      "??" * 4 + "8b442418" + "89da" + "e8" + "????????" + "e9" + "????????"
      + "e8" + "????????" + "85c0" + "8d7600" + "0f84" + "????????"
@@ -303,7 +254,61 @@ PATCHES = [
                          "e9dbf8ffff"),  # jmp match-0x6fd (the epilogue)
      "addrconf_dev_config() (inlined): do not configure IPv6 on the vendor "
      "dhcp0 interface", 0, "dhcp0_variant"),
+    # Not patched: rks_pkt_trace_init().  Returning 0 there stops the vendor "tif0"
+    # interface being created, which removes a rare cold-TCG-boot oops (tif_xmit
+    # dereferences NULL when an MLD timer fires on the half-built interface; the
+    # readiness deadline restarts the guest and the next boot usually wins the race).
+    # The price is too high: with tif0 absent a restored configuration (WLANs, AP
+    # groups) makes apmgr stop answering and the controller restarts about every
+    # two minutes, on every release and under KVM.  Found by bisecting a restored
+    # backup install; a factory install does not show it.
+    #
+    # tsc_read_refs() is native_calibrate_tsc()'s reference read: it samples the
+    # TSC either side of one HPET (or PM-timer) read, and throws the sample away
+    # when the two TSC reads are SMI_TRESHOLD = 50000 cycles (~15 us) or more apart,
+    # on the theory that an SMI landed in between.  In a nested guest the HPET read
+    # is an exit through two hypervisors and takes longer than that every time, so
+    # every sample is discarded, calibration returns 0, tsc_init() marks the TSC
+    # unstable and the guest clocks off the HPET instead -- an exit per ktime_get(),
+    # which is the "idle guest burns half a core" report on a nested host (13% of a
+    # core against 5% with a calibrated TSC, measured on the same nested host).
+    # Raising the limit to 0xfffff cycles (~0.3 ms) admits those samples and still
+    # rejects a real stall; calibration then succeeds ("TSC: using HPET reference
+    # calibration").  On the lab's nested host the smallest limit that works lies
+    # between 100000 and 150000 cycles, so 0xfffff leaves about 7x headroom for a
+    # slower or busier host; one that still fails keeps today's HPET fallback.
+    # The pinned bytes are `sub ecx,edi; sbb ebx,ebp; cmp ebx,0; ja;
+    # cmp ecx,imm32; ja` -- the 64-bit "difference >= limit" test -- and the write is
+    # the imm32 (0xc34f, 49999).  Direct KVM and TCG already end up on the TSC
+    # without it (measured: clocksource tsc, 1.5% of a core idle on direct KVM and
+    # 6% on TCG), so it changes nothing that matters there.
+    #
+    # An earlier version of this fix asked KVM for the frequency instead (it wrote
+    # MSR 0x4b564d01 from a code cave and read a pvclock page).  That was exact but
+    # KVM-only -- under TCG it replaced the stock PIT calibration with a failure and
+    # left the guest on the HPET -- and it needed a page of guest RAM that nothing
+    # reserves.  This is four bytes, runs wherever the guest does, and lands within
+    # ~0.007% of the hypervisor's figure.
+    ("tsc_read_refs_threshold",
+     "29f919eb83fb00771581f94fc3000077",
+     11, bytes.fromhex("ffff0f00"),
+     "tsc_read_refs(): accept reference reads up to 0xfffff cycles apart (was 49999)",
+     0, ""),
 ]
+
+# Opt-in patches: left out of PATCHES unless named in ZD_KERNEL_OPT_IN (comma
+# separated).  The two addrconf_dev_config dhcp0 shapes fix a crash-loop seen only on
+# the abandoned VM path (the guest never reached READY).  The Docker and LXC flows
+# never needed them, and they do harm there: with them applied, restoring a
+# configured backup on every 9.x release (9.9.1, 9.10.2, 9.13.3) makes apmgr stop
+# answering and the controller restart about every two minutes; without them, or on
+# `main`, the same restore is stable.  Measured by swapping the kernel patcher and then
+# removing just these two entries.  They stay in the table, with their tests, for a
+# path that can show it needs them, and are enabled with
+#   ZD_KERNEL_OPT_IN=addrconf_dev_config_dhcp0,addrconf_dev_config_dhcp0_inlined
+OPT_IN_PATCHES = {"addrconf_dev_config_dhcp0", "addrconf_dev_config_dhcp0_inlined"}
+_OPTED_IN = {n.strip() for n in os.environ.get("ZD_KERNEL_OPT_IN", "").split(",")}
+PATCHES = [e for e in PATCHES if e[0] not in OPT_IN_PATCHES or e[0] in _OPTED_IN]
 
 # Patches that a release may legitimately not carry at all.  A zero match for
 # one of these is reported and skipped; a zero match for any other patch means
@@ -338,105 +343,79 @@ OPTIONAL_PATCHES = {"addrconf_dev_config_dhcp0",
                     "addrconf_dev_config_dhcp0_inlined"}
 
 
-class Site(NamedTuple):
-    """One patch's signature, its match, and everything needed to write it.
-
-    Held as a record rather than a bare tuple because the locate pass and the
-    write pass are separate loops: a field the write pass uses but the record
-    does not carry is then a construction-time TypeError instead of a stale loop
-    variable.  That mistake shipped twice -- first `patch_off`, then the match
-    width -- and each time wrote at the wrong offset.
-    """
-    name: str
-    sig_hex: str
-    group: str
-    patch: bytes
-    rel32_exit: int
-    patch_off: int
-    sig_len: int
-    written: int              # bytes reported as overwritten (5 for a rel32 jump)
-    write_width: int          # bytes the locator masks: the whole write
-    hits: list                # file offsets of every match in the payload
-
-
-def _locator(sig_hex: str, patch_off: int, width: int) -> str:
-    """The match pattern: `width` bytes at patch_off masked out."""
-    return (sig_hex[:patch_off * 2] + "??" * width
-            + sig_hex[(patch_off + width) * 2:])
-
-
 def locate_sites(payload: bytes):
-    """Match every patch's signature against `payload` once, for both callers.
-
-    Returns (sites, matched_groups): one Site per PATCHES entry, in order, each
-    holding its hits and every field the readers need, plus the group -> member
-    map that says which shape of each group this kernel carries.
-
-    Both the writer (main) and the offline checker (self_test) go through here,
-    so they cannot drift apart in what they match or in how wide the mask is.
-    """
-    sites = []
-    matched_groups = {}
-    for name, sig_hex, patch_off, patch, desc, rel32_exit, group in PATCHES:
-        # The locator masks every byte the patch writes, so the same signature
-        # finds the site whether or not the patch is already there.  The width is
-        # the whole write -- the 5-byte jump, or the patch bytes -- which for a
-        # patch_off 0 entry like kernel_halt is wider than the declared patch (it
-        # replaces a 5-byte `mov eax,imm32`, but `patch` is just the 1-byte
-        # `ret`).
-        write_width = max(5 if rel32_exit else 0, len(patch))
-        hits = find_signature(payload, _locator(sig_hex, patch_off, write_width))
-        sites.append(Site(name, sig_hex, group, patch, rel32_exit, patch_off,
-                          len(sig_hex) // 2, 5 if rel32_exit else len(patch),
-                          write_width, hits))
-        if len(hits) == 1 and group:
-            matched_groups[group] = name
-    return sites, matched_groups
+    """The kernel table's sites in `payload` (see binpatch.locate_sites)."""
+    return binpatch.locate_sites(payload, PATCHES)
 
 
-def _patched_bytes(site, elf: bytes, sig_start: int):
-    """The exact bytes a Site writes at its match."""
-    fo = sig_start + site.patch_off
-    if not site.rel32_exit:
-        return site.patch
-    # Re-target the patch's jump to the exit of the block being skipped, whose
-    # displacement is read from the exit jump at match+rel32_exit.  Both sites are
-    # in one PT_LOAD segment, so file offsets and VAs share a delta.
-    exit_rel32 = struct.unpack_from("<i", elf, sig_start + site.rel32_exit + 1)[0]
-    target = (sig_start + site.rel32_exit + 5 + exit_rel32) & 0xffffffff
-    return b"\xe9" + struct.pack("<I", (target - (fo + 5)) & 0xffffffff)
+# The one jump this file writes whose landing nothing else checks.  The inlined
+# dhcp0 entry skips dhcp0 to the inlined function's epilogue with a *constant*
+# displacement baked into its patch bytes (`e9 dbf8ffff`, -0x725, to match-0x6fd).
+# Every other jump here is either re-derived from the match (rel32_exit) or
+# lands inside the signature, where the normal site check pins it -- group-A's
+# does, at match+0x33.  This one lands 0x702 bytes *before* the match, outside the
+# signature entirely, so binpatch validates nothing about it: the write succeeds
+# whatever is there.  All five inlined-shape releases carry `mov edx,1; mov
+# eax,edx; mov ebx,[esp+0xf0]` at match-0x702, so the fixed jump is correct for
+# them, but a release built with different inlined geometry would move the
+# epilogue and the jump would land mid-instruction with no error -- the silent
+# miswrite the comment history says was only ever caught by disassembly.  This
+# guard re-checks the landing against the bytes the five share, so such a release
+# is refused (escalated) rather than miswritten.
+DHCP0_INLINED = "addrconf_dev_config_dhcp0_inlined"
+DHCP0_INLINED_EPILOGUE_OFF = -0x702
+DHCP0_INLINED_EPILOGUE = bytes.fromhex("ba0100000089d08b9c24f0000000")
 
 
-def _site_error(site, pristine: bytes, sig_start: int):
-    """Why this Site must not be written at `sig_start`, or None if it is safe.
-
-    The site has to lie inside the one match, and the bytes it leaves alone have
-    to be the stock bytes its signature describes.  That is what catches a site
-    that is inside the match but is not the site the patch was derived from -- a
-    drifted offset passes a bounds check and fails this one.  A site that is
-    already fully patched is not an error: that is the patcher being re-run on
-    its own output, which must be a no-op.
-    """
-    fo = sig_start + site.patch_off
-    if not (0 <= site.patch_off
-            and fo + site.write_width <= sig_start + site.sig_len):
-        return (f"patch site for {site.name} at file 0x{fo:x} does not lie "
-                "inside its own match; refusing to write")
-    already = bytes(pristine[fo:fo + len(site.patch)]) == site.patch
-    if site.rel32_exit and not already:
-        # The jump is computed from the match, so compare against what it will be.
-        already = bytes(pristine[fo:fo + 5]) == _patched_bytes(site, pristine,
-                                                               sig_start)
-    if already:
+def inlined_dhcp0_landing_error(payload: bytes):
+    """Why the inlined dhcp0 patch's fixed jump would miss its epilogue in
+    `payload`, or None.  None when the release does not carry the inlined shape
+    (its site then has no match and there is no fixed jump to land)."""
+    site = next((s for s in locate_sites(payload)[0]
+                 if s.name == DHCP0_INLINED and len(s.hits) == 1), None)
+    if site is None:
         return None
-    wrong = [i for i in range(site.patch_off, site.patch_off + len(site.patch))
-             if site.sig_hex[i * 2:i * 2 + 2] != "??"
-             and pristine[sig_start + i] != int(site.sig_hex[i * 2:i * 2 + 2], 16)]
-    if wrong:
-        return (f"patch site for {site.name} at file 0x{fo:x} is not the stock "
-                f"site its signature describes (byte(s) {wrong[:4]} differ); "
-                "refusing to write")
-    return None
+    off = site.hits[0] + DHCP0_INLINED_EPILOGUE_OFF
+    found = bytes(payload[off:off + len(DHCP0_INLINED_EPILOGUE)])
+    if found == DHCP0_INLINED_EPILOGUE:
+        return None
+    return (f"{DHCP0_INLINED}: the inlined epilogue at match{DHCP0_INLINED_EPILOGUE_OFF:#x} "
+            f"(file 0x{off:x}) is {found.hex() or '(past end of image)'}, not "
+            f"{DHCP0_INLINED_EPILOGUE.hex()}: this release's inlined geometry differs, "
+            "so the patch's fixed -0x725 jump would not land on `mov eax,edx`.  "
+            "Escalate this release rather than patching it.")
+
+
+def self_test(vmlinux_path: str) -> int:
+    """Check every PATCHES signature against a pristine kernel ELF.
+
+    This is the offline half of the kernel-patch verification (see
+    binpatch.self_test for what is checked); it needs no vendor material beyond
+    the kernel ELF, so it can run on every change to PATCHES.
+
+    Returns 0 when every check passes, 1 otherwise.
+    """
+    path = Path(vmlinux_path)
+    if not path.exists():
+        print(f"self-test: {vmlinux_path} not found", file=sys.stderr)
+        return 1
+    elf = path.read_bytes()
+    if not elf.startswith(b"\x7fELF") or elf[4:5] != b"\x01":
+        print(f"self-test: {vmlinux_path} is not a 32-bit ELF", file=sys.stderr)
+        return 1
+    print(f"self-test against {vmlinux_path} ({len(elf)} bytes)")
+    failures = binpatch.self_test(elf, PATCHES, OPTIONAL_PATCHES, what="kernel")
+    landing = inlined_dhcp0_landing_error(elf)
+    if landing:
+        print(f"  FAIL  {DHCP0_INLINED:32s} {landing}", file=sys.stderr)
+        failures += 1
+    elif any(s.name == DHCP0_INLINED and s.hits for s in locate_sites(elf)[0]):
+        print(f"  ok    {DHCP0_INLINED:32s} fixed jump lands on the stock epilogue")
+    if failures:
+        print(f"self-test: {failures} failure(s)", file=sys.stderr)
+        return 1
+    print("self-test: all signatures locate exactly one site")
+    return 0
 
 
 def find_elf_member(data: bytes):
@@ -539,107 +518,6 @@ def shrink_payload(elf: bytes):
     return bytes(out), "zeroed " + " and ".join(reclaimed)
 
 
-def off_to_va(data: bytes, off: int) -> int:
-    """Map a file offset in the ELF payload back to a kernel virtual address
-    via the ELF32 PT_LOAD segments (for reporting)."""
-    e_phoff = struct.unpack_from("<I", data, 28)[0]
-    e_phentsize = struct.unpack_from("<H", data, 42)[0]
-    e_phnum = struct.unpack_from("<H", data, 44)[0]
-    for i in range(e_phnum):
-        o = e_phoff + i * e_phentsize
-        p_type, p_offset = struct.unpack_from("<II", data, o)
-        p_vaddr = struct.unpack_from("<I", data, o + 8)[0]
-        p_filesz = struct.unpack_from("<I", data, o + 16)[0]
-        if p_type == 1 and p_offset <= off < p_offset + p_filesz:
-            return p_vaddr + (off - p_offset)
-    raise SystemExit(f"file offset 0x{off:x} is not in any PT_LOAD segment")
-
-
-def find_signature(payload: bytes, sig_hex: str):
-    """Return all file offsets in `payload` matching the hex signature, where
-    "??" masks a byte."""
-    rx = re.compile(b"".join(
-        (b"." if sig_hex[j:j + 2] == "??"
-         else re.escape(bytes([int(sig_hex[j:j + 2], 16)])))
-        for j in range(0, len(sig_hex), 2)), re.DOTALL)
-    return [m.start() for m in rx.finditer(payload)]
-
-
-def self_test(vmlinux_path: str) -> int:
-    """Check every PATCHES signature against a pristine kernel ELF.
-
-    Each patch must match exactly once, and the site it would write must fall
-    inside that one match -- a signature that drifted, or that matches somewhere
-    other than the function it describes, would otherwise write bytes into the
-    wrong place and only show up as a guest that will not boot.  This is the
-    offline half of the kernel-patch verification; it needs no vendor material
-    beyond the kernel ELF, so it can run on every change to PATCHES.
-
-    Returns 0 when every check passes, 1 otherwise.
-    """
-    path = Path(vmlinux_path)
-    if not path.exists():
-        print(f"self-test: {vmlinux_path} not found", file=sys.stderr)
-        return 1
-    elf = path.read_bytes()
-    if not elf.startswith(b"\x7fELF") or elf[4:5] != b"\x01":
-        print(f"self-test: {vmlinux_path} is not a 32-bit ELF", file=sys.stderr)
-        return 1
-
-    failures = 0
-    print(f"self-test against {vmlinux_path} ({len(elf)} bytes)")
-    # The same location pass the writer uses, so this checks the real thing --
-    # including the mask width -- rather than an approximation of it.
-    sites, matched_groups = locate_sites(elf)
-
-    for site in sites:
-        name = site.name
-        optional = name in OPTIONAL_PATCHES
-        if len(site.hits) == 0:
-            if site.group and site.group in matched_groups:
-                # A sibling shape of the same fix matched here, so this one is
-                # simply not the shape this kernel was built with.
-                print(f"  ok    {name:32s} not this release's shape "
-                      f"(already covered by {matched_groups[site.group]})")
-            elif optional:
-                print(f"  ok    {name:32s} absent (optional for this release)")
-            else:
-                print(f"  FAIL  {name:32s} no match (required patch)", file=sys.stderr)
-                failures += 1
-            continue
-        if len(site.hits) > 1:
-            print(f"  FAIL  {name:32s} matched {len(site.hits)} places (ambiguous)",
-                  file=sys.stderr)
-            failures += 1
-            continue
-        # The site must lie within the match, and the match must be long enough
-        # to hold the preimage the description promises.
-        if not (0 <= site.patch_off
-                and site.patch_off + site.write_width <= site.sig_len):
-            print(f"  FAIL  {name:32s} patch_off {site.patch_off}+"
-                  f"{site.write_width} outside the {site.sig_len}-byte match",
-                  file=sys.stderr)
-            failures += 1
-            continue
-        # A pristine kernel must NOT already carry the patch, or the signature is
-        # describing our own output rather than the stock bytes.
-        fo = site.hits[0] + site.patch_off
-        if bytes(elf[fo:fo + len(site.patch)]) == site.patch:
-            print(f"  FAIL  {name:32s} already patched in a pristine kernel "
-                  "(signature describes the patched bytes)", file=sys.stderr)
-            failures += 1
-            continue
-        va = off_to_va(elf, fo)
-        print(f"  ok    {name:32s} unique at {va:#x} "
-              f"(file 0x{fo:x}, {site.written} byte(s))")
-
-    if failures:
-        print(f"self-test: {failures} failure(s)", file=sys.stderr)
-        return 1
-    print("self-test: all signatures locate exactly one site")
-    return 0
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -678,44 +556,15 @@ def main():
             print(f"note: payload differs from {args.vmlinux} "
                   "(different release? continuing with signatures)")
 
-    elf = bytearray(payload)
-    pristine = bytes(payload)
-    missing = []
-    # Every site is located first, because whether a group member's absence is a
-    # skipped patch depends on whether a sibling in its group matched -- and that
-    # sibling may come later in PATCHES.  A group member that places no site
-    # while a sibling does is simply not this release's shape: the fix still
-    # landed, and it must not be reported as skipped (which would make a fully
-    # patched release look partly unpatched).
-    sites, matched_groups = locate_sites(bytes(elf))
+    # Refuse before writing anything if this release carries the inlined dhcp0
+    # shape but not at the geometry the fixed -0x725 jump assumes (see
+    # inlined_dhcp0_landing_error): a miss there is a silent kernel corruption.
+    landing = inlined_dhcp0_landing_error(payload)
+    if landing:
+        raise SystemExit(landing)
 
-    for site in sites:
-        name = site.name
-        if len(site.hits) == 0:
-            if site.group and site.group in matched_groups:
-                print(f"  {name:22s}: not this release's shape - already "
-                      f"covered by {matched_groups[site.group]}")
-            else:
-                print(f"  {name:22s}: NOT FOUND - no site for this fix")
-                missing.append(name)
-            continue
-        if len(site.hits) > 1:
-            raise SystemExit(f"signature for {name} matched {len(site.hits)} "
-                             "places; refusing to patch (ambiguous)")
-        sig_start = site.hits[0]
-        fo = sig_start + site.patch_off
-        error = _site_error(site, pristine, sig_start)
-        if error:
-            raise SystemExit(error)
-        patch = _patched_bytes(site, bytes(elf), sig_start)
-        va = off_to_va(bytes(elf), fo)
-        original = bytes(elf[fo:fo + len(patch)])
-        if original == patch:
-            print(f"  {name:22s}: already patched at {va:#x} (offset 0x{fo:x})")
-        else:
-            print(f"  {name:22s}: {original.hex()} -> {patch.hex()} at {va:#x} "
-                  f"(offset 0x{fo:x})")
-            elf[fo:fo + len(patch)] = patch
+    elf = bytearray(payload)
+    missing, _changed = binpatch.apply(elf, PATCHES)
 
     if missing:
         required_missing = [m for m in missing if m not in OPTIONAL_PATCHES]

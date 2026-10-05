@@ -6,13 +6,8 @@
 set -u
 
 work_dir="$(cd "$(dirname "$0")" && pwd)"
-kernel="${KERNEL:-$work_dir/image/bzImage}"
-rootfs="$work_dir/image/rootfs.ext2"
-# No initramfs by default: like the physical appliance, the kernel mounts
-# root=/dev/sda2 directly and runs the stock /sbin/init.  Set INITRD to a
-# path (or "none", which is ignored) to boot an initramfs instead.
-initrd="${INITRD-}"
-if [ "$initrd" = "none" ]; then initrd=""; fi
+# The guest boots from its disk like the appliance: GRUB loads /bzImage from the
+# active root, so QEMU is given no -kernel or -initrd.
 synthetic_disk="$work_dir/synthetic-cf.img"
 disk_image="${DISK_IMAGE:-$synthetic_disk}"
 disk_format="${DISK_FORMAT:-raw}"
@@ -23,20 +18,6 @@ if ! command -v qemu-system-i386 >/dev/null 2>&1; then
     exit 1
 fi
 
-for required_file in "$kernel" "$rootfs"; do
-    if [ ! -f "$required_file" ]; then
-        echo "Missing required file: $required_file" >&2
-        exit 1
-    fi
-done
-if [ -n "$initrd" ] && [ ! -f "$initrd" ]; then
-    echo "Missing required file: $initrd" >&2
-    exit 1
-fi
-
-if [ "$disk_image" = "$synthetic_disk" ] && [ ! -f "$synthetic_disk" ]; then
-    python3 "$work_dir/build-synthetic-cf.py"
-fi
 if [ ! -f "$disk_image" ]; then
     echo "Missing disk image: $disk_image" >&2
     exit 1
@@ -152,7 +133,7 @@ case "${NETWORK_MODE:-user}" in
             fi
         fi
         if ! ip link show "$macvtap_if" >/dev/null 2>&1; then
-            ip link add link eth0 name "$macvtap_if" type macvtap mode bridge
+            ip link add link "${ZD_HOST_IF:-eth0}" name "$macvtap_if" type macvtap mode bridge
         fi
         # The kernel assigns the macvtap an auto-generated MAC, but the guest NIC
         # carries the board-data MAC1 ($ZD_MAC1).  The macvlan bridge routes
@@ -196,6 +177,21 @@ case "${NETWORK_MODE:-user}" in
                 exit 1
             fi
         fi
+        # The host must not speak IPv6 on the guest's identity.  The macvtap
+        # carries the guest's MAC, so the kernel's own link-local address (the
+        # EUI-64 of that MAC) is the guest's too, and the host stack's MLD and
+        # neighbour traffic goes out with the guest's source MAC.  The guest
+        # watchdog counts the frames this interface transmits as proof that the
+        # guest is alive; with the host's own frames mixed in a frozen guest
+        # still looked alive (one frame every ~2 minutes in a four-minute
+        # freeze).  Set before the interface comes up, so no address is ever
+        # generated; the flush covers an interface that is already up (reused
+        # after a restart).  The sysctl is read-only in the container, netlink is
+        # not.
+        if ! ip link set dev "$macvtap_if" addrgenmode none 2>/dev/null; then
+            echo "Warning: could not stop the host's IPv6 on $macvtap_if; the guest watchdog may count the host's frames as the guest's." >&2
+        fi
+        ip -6 addr flush dev "$macvtap_if" 2>/dev/null || true
         ip link set "$macvtap_if" up
         tap_idx="$(cat "/sys/class/net/$macvtap_if/ifindex")"
         dev_t="$(cat "/sys/class/macvtap/tap$tap_idx/dev" 2>/dev/null)"
@@ -285,11 +281,6 @@ case "${ACCEL:-auto}" in
 esac
 echo "QEMU accelerator: ${accel_args[1]}" >&2
 
-initrd_args=()
-if [ -n "$initrd" ]; then
-    initrd_args=( -initrd "$initrd" )
-fi
-
 # The ZD1200 CLI login authenticates users through a BMC chip over IPMI (see
 # the ipmi_cmdraw_ia / "BMC KCS Initialized" / GetUser/SetPasswd strings in the
 # rootfs).  A physical ZD has that BMC; QEMU's '-machine pc' does not, so the
@@ -320,15 +311,15 @@ fi
 # chardev that (1) appends every byte to $ZD_CONSOLE_LOG so the entrypoint's
 # READY detection (grep on /tmp/zd1200-console.log) and `docker exec … tail -f`
 # keep working, and (2) serves an interactive socket so you can attach to the
-# login prompt.  Set ZD_CONSOLE=0 for the old -nographic behaviour (console ->
-# stdio -> the entrypoint's log only, not interactive).
+# login prompt.  Set ZD_CONSOLE=0 for -nographic instead (console -> stdio -> the
+# entrypoint's log only, not interactive).
 console_args=()
 if [ "${ZD_CONSOLE:-1}" != "0" ]; then
     # QEMU's socket chardev answers exactly one client, and this QEMU has no
     # option to raise that.  The LXC flavour therefore puts the chardev on a
     # private path (ZD_CONSOLE_QEMU_SOCK) owned by the console bridge, which
     # in turn serves the public ZD_CONSOLE_SOCK that attach-console.py uses.
-    # Docker sets neither, so it binds ZD_CONSOLE_SOCK directly as before.
+    # Docker sets neither, so QEMU binds ZD_CONSOLE_SOCK directly.
     console_sock="${ZD_CONSOLE_QEMU_SOCK:-${ZD_CONSOLE_SOCK:-/tmp/zd1200-console.sock}}"
     console_log="${ZD_CONSOLE_LOG:-/tmp/zd1200-console.log}"
     # 'path=' for a unix socket (default); 'host='/'port=' for a TCP listener
@@ -381,7 +372,6 @@ qemu_args=(
     -m "${MEMORY_MB:-2048}"
     # Two vCPUs; see the -machine comment above (NUM_GCPUS == 2 in the driver).
     -smp "${ZD_SMP:-2}"
-    "${initrd_args[@]}"
     -device ich9-ahci,id=ahci
     -drive "file=$disk_image,format=$disk_format,if=none,id=disk0,cache=${DISK_CACHE:-writeback}"
     -device "ide-hd,drive=disk0,bus=ahci.0"
@@ -440,17 +430,15 @@ retire_applied_backup
 # So the container is the authority and rewrites the MAC fields before every
 # QEMU launch, unconditionally -- but only in shared mode, where the guest's MAC
 # must be the container's.  Without it (an upgraded older container, or Docker)
-# the board data stays authoritative and a guest-side change is honoured, as
-# before.
+# the board data stays authoritative and a guest-side change is honoured.
 #
 # --mac-only keeps everything else the records carry -- serial, model, customer
 # -- so an rbd.sh serial change still survives; only the MACs are forced.  The
 # 35-rbd-mac-guard.sh rootfs patch closes the same door from inside the guest so
 # the change is refused rather than reverted at the next boot.
 #
-# Uses this script's own $disk_image, not the DISK_IMAGE env var: the script
-# documents SYNTHETIC_DISK as the way to supply a disk, and under `set -u` an
-# unset DISK_IMAGE would abort the launcher before QEMU ever starts.
+# Uses $disk_image, which has a default: under `set -u` a bare $DISK_IMAGE would
+# abort the launcher when the variable is unset.
 assert_guest_mac() {
     [ "${ZD_SHARE_UPLINK_MAC:-0}" = 1 ] || return 0
     [ -n "$guest_mac" ] || return 0
@@ -466,8 +454,14 @@ assert_guest_mac() {
     fi
 }
 
+# The entrypoint has already prepared the disk for the first boot (ZD_PREPARED=1);
+# every relaunch after a guest reset prepares again, which is how a root the
+# guest just upgraded gets customised.
+first_launch=1
 while :; do
-    if [ "${ZD_REPREP:-1}" = "1" ] && [ -x "$work_dir/prepare-vm-disks.sh" ]; then
+    if [ "$first_launch" = 1 ] && [ "${ZD_PREPARED:-0}" = 1 ]; then
+        :
+    elif [ "${ZD_REPREP:-1}" = "1" ] && [ -x "$work_dir/prepare-vm-disks.sh" ]; then
         prep_rc=0
         "$work_dir/prepare-vm-disks.sh" || prep_rc=$?
         if [ "$prep_rc" -ne 0 ]; then
@@ -486,6 +480,7 @@ while :; do
     # discard a write made first.  Still before every boot -- the guest may have
     # rewritten the records during the run that just ended, and the loop
     # relaunches QEMU on every guest reset.
+    first_launch=0
     assert_guest_mac
     python3 "$work_dir/qemu-once.py" "${qemu_args[@]}"
     rc=$?

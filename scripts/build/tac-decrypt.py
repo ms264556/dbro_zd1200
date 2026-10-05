@@ -53,7 +53,15 @@ def decrypt_stream(source: BinaryIO, destination: BinaryIO, *, chunk_size: int =
 
 
 def decrypt_bytes(encrypted: bytes) -> bytes:
-    """Convenience wrapper for small tests and browser-core equivalence tests."""
+    """Convenience wrapper for small tests and browser-core equivalence tests.
+
+    This returns the raw word-aligned stream and does NOT strip the trailing TAC
+    alignment padding -- unlike decrypt_file(), which truncates it using the last
+    byte's low nibble.  Keeping the raw output is deliberate: the browser-core
+    equivalence tests compare this byte-for-byte against the algorithm's output,
+    and gzip/TAR readers ignore the few trailing bytes, so the one caller that
+    feeds it to tarfile (unlock-backup.py) is unaffected.
+    """
     from io import BytesIO
 
     source = BytesIO(encrypted)

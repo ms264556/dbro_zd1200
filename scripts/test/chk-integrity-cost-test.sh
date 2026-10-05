@@ -44,6 +44,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PATCH="${AS_PATCH:-$REPO/scripts/container/patches/40-skip-integrity.sh}"
 LIB="$REPO/scripts/container/patch-lib.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-chkint-cost.XXXXXX")"
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap 'rm -rf "$TMP"' EXIT
 
 pass() { printf 'ok   %s\n' "$*"; }
@@ -64,7 +65,6 @@ done
 ALIGN=512
 START=84568
 SECTORS=32768                 # 16 MiB fixture root
-ROOT_BYTES=$(( SECTORS * ALIGN ))
 TARGET=/etc/init.d/chk_integrity.sh
 
 # --- the spawn counter -------------------------------------------------------
@@ -218,16 +218,12 @@ if [ "${#LISTS[@]}" -eq 0 ]; then LISTS=("fixture:$TMP/fixture-list.txt"); fi
 # Same read -> debugfs -> dd channel as the pipeline, with the fixture root at
 # the real hda2 sector so the patch's own verification runs.
 build_disk() { # <checker> <disk>
-    local stage="$TMP/stage.$$" img="$TMP/part.$$.img"
+    local stage="$TMP/stage.$$"
     rm -rf "$stage"; mkdir -p "$stage/etc/init.d"
     cp "$1" "$stage/etc/init.d/chk_integrity.sh"
     cp "$TMP/fixture-list.txt" "$stage/file_list.txt"
-    rm -f "$img"
-    mke2fs -q -t ext2 -b 1024 -I 128 -m 0 -F -d "$stage" "$img" \
-        $(( ROOT_BYTES / 1024 )) >/dev/null 2>&1 || fail "mke2fs failed"
-    rm -f "$2"; truncate -s $(( (START + SECTORS) * ALIGN )) "$2"
-    dd if="$img" of="$2" bs=$ALIGN seek="$START" conv=notrunc status=none
-    rm -rf "$stage" "$img"
+    ext2_disk_from_stage "$stage" "$2" "$START" "$SECTORS" "$ALIGN" || fail "mke2fs failed"
+    rm -rf "$stage"
 }
 apply_patch() { # <patch> <out> <label>
     local patch="$1" out="$2" label="$3"
@@ -236,8 +232,8 @@ apply_patch() { # <patch> <out> <label>
     ( cd "$REPO/scripts/container" && QCOW="$disk" WORK="$work" \
         ZD_PATCH_PARTS="hda2|$START|$SECTORS" bash "$patch" "" ) \
         > "$TMP/apply.$$.log" 2>&1 || { echo "FAIL: $label patch exited non-zero" >&2; return 1; }
-    dd if="$disk" of="$TMP/dump.$$.hda2.img" bs=$ALIGN skip=$START count=$SECTORS status=none
-    debugfs -R "dump $TARGET $out" "$TMP/dump.$$.hda2.img" >/dev/null 2>&1 \
+    part_image "$disk" "$TMP/dump.$$.hda2.img" "$START" "$SECTORS" "$ALIGN"
+    fs_dump "$TMP/dump.$$.hda2.img" "$TARGET" "$out" \
         || { echo "FAIL: $label produced no $TARGET" >&2; return 1; }
     rm -rf "$disk" "$work"
     pass "$label applied to the fixture and dumped"

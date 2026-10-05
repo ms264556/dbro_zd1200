@@ -110,5 +110,22 @@ rc="$(ZD_ADDRESS_HELPER="$TMP/nope" STATE_DIR="$TMP/state" "$HEALTH" >/dev/null 
 [ "$rc" = 1 ] || fail "a missing address helper must be unhealthy (got rc=$rc)"
 pass "no address helper -> unhealthy (the verdict can fail)"
 
+# 7. The real helper, not the stub: a cached address from an earlier tick and a
+#    pinned ZD_GUEST_IP must not stand in for an answer.  With no control socket
+#    the guest cannot have answered, so both health verdicts must fail.
+REAL_HELPER="$REPO/scripts/container/zd1200-guest-address"
+LXC_HEALTH="$REPO/scripts/container/zd1200-guest-healthcheck"
+printf '10.222.1.50\n' > "$TMP/state/guest-ip"
+for pinned in "" 10.222.1.50; do
+    rc="$(ZD_GUEST_IP="$pinned" ZD_ADDRESS_HELPER="$REAL_HELPER" STATE_DIR="$TMP/state" \
+          ZD_CONTROL_SOCK="$TMP/no-such.sock" "$HEALTH" >/dev/null 2>&1; printf '%s' "$?")"
+    [ "$rc" = 1 ] || fail "docker health: a cached/pinned address passed for a guest with no control channel (pinned='$pinned', rc=$rc)"
+    rc="$(ZD_GUEST_IP="$pinned" ZD_ADDRESS_HELPER="$REAL_HELPER" STATE_DIR="$TMP/state" \
+          ZD_DISPLAY_HELPER="$TMP/nope" ZD_CONTROL_SOCK="$TMP/no-such.sock" \
+          "$LXC_HEALTH" >/dev/null 2>&1; printf '%s' "$?")"
+    [ "$rc" = 1 ] || fail "LXC healthcheck: a cached/pinned address passed for a guest with no control channel (pinned='$pinned', rc=$rc)"
+done
+pass "a cached or pinned address does not stand in for an answer (both health checks)"
+
 echo
 echo "all docker health-verdict tests passed"

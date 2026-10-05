@@ -51,7 +51,7 @@
 # guest wizard's later calls, Finish included, use the same Prototype/rico path
 # at the same four non-default headers (a code read, not a click-through; the
 # margin is one field).  The 9.10.2.0.130 control, patched, answers to 40 and
-# closes at 41 (HANDOFF.md session 11).  Where AS_WEBS_CONF_DIR is set, this is
+# closes at 41 (measured on a lab guest; not reproduced here).  Where AS_WEBS_CONF_DIR is set, this is
 # the test that would catch a widened anchor changing those two roots without a
 # demonstrated defect; the repository carries no vendor configs, so a plain
 # `run-suite.sh` run marks that half `partial:` rather than pretending to have
@@ -68,6 +68,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PATCH="$REPO/scripts/container/patches/55-webs-header-limit.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-webshdr.XXXXXX")"
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -87,7 +88,6 @@ done
 ALIGN=512
 START=84568                 # the flat disk's hda2 sector, as patch-lib defines it
 SECTORS=32768               # 16 MiB, enough for the fixture root
-ROOT_KB=$(( SECTORS * ALIGN / 1024 ))
 TARGET=/bin/webs.conf
 FIELDS_LINE='LimitRequestFields 40'
 FIELD_SIZE_LINE='LimitRequestFieldSize 4096'
@@ -97,38 +97,28 @@ FIELD_SIZE_LINE='LimitRequestFieldSize 4096'
 # empty /bin), written into a flat disk at the hda2 sector the patch extracts.
 build_disk() {
     local conf="$1" disk="$2" mode="${3:-0640}"
-    local stage="$TMP/stage.$$" part="$TMP/part.$$.img"
+    local stage="$TMP/stage.$$"
     rm -rf "$stage"; mkdir -p "$stage/bin"
     if [ "$conf" != NONE ]; then
         cp "$conf" "$stage/bin/webs.conf"
         chmod "$mode" "$stage/bin/webs.conf"
     fi
-    rm -f "$part"
-    mke2fs -q -t ext2 -b 1024 -I 128 -m 0 -F -d "$stage" "$part" "$ROOT_KB" >/dev/null 2>&1 \
-        || fail "mke2fs failed"
+    ext2_disk_from_stage "$stage" "$disk" "$START" "$SECTORS" "$ALIGN" || fail "mke2fs failed"
     rm -rf "$stage"
-    rm -f "$disk"; truncate -s $(( (START + SECTORS) * ALIGN )) "$disk"
-    dd if="$part" of="$disk" bs=$ALIGN seek="$START" conv=notrunc status=none
-    rm -f "$part"
-}
-
-part_image() { # <disk> <out>: the partition as its own image
-    rm -f "$2"
-    dd if="$1" of="$2" bs=$ALIGN skip="$START" count=$SECTORS status=none
 }
 
 read_conf() { # <disk> <out>: nonzero when $TARGET is not on the root
     local part="$TMP/read.$$.img"
-    part_image "$1" "$part"
+    part_image "$1" "$part" "$START" "$SECTORS" "$ALIGN"
     rm -f "$2"
-    debugfs -R "dump $TARGET $2" "$part" >/dev/null 2>&1
+    fs_dump "$part" "$TARGET" "$2"
     rm -f "$part"
     [ -f "$2" ]
 }
 
 conf_meta() { # <disk> -> "type mode uid gid" (empty when absent)
     local part="$TMP/meta.$$.img"
-    part_image "$1" "$part"
+    part_image "$1" "$part" "$START" "$SECTORS" "$ALIGN"
     debugfs -R "stat $TARGET" "$part" 2>/dev/null \
         | awk '{ for (i = 1; i <= NF; i++) {
                      if ($i == "Type:")  t = $(i+1)

@@ -44,6 +44,7 @@ This mirrors (and supersedes the magic-only seeds of) build-synthetic-cf.py.
 """
 
 import argparse
+import re
 import struct
 from pathlib import Path
 
@@ -83,10 +84,37 @@ RKS_STRUCT_SIZE = 0xD0             # sizeof(struct rks_boarddata), rev 4
 AR531X_STRUCT_SIZE = 0x80          # sizeof(struct ar531x_boarddata), rev 5
 
 
+MAC_RE = re.compile(r"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}")
+SERIAL_RE = re.compile(r"[0-9]+")   # ASCII only; str.isdigit() accepts unicode digits
+
+
 def parse_mac(mac: str) -> bytes:
-    m = bytes(int(x, 16) for x in mac.split(":"))
-    assert len(m) == 6, f"bad MAC {mac!r}"
+    """Parse a unicast MAC; exit with a message on anything else.
+
+    Not an assert (stripped under python -O) and strict about the shape, since
+    int(x, 16) alone accepts "0x1", " 1", "-1" and values above 0xff.
+    """
+    if not MAC_RE.fullmatch(mac):
+        raise SystemExit(f"bad MAC {mac!r}: need six colon-separated "
+                         f"two-digit hex octets (aa:bb:cc:dd:ee:ff)")
+    m = bytes.fromhex(mac.replace(":", ""))
+    if m[0] & 1:
+        raise SystemExit(f"bad MAC {mac!r}: multicast address (low bit of the "
+                         f"first octet is set); a unicast MAC is required")
     return m
+
+
+def check_serial(serial: str) -> str:
+    """Exit unless read-boarddata.py's valid_serial() would accept `serial`.
+
+    A serial it rejects makes the whole record be discarded on read.  The
+    limit here is 15, not its 20: the serialNumber field holds 15 bytes and
+    read-boarddata prefers it when valid, so 16-20 digits would read back
+    truncated to 15.
+    """
+    if not (SERIAL_RE.fullmatch(serial) and 5 <= len(serial) <= 15):
+        raise SystemExit(f"bad serial {serial!r}: need 5-15 ASCII digits")
+    return serial
 
 
 def mac_plus_one(mac: bytes) -> bytes:
@@ -225,6 +253,8 @@ def main():
     if not disk.exists():
         raise SystemExit(f"disk image not found: {disk}")
     mac1 = parse_mac(args.mac1)
+    if not args.mac_only:
+        check_serial(args.serial)
     mac2 = mac_plus_one(mac1)
 
     region2 = 3981601 if args.platform == 0 else REGION2_START

@@ -122,12 +122,21 @@ if [ -f "$BACKUP_IMG" ]; then
 else
     backup_sig="none"
 fi
-kernel_sig="$(sha256sum "$BASE/patch-kernel.py" | awk '{print $1}')"
+# The kernel patcher is patch-kernel.py plus the signature engine it shares with
+# patch-file.py, so a change to either re-patches /bzImage.
+# An opt-in patch (ZD_KERNEL_OPT_IN) changes what the patcher does; it is part of the
+# signature only when set, so an ordinary install keeps the signature it had.
+kernel_sig="$( { cat "$BASE/patch-kernel.py" "$BASE/binpatch.py"
+                 [ -z "${ZD_KERNEL_OPT_IN:-}" ] || printf 'opt-in=%s\n' "$ZD_KERNEL_OPT_IN"
+               } | sha256sum | awk '{print $1}')"
 patch_sig="$( {
     cd "$PATCHES_DIR" && for f in *.sh; do [ -f "$f" ] || continue; \
         printf '%s ' "$f"; sha256sum "$f" | awk '{print $1}'; done | sha256sum | awk '{print $1}'
     printf 'patch-lib=%s\n' "$(sha256sum "$BASE/patch-lib.sh" | awk '{print $1}')"
     printf 'patch-kernel=%s\n' "$kernel_sig"
+    # patch-file.py holds the tables the rootfs binary patches apply (the engine,
+    # binpatch.py, is already in kernel_sig).
+    printf 'patch-file=%s\n' "$(sha256sum "$BASE/patch-file.py" | awk '{print $1}')"
     printf 'rollback-format=%s\n' "$PR_FORMAT"
     if [ -d "$ANALYTICS_DIR" ]; then
         ( cd "$ANALYTICS_DIR" && find . -type f -print | LC_ALL=C sort | while read -r f; do
@@ -167,7 +176,7 @@ else
     if [ -z "$stored_backup" ] && [ -f "$SEED_MARKER" ]; then
         stored_backup="$(sed -n 's/^backup=//p' "$SEED_MARKER")"
     fi
-    # stale_rootfs is written by every version; vendor= only by this one, so an
+    # rootfs= is written by every version; vendor= only by newer ones, so an
     # existing marker without it is compared on the rootfs alone (its boot files
     # are not part of the decision and must not trigger a rebuild).
     if   [ "$stored_rootfs" != "$rootfs_sig" ]; then rebuild=1; reason="base rootfs changed"
@@ -201,13 +210,19 @@ EOF
         exit 1
     fi
     say "Building the synthetic CF disk — $reason"
-    rm -f "$DISK"
-    SYNTHETIC_DISK="$DISK" ZD_R600_REPAIR="${ZD_R600_REPAIR:-1}" \
+    # Built beside the live path and moved into place once the board data is
+    # written.  A build that dies half-way (a rejected MAC, a stop signal) must
+    # not leave a disk with no marker: the next start would take it for an
+    # existing appliance whose rootfs changed and refuse to rebuild it.
+    NEW_DISK="$DISK.building"
+    rm -f "$NEW_DISK"
+    SYNTHETIC_DISK="$NEW_DISK" ZD_R600_REPAIR="${ZD_R600_REPAIR:-1}" \
         python3 "$BASE/build-synthetic-cf.py"
     say "Writing board data (serial=${ZD_SERIAL:-123456000789}, MAC1=${ZD_MAC1:-00:0c:e6:12:00:01})"
-    python3 "$BASE/write-boarddata.py" --disk "$DISK" \
+    python3 "$BASE/write-boarddata.py" --disk "$NEW_DISK" \
         --serial "${ZD_SERIAL:-123456000789}" --mac "${ZD_MAC1:-00:0c:e6:12:00:01}" \
         --model "${ZD_MODEL:-ZD1200}" --customer "${ZD_CUSTOMER:-ruckus}"
+    mv -f "$NEW_DISK" "$DISK"
     printf 'rootfs=%s\nvendor=%s\nbackup=%s\n' "$rootfs_sig" "$vendor_sig" "$backup_sig" > "$MARKER"
     # Record the seed on the container side.  A /writable is only ever seeded by
     # this build, so this marker plus the existing "refuse to rebuild a live
@@ -310,9 +325,8 @@ sentinel_of()        { debugfs -R "cat $PR_SENTINEL" "$1" 2>/dev/null | head -n1
 legacy_sentinel_of() { debugfs -R "cat $LEGACY_SENTINEL" "$1" 2>/dev/null | head -n1; }
 
 # apply_kernel <name>: leave the root's own /bzImage carrying the QEMU patches,
-# recording which kernel patcher did it.  Idempotent by marker, because
-# patch-kernel.py's signatures describe the *stock* bytes and cannot recognise an
-# already-patched kernel.
+# recording which kernel patcher did it.  A root whose marker already names this
+# patcher is skipped, so an unchanged start does not unpack and rewrite /bzImage.
 apply_kernel() {
     local name="$1" img="$WORK/$name.img" have=""
     have="$(debugfs -R "cat $PR_KERNEL" "$img" 2>/dev/null | head -n1 || true)"
@@ -340,6 +354,14 @@ apply_kernel() {
        && ! cmp -s "$WORK/$name.kernel" "$WORK/$name.kernel.patched"; then
         debugfs -w -R "rm /bzImage" "$img" 2>/dev/null || true
         debugfs -w -R "write $WORK/$name.kernel.patched /bzImage" "$img"
+        # debugfs exits 0 when the write fails (a full root, say), so read the
+        # kernel back: the sentinel below must never stamp a root whose kernel is
+        # missing or truncated.
+        if ! fs_read "$img" /bzImage "$WORK/$name.kernel.check" \
+           || ! cmp -s "$WORK/$name.kernel.patched" "$WORK/$name.kernel.check"; then
+            echo "prepare-vm-disks: the patched kernel did not land in $name's /bzImage (is the root full?)" >&2
+            exit 1
+        fi
         say "[$name] /bzImage patched"
     else
         say "[$name] /bzImage already carries the QEMU patches; leaving it"
@@ -381,7 +403,11 @@ EOF
         # runs against the rootfs it was written for.
         say "[$name] patch set changed (sentinel: ${have:-<none>}); restoring the vendor rootfs"
         snapshot_orig "$name"
-        pr_reset "$WORK/$name.img"
+        pr_reset "$WORK/$name.img" || {
+            echo "prepare-vm-disks: could not restore the vendor files on $name" >&2
+            exit 1
+        }
+        # 1 is "nothing changed"; a failed write exits inside write_deltas.
         write_deltas "$name" "$start" || true
     else
         say "[$name] needs customising (sentinel: ${have:-<none>})"

@@ -65,12 +65,13 @@ is compiled and nothing is committed.
 
 ## CompactFlash dump parsing
 
-A CF dump is a raw 1872 MiB disk (`3931200` × 512-byte sectors) for the ZD1200,
+A CF dump is a raw 1.87 GiB disk (`3931200` × 512-byte sectors) for the ZD1200,
 or a larger/smaller disk for other platforms. A Windows ImageUSB dump is the same
 image with a 512-byte `imageUSB` header; it is detected and skipped.
 
 Preparation runs inside the container image (which carries e2fsprogs/`debugfs`,
-Python, `tar` and `gzip`), so the host needs only Docker. From a dump,
+Python, `tar` and `gzip`), so the host needs Docker, plus `python3` for the
+installer to read a backup or a ZD1100/ZD3000 dump. From a dump,
 `prepare-vendor-image.sh` takes the boot files
 (`/bzImage`, `/restoreinitramfs.gz`, `/restoreinitramfs.ver`,
 `/lib/grub/i386-pc/menu.lst`), the rootfs (hda2) and `/writable` (hda4) straight
@@ -227,7 +228,7 @@ filesystem allows, so a later rebuild cannot re-stage a backup the appliance has
 already consumed. In the Docker flavour `image/` is mounted read-only, so the
 copy stays but is inert: the state marker and the refuse-to-rebuild gate are what
 prevent a second restore. A backup the vendor rejects (or a failed restore) is
-renamed `backup.failed` and the appliance keeps its factory configuration rather
+renamed `backup.bak.failed` and the appliance keeps its factory configuration rather
 than boot-looping, with the run logged to `/writable/zd1200-restore/restore.log`
 and reported to the container as `ZD-CONFIG-RESTORED=failed`.
 
@@ -298,7 +299,8 @@ those names inside the checkout to the state directory, which is why
 ### More than one appliance on a host
 
 The Proxmox flow is already multi-instance: each CT has its own network
-namespace and `/tmp`, so its `mvt0`/console/control names are its own.
+namespace and `/tmp`, so its `tap-zd`/`br-zd` interfaces and console/control
+sockets are its own.
 
 The Docker flow is not, by default: `network_mode: host` puts every container in
 the host's network namespace, so the macvtap interface (`mvt0`) and the QEMU
@@ -348,7 +350,7 @@ Each root partition carries a rollback store at `/.patchrollback/`:
 | entry | meaning |
 |---|---|
 | `sentinel` | signature of the patch set applied to this root |
-| `kernel` | hash of `patch-kernel.py` that customised `/bzImage` |
+| `kernel` | hash of the kernel patcher (`patch-kernel.py` and its engine `binpatch.py`) that customised `/bzImage` |
 | `replaced.list`, `replaced/<n>`, `replaced/<n>.meta` | the pristine vendor copy (content, plus mode/uid/gid) of every file a patch replaced |
 | `added` | paths a patch created, deleted again on reset |
 
@@ -363,7 +365,7 @@ what lets an upgrade keep the appliance's configuration.
 
 The kernel is the one deliberate exception: it is not copied into the store (it
 is the largest file the pipeline touches, and its transform is deterministic).
-`/bzImage` is keyed on the hash of `patch-kernel.py` instead, so a root already
+`/bzImage` is keyed on the hash of the kernel patcher instead, so a root already
 carrying the QEMU patches is left alone and the patcher never has to recognise an
 already-patched kernel.
 
@@ -391,7 +393,9 @@ The patches, in order:
 | `35-rbd-mac-guard.sh` | stop the guest's own board-data tool (`/bin/rbd.sh`) from moving the MAC: an invocation that supplies an OUI/MAC1/MAC2 is refused before `rbd change` runs, while serial/model/customer updates still work. The container re-asserts its MAC in the board data before every launch (see [Board data and identity](#board-data-and-identity)) |
 | `40-skip-integrity.sh` | disable the md5 verification in `chk_integrity.sh` so the vendor integrity check reports nothing for our patched files; the file list is left intact so `flag_reset`'s `clone` still copies the tree |
 | `45-zd-bmc-watchdog.sh` | `S46zd_bmc_watchdog` arms and feeds the in-box IPMI BMC watchdog, stopping when the kernel writes the `'9'` kflag |
+| `47-stamgr-idle.sh` | three bytes of `/bin/stamgr`: its event loop no longer zeroes a 49 KB buffer and wakes every 2 ms while idle (see [Binary patches to rootfs files](#binary-patches-to-rootfs-files)) |
 | `50-network-monitor.sh` | install the Network Monitor page, collectors and menu entry |
+| `55-webs-header-limit.sh` | add `LimitRequestFields 40` / `LimitRequestFieldSize 4096` to `/bin/webs.conf` on the releases that omit them (10.1.2.0.318, 10.3.1.0.45): Appweb's default of 20 header fields is one fewer than the 10.x setup wizard's AJAX sends |
 | `60-dropbear-static.sh` | optional static dropbear + public-key root SSH on 2222 |
 | `70-container-control.sh` | `S98zd_container_control` orderly-shutdown hook |
 | `80-ecdsa-hostkey.sh` | ECDSA host key alongside RSA |
@@ -399,9 +403,90 @@ The patches, in order:
 
 Every patch decides from the files and patterns it finds (`sesame`/`sesame2`,
 `check_sign_cert`/entitlement cases, `/web/admin10` vs the 9.x consoles, …)
-rather than from a version number, and the kernel patcher identifies its sites by
-byte signature. The one exception is the R600 repair below, which is gated on the
-firmware version.
+rather than from a version number, and the kernel and file patchers identify their
+sites by byte signature. The one exception is the R600 repair below, which is gated
+on the firmware version.
+
+### Notes on individual patches
+
+* **`40-skip-integrity.sh`, the parsing rewrite.** Boot's `check` mode runs the
+  vendor loop over three lists (3,626 lines measured, 2,827 of them `FILE`): at
+  two fork/execs per `echo|cut` pipeline that is 25,812 fork/execs, ~400 s of
+  system time under TCG, blocking everything after `S70resetflag`. The builtin
+  rewrite was checked equivalent on every line of the real lists (root list
+  3,080 lines, `/writable/aidfs/file_list.txt` 546, the firmwares list 310): the
+  derived type, md5 and file are identical. `${data#* }`/`${data%% *}` must not
+  replace `set -- $data`: FILE lines separate hash and path with two spaces, so
+  that pair leaves `file` with a leading space.
+* **`55-webs-header-limit.sh`, the field count.** On 10.1.2.0.318 the same AJAX
+  request padded with dummy headers returns 200 at 20 fields and closes the TLS
+  connection at 21 (`curl: SSL_read: unexpected eof`); header size is irrelevant.
+  Unpatched 9.9.1.0.52 and 9.13.3.0.164 fail at the same 21, but their wizard
+  page sends 20 (9.x `prototype.js` sets no `X-CSRF-Token`), a margin of one.
+
+### Binary patches to rootfs files
+
+The signature engine is `scripts/container/binpatch.py`: it locates each patch by
+the bytes around its site (`??` masks what varies between releases), refuses a
+signature that matches more than once or a site that is not the stock bytes, and
+treats its own output as already patched. It holds no tables. Two front-ends own
+those:
+
+* `patch-kernel.py` unwraps the bzImage's gzip member, applies the kernel table to
+  the ELF inside and re-packs it into the same region.
+* `patch-file.py` applies a table to a plain ELF file from the root filesystem.
+  `TARGETS` maps a rootfs path to its table; a rootfs patch reads the file out of a
+  root, runs `patch-file.py --target <path> --in <file> --out <file>` and writes the
+  result back with `write_local`, which keeps the vendor copy in the rollback store.
+  `--self-test` checks the table against a pristine file without writing.
+
+A table for a rootfs file must degrade safely: a release with no such site is left
+alone and reported, and the rootfs patch treats a refusal as "leave this root
+unchanged", because a patch that exits non-zero aborts provisioning.
+
+`/bin/stamgr` is the first such target (`47-stamgr-idle.sh`). The station manager's
+event loop sleeps in `epoll_wait()` for at most 2 ms and `memset`s its 49 KB event
+buffer on every pass, so an idle guest is woken 500 times a second. Measured on
+10.5.1.0.282 under TCG, idle after READY, as the emulator's `utime+stime` over 60 s:
+24-27% of one host core stock, 19.9% with the memset's length zeroed, 6.1% with the
+cap raised to 100 ms as well (and 6.2% with the thread stopped outright). The cap is
+only a ceiling on the sleep -- the timeout is the smaller of it and the time to the
+daemon's next timer, and socket and signal events wake the loop directly -- so
+timers and messages are served as before; the reasoning, and what it does not
+cover, is in the comment above `STAMGR_PATCHES`. Both sites match exactly once in
+the vendor binary of all nine supported releases. The change has not been exercised
+with clients roaming between APs.
+
+`scripts/test/patch-file-test.sh` checks the two sites on a synthesised ELF without
+any vendor material, and against real `stamgr` binaries when `AS_STAMGR_DIR` names a
+directory holding them.
+
+### The TSC calibration patch
+
+The vendor 2.6.32 kernel calibrates the TSC against the PIT and then the HPET.
+The HPET step samples the TSC either side of one HPET read and discards the
+sample if the two TSC reads are 50 000 cycles or more apart (the kernel's guard
+against an SMI landing in between). On a nested host an HPET read is an exit
+through two hypervisors and always takes longer, so every sample is discarded,
+calibration fails, `tsc_init()` marks the TSC unstable and the guest clocks off
+the HPET, which costs an exit per `ktime_get()`.
+
+`tsc_read_refs_threshold` in `patch-kernel.py` raises that limit to `0xfffff`
+cycles (about 0.3 ms) by rewriting one imm32. Calibration then succeeds on a
+nested host and the clocksource stays `tsc`; direct KVM and TCG already run on
+the TSC without it. The frequency lands within about 0.007% of what the
+hypervisor reports, so the guest clock can drift a few seconds a day until NTP
+corrects it.
+
+An earlier version of this fix asked KVM for the frequency (an MSR write from a
+code cave, then a read of a pvclock page). It was exact but KVM-only, needed a
+page of guest RAM that nothing reserves, and left KVM rewriting that page for the
+life of the guest, so it is gone along with the cave support in `binpatch.py`.
+
+`scripts/test/patch-kernel-fixture-test.sh` synthesises a kernel carrying the
+stock compare at its real offset and reads the patched artifact back: exactly
+the four immediate bytes change, to the expected value, and a re-run changes
+nothing.
 
 ## Upgrading an existing appliance
 
@@ -570,7 +655,7 @@ guest's init, so a stop issued in the first seconds after a boot could otherwise
 arrive before anything was reading ttyS1 and cost the whole grace period
 (measured: 8s for a running guest, 17s worst case just after READY, against 121s
 before the resend). If the guest never responds within `ZD_STOP_TIMEOUT`
-(half-seconds), QEMU is killed and `prepare-vm-disks.sh` repairs an ext2 data
+(seconds, default 240), QEMU is killed and `prepare-vm-disks.sh` repairs an ext2 data
 partition on the next start.
 
 QEMU is launched with ACPI on (`-machine pc`) and `-smp 2`, even though the real
@@ -665,7 +750,7 @@ appliance is then the only thing on the LAN with an address while it runs; see
 
 ## Boot test without the container
 
-`scripts/test/boot-test.sh` boots the prepared disk under a direct QEMU (KVM, a
+`scripts/test/boot-test.sh` boots the prepared disk under a direct QEMU (KVM when available, a
 software IPMI BMC, user-mode networking — no macvtap, no LAN traffic) and watches
 the serial console until it reaches a milestone. It is the quick way to check a
 bootloader/rootfs change without disturbing the running container or the LAN.
@@ -686,13 +771,14 @@ Milestones, in order, detected on the guest serial console:
 | `kernel` | `[Linux-bzImage,` | GRUB mounted the ext2 partition and loaded `/bzImage` |
 | `init` | `/dev/sda4 on /writable type ext2` | the guest kernel reached user-space init (default) |
 | `controller` | `Initializing ZoneDirector...` | the controller init script is running |
-| `ready` | `System go into READY status.` | the appliance is up (the healthcheck's marker) |
+| `ready` | `System go into READY status.` | the appliance is up (the entrypoint's readiness marker) |
 
 Exit status 0 means the requested milestone was reached; 1 means it was not
 (timeout, QEMU exited, or a fatal guest error such as `Error 17: Cannot mount
 selected partition` / `Kernel panic`). The serial log is kept at
-`.boot-test/serial.log` (gitignored), the firmware's pre-console debug output at
-`.boot-test/debugcon.log`, and each milestone is printed with its elapsed time.
+`<state dir>/serial.log` and the firmware's pre-console debug output at
+`<state dir>/debugcon.log`, where the state dir is `--state-dir` or a fresh
+`.boot-test/run.XXXXXX` (gitignored) printed at the start; each milestone is printed with its elapsed time.
 
 `--reboot` drives the guest console (declining the setup wizard and logging in)
 and runs `reboot`, then requires the milestone again — exercising the kernel's

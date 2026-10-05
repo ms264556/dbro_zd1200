@@ -64,6 +64,8 @@ printf '%s\n' "$*" >> "$ZD_STUB_IP_LOG"
 case "$*" in
     "link show "*)
         exit "${ZD_STUB_SHOW_RC:-1}" ;;
+    *" addrgenmode "*)
+        exit "${ZD_STUB_AGM_RC:-0}" ;;
     *" address "*)
         if [ "${ZD_STUB_SETADDR_RC:-0}" != 0 ]; then
             echo "RTNETLINK answers: Address already in use" >&2
@@ -94,6 +96,7 @@ run_launch() {
         ZD_STUB_IP_LOG="$ZD_STUB_IP_LOG" \
         ZD_STUB_SHOW_RC=1 \
         ZD_STUB_SETADDR_RC="$setaddr_rc" \
+        ZD_STUB_AGM_RC="${ZD_STUB_AGM_RC:-0}" \
         "$WS/launch-vm.sh" > "$TMP/out" 2>&1 || RUN_RC=$?
 }
 
@@ -167,6 +170,32 @@ if ! grep -qF "$NEXT_STEP" "$TMP/out" && ! grep -qF "$QEMU_MARKER" "$TMP/out"; t
     fail "an empty ZD_MAC1 did not leave the launch running: $(tr '\n' '|' < "$TMP/out")"
 fi
 pass "an empty ZD_MAC1 skips the block entirely"
+
+
+# --- 5. the host's IPv6 is silenced on the macvtap, before it comes up --------
+# The macvtap wears the guest's MAC, so the kernel's own link-local address and the
+# MLD/neighbour frames it sends are indistinguishable from the guest's.  The guest
+# watchdog counts this interface's transmitted frames as proof the guest is alive;
+# measured with a frozen guest, one host frame every ~2 minutes made it look alive.
+run_launch lo "$lo_mac" 1
+agm_line="$(grep -n -- 'link set dev lo addrgenmode none' "$TMP/ip.log" | head -1 | cut -d: -f1 || true)"
+flush_line="$(grep -n -- '-6 addr flush dev lo' "$TMP/ip.log" | head -1 | cut -d: -f1 || true)"
+up_line="$(grep -n -- 'link set lo up' "$TMP/ip.log" | head -1 | cut -d: -f1 || true)"
+[ -n "$agm_line" ] || fail "addrgenmode was never set to none: $(tr '\n' '|' < "$TMP/ip.log")"
+[ -n "$flush_line" ] || fail "the macvtap's IPv6 addresses were never flushed: $(tr '\n' '|' < "$TMP/ip.log")"
+[ -n "$up_line" ] || fail "the macvtap was never brought up: $(tr '\n' '|' < "$TMP/ip.log")"
+[ "$agm_line" -lt "$up_line" ] || fail "addrgenmode was set after the interface came up"
+[ "$flush_line" -lt "$up_line" ] || fail "the flush happened after the interface came up"
+pass "the host stops generating IPv6 addresses on the macvtap before it comes up"
+
+# A kernel or iproute that cannot do it must not stop the guest, but must say so.
+ZD_STUB_AGM_RC=1 run_launch lo "$lo_mac" 1
+grep -q "could not stop the host's IPv6" "$TMP/out" \
+    || fail "a failed addrgenmode was not reported: $(tr '\n' '|' < "$TMP/out")"
+if ! grep -qF "$NEXT_STEP" "$TMP/out" && ! grep -qF "$QEMU_MARKER" "$TMP/out"; then
+    fail "a failed addrgenmode stopped the launch: $(tr '\n' '|' < "$TMP/out")"
+fi
+pass "a failed addrgenmode is reported and does not stop the launch"
 
 echo
 echo "all macvtap MAC-check tests passed"

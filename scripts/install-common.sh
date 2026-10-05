@@ -215,7 +215,12 @@ resolve_inputs() {
     if [ "${#firmware_paths[@]}" -gt 1 ]; then
         die "pass only one firmware upgrade file"
     fi
-    if [ "${#unknown[@]}" -gt 0 ] && [ "${#config_paths[@]}" -eq 0 ] && [ "${#firmware_paths[@]}" -eq 0 ]; then
+    # An input that is not recognised is an error even beside a valid one: a
+    # mistyped backup next to a firmware would otherwise install a blank appliance.
+    if [ "${#unknown[@]}" -gt 0 ]; then
+        [ -e "${unknown[0]}" ] || die "input not found: ${unknown[0]}"
+        command -v python3 >/dev/null 2>&1 \
+            || die "${unknown[0]} was not recognised; reading a backup or a dump needs python3 on this host"
         die "${unknown[0]} is not a ZD1200 firmware upgrade file, a ZD configuration backup or a ZoneDirector dump"
     fi
 

@@ -24,9 +24,10 @@
 #
 # The container's own address, if it has one (ip=dhcp in the CT config), is moved
 # from the uplink onto the bridge.  Set ZD_CT_DHCP=1 or ZD_CT_ADDRESS=<cidr> in
-# /etc/zd1200.conf so the wait above knows an address is expected.
+# /etc/zd1200.conf so the wait for the uplink's address knows one is expected.
 #
 # Options: --host-if IFACE, --bridge IFACE
+
 set -euo pipefail
 
 HOST_IF="${ZD_HOST_IF:-eth0}"
@@ -45,7 +46,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --host-if) HOST_IF="${2:?}"; shift 2 ;;
         --bridge)  BRIDGE_IF="${2:?}"; shift 2 ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -134,8 +135,8 @@ else
 fi
 ip link set "$DISPLAY_IF" up
 # The guest must remain the only thing that answers ARP for its own address.
-# zd1200-guest-display sets the arp_ignore/arp_announce sysctls that enforce
-# that; `arp off` here is not enough on its own (it only sets the NOARP flag).
+# The arp_ignore/arp_announce sysctls set further down enforce that; `arp off`
+# here is not enough on its own (it only sets the NOARP flag).
 ip link set "$DISPLAY_IF" arp off 2>/dev/null || true
 
 # One address per family is enough for a display interface, and the container
@@ -182,8 +183,7 @@ fi
 #
 # Verified on PVE 9.2: with the shared MAC and the uplink enslaved, the guest
 # loops on DHCP DISCOVER and stays on its 192.168.0.2 fallback; with this
-# cross-connect it leases normally.  The same shape works for a future QEMU VM
-# whose eth0 carries the hypervisor MAC.
+# cross-connect it leases normally.
 command -v tc >/dev/null 2>&1 || { log "tc is required for the uplink cross-connect (install iproute2)"; exit 1; }
 
 if [ ! -e "/sys/class/net/$WIRE_IF" ] || [ ! -e "/sys/class/net/$WIRE_PEER_IF" ]; then
@@ -194,8 +194,8 @@ else
     log "cross-connect wire $WIRE_IF already exists; reusing it"
 fi
 
-# Undo an enslave left by an older version of this script, then make the wire's
-# bridge end the bridge port and bring everything up.
+# Make sure the uplink is not a bridge port (a no-op when it is not), make the
+# wire's bridge end the port instead, and bring everything up.
 ip link set "$HOST_IF" nomaster 2>/dev/null || true
 ip link set "$WIRE_PEER_IF" master "$BRIDGE_IF" 2>/dev/null || true
 ip link set "$BRIDGE_IF" up
@@ -228,15 +228,14 @@ if [ -n "${ZD_CT_DHCP:-}" ]; then
     if command -v dhclient >/dev/null 2>&1; then
         dhclient -r "$HOST_IF" >/dev/null 2>&1 || true
         # Stop the client that still holds this uplink -- by PID, never by
-        # pattern.  `pkill -f "dhclient.*$HOST_IF"` matched the full command
+        # pattern: `pkill -f "dhclient.*$HOST_IF"` matches the full command
         # line of every process on the host, so any unrelated process whose
-        # arguments merely contained that text -- a shell running this script
-        # with --host-if among its arguments, for one -- was killed too
-        # (HANDOFF.md 8.8 item 11).  Walk /proc instead, and require both
-        # halves to hold of the process itself: its own executable is dhclient
-        # and $HOST_IF is one of its own arguments.  Anything unreadable, gone,
-        # or not matching is skipped, so this is a no-op when there is nothing
-        # to stop.
+        # arguments merely contain that text -- a shell running this script
+        # with --host-if among its arguments, for one -- would be killed too.
+        # Walk /proc instead, and require both halves to hold of the process
+        # itself: its own executable is dhclient and $HOST_IF is one of its own
+        # arguments.  Anything unreadable, gone, or not matching is skipped, so
+        # this is a no-op when there is nothing to stop.
         for _pid_dir in /proc/[0-9]*; do
             _pid="${_pid_dir#/proc/}"
             _exe="$(readlink "$_pid_dir/exe" 2>/dev/null || true)"
@@ -302,10 +301,9 @@ fi
 # ARP policy for the display address.  The guest's address is held locally on
 # $DISPLAY_IF so Proxmox can display it, and a Linux host answers ARP for any
 # address it holds locally.  Left alone, this container would therefore answer
-# ARP for the appliance's own address and race the guest for its traffic -- the
-# failure Gemini's recipe warns about, except that `ip link set ... arp off` does
-# NOT prevent it (it only sets the NOARP flag; verified: the container still
-# replied, presenting the bridge MAC).
+# ARP for the appliance's own address and race the guest for its traffic.
+# `ip link set ... arp off` does NOT prevent it (it only sets the NOARP flag;
+# verified: the container still replied, presenting the bridge MAC).
 #
 # arp_ignore=1 is what actually prevents it: reply only when the target address
 # is on the interface the request arrived on.  The request arrives on the uplink,
@@ -337,7 +335,7 @@ sysctl -qw net.ipv4.conf.all.arp_announce=2 2>/dev/null || true
 # (address on the uplink) on its own schedule.  If the container has taken the
 # address the guest is using, every packet for the guest is delivered to the
 # container instead, and the appliance looks dead while the container looks fine
-# -- the exact failure mode observed while bringing this up.  Release the
+# -- the failure mode this guard exists for.  Release the
 # container's address so the guest owns it, as it would on real hardware.
 if [ -s "$STATE_FILE" ] && [ -n "${ZD_GUEST_IP_FILE:-}" ] && [ -r "$ZD_GUEST_IP_FILE" ]; then
     guest_addr="$(head -n1 "$ZD_GUEST_IP_FILE" 2>/dev/null || true)"

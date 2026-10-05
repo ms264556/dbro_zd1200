@@ -17,14 +17,16 @@
 # Proxmox does.  Both runs are launched together and stop at `pct create`; the id
 # each one chose, and when, is the measurement.
 #
-#   * the current installer, one run at a time: the output is byte-identical to
-#     b48d8ab's, i.e. the lock is invisible when it is not contended;
+#   * one run at a time takes the first free id (120), so the lock is invisible
+#     when it is not contended, and what the run writes to stderr after taking
+#     the lock still reaches its output (an error after that point must show);
 #   * the current installer, two runs together: different ids (120 and 121),
 #     creations that do not overlap, and the run that arrives second names
 #     /run/zd1200-lxc-install.lock before it blocks;
-#   * b48d8ab, the revision before the lock, two runs together: the SAME id and
-#     overlapping creations.  If they do not collide, the harness is not
-#     discriminating and this test FAILS rather than claiming a pass;
+#   * the same installer with a `flock` that always succeeds (so no run ever
+#     waits), two runs together: the SAME id and overlapping creations.  If they
+#     do not collide, the harness is not discriminating and this test FAILS
+#     rather than claiming a pass;
 #   * a killed lock holder leaves no stale lock (flock is held on an open file
 #     descriptor, so the kernel drops it when the process dies).
 #
@@ -32,17 +34,13 @@
 # `sudo -n` when that needs no password; otherwise it skips cleanly.  Every case
 # stops at `pct create`: what happens after creation is not covered here.
 #
-# ZD_CTID_RACE_KEEP_DIR=<dir> keeps each run's own output as evidence, the way
-# wizard-e2e-lxc.sh's ZD_E2E_KEEP_RUN_DIR does.
+# ZD_CTID_RACE_KEEP_DIR=<dir> keeps each run's own output as evidence.
 #
 # Usage: ./scripts/test/lxc-install-ctid-race-test.sh   (or sudo ...)
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALLER="$REPO/install-zd1200-lxc.sh"
-# The last revision whose id allocation is not serialised: the harness has to
-# show that revision's two runs colliding, or it proves nothing.
-PRE_FIX_REV="b48d8ab"
 LOCK_FILE=/run/zd1200-lxc-install.lock
 # How long the `pct create` stub takes to write /etc/pve/lxc/<id>.conf.  Long
 # enough that the second run's scan lands inside the first run's creation, which
@@ -55,15 +53,6 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -f "$INSTALLER" ] || fail "missing $INSTALLER"
 command -v unshare >/dev/null 2>&1 || skip "needs unshare (mount namespaces)"
-
-# This test drives the installer's --wizard path, which reaches the container-id
-# allocation without requiring a firmware input.  The first-run wizard is not
-# part of every tree that carries this test, and on one without it the installer
-# rejects the flag and dies on the missing input -- which would look like an
-# allocation bug rather than a missing feature.  So say so and skip.
-if ! grep -q -- '--wizard)' "$INSTALLER" 2>/dev/null; then
-    skip "this installer has no --wizard mode; the id-allocation harness needs it to reach the allocation without an input"
-fi
 
 # Root is needed for a mount namespace and to write /etc/pve.  Re-enter under
 # `sudo -n` when that needs no password; the marker stops the re-execution from
@@ -91,6 +80,12 @@ cleanup_tmp() {
 }
 trap cleanup_tmp EXIT
 
+# The installer wants an input and reads none of it before `pct create`: a large
+# opaque archive with the TAC magic is classified as a firmware by shape alone.
+FIRMWARE="$TMP/zd1200_0.0.0.0.0.ap_0.0.0.0.0.img"
+truncate -s 40M "$FIRMWARE" || skip "cannot create the firmware fixture"
+printf '\x36\x91\x4a' | dd of="$FIRMWARE" bs=1 conv=notrunc status=none
+
 # ------------------------------------------------------------------- the stubs
 write_stubs() {
     local d="$1"
@@ -106,7 +101,10 @@ if [ "${1:-}" = create ]; then
     : > "/etc/pve/lxc/$id.conf"
     printf 'end %s %s\n' "$id" "$(date +%s.%N)" >> "$log"
     # Stop the run here: the id it chose is the subject, and everything after
-    # creation would need a whole container's worth of further stubs.
+    # creation would need a whole container's worth of further stubs.  The
+    # message is written to the installer's stderr, which the lock setup must
+    # leave intact.
+    echo "stub pct: create stopped here on purpose" >&2
     exit 1
 fi
 exit 0
@@ -124,6 +122,10 @@ STUB
     printf '#!/usr/bin/env bash\nexit 0\n' > "$d/qm"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$d/whiptail"
     chmod 755 "$d"/* || fail "cannot make the stubs executable"
+    # A flock that always succeeds: nothing is ever held, so nothing ever waits.
+    mkdir -p "$d-nolock" || fail "cannot create $d-nolock"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$d-nolock/flock"
+    chmod 755 "$d-nolock/flock" || fail "cannot make the flock stub executable"
 }
 
 # The wrapper: private /etc/pve, then the run(s).  It is executed by `unshare -m`,
@@ -133,17 +135,20 @@ write_wrapper() {
     cat > "$TMP/wrap.sh" <<'WRAP'
 #!/usr/bin/env bash
 set -uo pipefail
-inst="$1"; base="$2"; stub="$3"; delay="$4"; mode="${5:-pair}"
+inst="$1"; base="$2"; stub="$3"; delay="$4"; mode="${5:-pair}"; fw="$6"; extra="${7:-}"
+tpl="${8:-debian-13-standard_test.tar.zst}"; more="${9:-}"
 mkdir -p "$base/upper/pve/lxc" "$base/upper/pve/qemu-server" "$base/work" "$base/merged" \
         "$base/template-dir" || exit 80
-: > "$base/template-dir/debian-13-standard_test.tar.zst"
+: > "$base/template-dir/$tpl"
 mount -t overlay overlay -o "lowerdir=/etc,upperdir=$base/upper,workdir=$base/work" \
       "$base/merged" || exit 90
 mount --bind "$base/merged" /etc || exit 91
-export PATH="$stub:$PATH"
+export PATH="${extra:+$extra:}$stub:$PATH"
 export ZD_TEST_CREATE_DELAY="$delay"
-args=(--wizard --yes --non-interactive --storage local --bridge vmbr0 \
-      --template "$base/template-dir/debian-13-standard_test.tar.zst")
+args=("$fw" --yes --non-interactive --storage local --bridge vmbr0 \
+      --template "$base/template-dir/$tpl")
+# shellcheck disable=SC2206  # a plain word list from the test, no globs
+args+=($more)
 if [ "$mode" = solo ]; then
     env ZD_TEST_PCT_LOG="$base/a.pct" "$inst" "${args[@]}" > "$base/a.txt" 2>&1
     printf '%s\n' "$?" > "$base/a.rc"
@@ -165,12 +170,12 @@ WRAP
 write_stubs "$TMP/bin"
 write_wrapper
 
-# run_case <installer> <tag> <solo|pair>
+# run_case <installer> <tag> <solo|pair> [<dir prepended to PATH>] [<template file name>] [<more installer args>]
 run_case() {
-    local inst="$1" tag="$2" mode="$3" base
+    local inst="$1" tag="$2" mode="$3" extra="${4:-}" tpl="${5:-}" more="${6:-}" base
     base="$TMP/$tag"
     mkdir -p "$base" || fail "cannot create $base"
-    ( cd "$TMP" && unshare -m bash "$TMP/wrap.sh" "$inst" "$base" "$TMP/bin" "$CREATE_DELAY" "$mode" ) \
+    ( cd "$TMP" && unshare -m bash "$TMP/wrap.sh" "$inst" "$base" "$TMP/bin" "$CREATE_DELAY" "$mode" "$FIRMWARE" "$extra" "$tpl" "$more" ) \
         > "$TMP/$tag-wrapper.txt" 2>&1
     WRAP_RC=$?
     case "$WRAP_RC" in
@@ -207,40 +212,18 @@ overlaps() {  # overlaps <a1> <a2> <b1> <b2>
         'BEGIN { print (a1+0 < b2+0 && b1+0 < a2+0) ? "yes" : "no" }'
 }
 
-# ------------------------------------- the revision before the lock, out of git
-HAVE_PRE_FIX=0
-if command -v git >/dev/null 2>&1 \
-        && git -C "$REPO" cat-file -e "$PRE_FIX_REV:install-zd1200-lxc.sh" 2>/dev/null; then
-    mkdir -p "$TMP/prefix/scripts"
-    git -C "$REPO" show "$PRE_FIX_REV:install-zd1200-lxc.sh" > "$TMP/prefix/install-zd1200-lxc.sh" 2>/dev/null
-    git -C "$REPO" show "$PRE_FIX_REV:scripts/install-common.sh" > "$TMP/prefix/scripts/install-common.sh" 2>/dev/null
-    if [ -s "$TMP/prefix/install-zd1200-lxc.sh" ] && [ -s "$TMP/prefix/scripts/install-common.sh" ]; then
-        chmod 755 "$TMP/prefix/install-zd1200-lxc.sh"
-        HAVE_PRE_FIX=1
-    fi
-fi
-
-# ------------------------- 1. uncontended: one run, unchanged from the pre-fix
+# ------------------------- 1. uncontended: one run
 run_case "$INSTALLER" solo-current solo
 S_CUR="$(one_id solo-current a)"
 echo "     solo current: exit $RC_A, id ${S_CUR:-none}"
 [ "$S_CUR" = 120 ] || { cat "$TMP/solo-current/a.txt" >&2
     fail "a single uncontended install chose '${S_CUR:-nothing}' instead of the first free id 120"; }
-if [ "$HAVE_PRE_FIX" = 1 ]; then
-    run_case "$TMP/prefix/install-zd1200-lxc.sh" solo-prefix solo
-    S_PRE="$(one_id solo-prefix a)"
-    echo "     solo $PRE_FIX_REV: exit $RC_A, id ${S_PRE:-none}"
-    [ "$S_PRE" = 120 ] || fail "$PRE_FIX_REV's single uncontended install chose '${S_PRE:-nothing}'"
-    if diff -u "$TMP/solo-prefix/a.txt" "$TMP/solo-current/a.txt" > "$TMP/solo-diff.txt"; then
-        pass "one uncontended install is byte-identical to $PRE_FIX_REV (the lock is invisible)"
-    else
-        cat "$TMP/solo-diff.txt" >&2
-        fail "an uncontended install's output changed from $PRE_FIX_REV (above)"
-    fi
-else
-    echo "skipped: $PRE_FIX_REV is not in this clone, so the uncontended output"
-    echo "         could not be compared with it"
-fi
+pass "one uncontended install takes the first free id"
+grep -qF "stub pct: create stopped here on purpose" "$TMP/solo-current/a.txt" || {
+    cat "$TMP/solo-current/a.txt" >&2
+    fail "a message written to stderr after the lock was taken never reached the output:
+  the lock setup redirected the installer's own stderr, so every later error is invisible"; }
+pass "stderr is still the installer's own after the lock is taken"
 
 # --------------------------------------------- 2. the current installer, pair
 run_case "$INSTALLER" current pair
@@ -271,26 +254,15 @@ else
     fail "neither run reported waiting for $LOCK_FILE; the contended path was not exercised"
 fi
 
-# ------------------------------------- 3. the pre-fix revision: must collide
-if [ "$HAVE_PRE_FIX" = 1 ]; then
-    run_case "$TMP/prefix/install-zd1200-lxc.sh" prefix pair
-    P_A="$(one_id prefix a)"; P_B="$(one_id prefix b)"
-    echo "     $PRE_FIX_REV pair: exit A=$RC_A B=$RC_B, id A=${P_A:-none}, id B=${P_B:-none}"
-    [ -n "$P_A" ] && [ -n "$P_B" ] || { cat "$TMP/prefix/a.txt" "$TMP/prefix/b.txt" >&2
-        fail "$PRE_FIX_REV: a run never reached pct create (harness problem)" ; }
-    [ "$P_A" = "$P_B" ] || {
-        cat "$TMP/prefix/a.txt" "$TMP/prefix/b.txt" >&2
-        fail "two concurrent runs of $PRE_FIX_REV chose DIFFERENT ids ($P_A and $P_B):
-  the harness is not discriminating and would not have caught this defect"
-    }
-    P_OVER="$(overlaps "$(one_time prefix a begin)" "$(one_time prefix a end)" \
-                       "$(one_time prefix b begin)" "$(one_time prefix b end)")"
-    pass "the two runs of $PRE_FIX_REV both chose container $P_A (creates overlapped: $P_OVER)"
-else
-    echo "skipped: $PRE_FIX_REV:install-zd1200-lxc.sh is not in this clone"
-    echo "         (shallow or rewritten history); the current installer is still"
-    echo "         checked, but the harness is not shown discriminating"
-fi
+# ------------- 3. the same installer with no effective lock: the harness must see the race
+run_case "$INSTALLER" nolock pair "$TMP/bin-nolock"
+N_A="$(one_id nolock a)"; N_B="$(one_id nolock b)"
+echo "     no lock pair: exit A=$RC_A B=$RC_B, id A=${N_A:-none}, id B=${N_B:-none}"
+[ -n "$N_A" ] && [ -n "$N_B" ] || { cat "$TMP/nolock/a.txt" "$TMP/nolock/b.txt" >&2
+    fail "an unlocked run never reached pct create; the discrimination arm proves nothing"; }
+[ "$N_A" = "$N_B" ] || fail "with no effective lock the two runs chose different ids ($N_A, $N_B):
+  the harness does not provoke the race, so the passes above prove nothing"
+pass "with no effective lock the same two runs collide on container $N_A (the harness can fail)"
 
 # ------------------------------- 4. a killed holder leaves no stale lock
 if command -v flock >/dev/null 2>&1; then
@@ -312,6 +284,33 @@ if command -v flock >/dev/null 2>&1; then
 else
     echo "skipped: flock: a killed holder's lock cannot be checked"
 fi
+
+# ------------- 5. a Debian 12 template is refused before any container exists
+# (its QEMU has no igb NIC model; finding that out after `pct create` leaves a
+# half-built container behind)
+run_case "$INSTALLER" deb12 solo "" debian-12-standard_test.tar.zst
+[ -z "$(one_id deb12 a)" ] || { cat "$TMP/deb12/a.txt" >&2
+    fail "a Debian 12 template reached pct create: it was accepted and would fail later, at the igb probe"; }
+grep -qF "is Debian 12; the guest needs Debian 13" "$TMP/deb12/a.txt" || { cat "$TMP/deb12/a.txt" >&2
+    fail "a Debian 12 template was refused without saying why"; }
+[ "$RC_A" != 0 ] || fail "a Debian 12 template did not make the installer fail"
+pass "a Debian 12 template is refused with its reason, before pct create"
+
+# ------------- 6. --container-mac: any well-formed value is the container's own MAC
+# The pinned value names the container's net0 hwaddr only, so an even or an odd
+# last octet are equally fine, shared or not (an unshared guest draws its own MAC
+# later, after container creation, which this harness does not reach); a value
+# that is not a MAC is refused before anything is created.
+for variant in "mac-even:02:aa:bb:cc:dd:ee" "mac-odd:02:aa:bb:cc:dd:ef"; do
+    tag="${variant%%:*}"; mac="${variant#*:}"
+    run_case "$INSTALLER" "$tag" solo "" "" "--no-shared-mac --container-mac $mac"
+    [ "$(one_id "$tag" a)" = 120 ] || { cat "$TMP/$tag/a.txt" >&2
+        fail "--no-shared-mac --container-mac $mac did not reach pct create"; }
+done
+run_case "$INSTALLER" mac-bad solo "" "" "--container-mac not-a-mac"
+[ -z "$(one_id mac-bad a)" ] && grep -qF "is not a MAC address" "$TMP/mac-bad/a.txt" || { cat "$TMP/mac-bad/a.txt" >&2
+    fail "a malformed --container-mac was not refused before pct create"; }
+pass "an even or odd --container-mac reaches pct create; a malformed one is refused before it"
 
 echo
 echo "all lxc-install ctid-race tests passed"

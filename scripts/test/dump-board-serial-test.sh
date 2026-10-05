@@ -13,8 +13,7 @@
 #
 # This is the unit half: the function that reads the record.  What the serial is
 # used for is prepare-vm-disks.sh's board-data write, which takes ZD_SERIAL --
-# pinned by wizard-guest-identity-test.sh on the wizard path and by
-# prepare-vm-disks.sh's own call here.
+# pinned by prepare-vm-disks.sh's own call here.
 #
 # No firmware, no dump contents, no container: the fixtures are the record's
 # shapes.

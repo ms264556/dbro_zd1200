@@ -375,6 +375,11 @@ rootfs_md5="$(md5sum "$source_dir/rootfs.i386.ext2.director1200.img" | awk '{pri
 
 output_dir="$IMAGE_DIR"
 mkdir -p "$output_dir"
+# A card dump installed earlier into this image/ left its /writable and board
+# record behind.  Only --writable-from (below) writes them for a firmware
+# source; otherwise the disk build would pick them up and the "factory" install
+# would carry the old unit's configuration and serial.
+rm -f "$output_dir/writable.raw" "$output_dir/dump-boarddata"
 # A configuration backup and a captured /writable both seed the appliance's
 # configuration, and they cannot both win.
 if [ -n "$backup_file" ] && [ -n "$writable_from" ]; then

@@ -17,6 +17,7 @@ set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../container" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-patchlib.XXXXXX")"
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap 'rm -rf "$TMP"' EXIT
 
 WORK="$TMP/work"
@@ -34,7 +35,7 @@ pass() { printf 'ok   %s\n' "$*"; }
 read_img() {
     local out="$TMP/read.$$"
     rm -f "$out"
-    debugfs -R "dump $1 $out" "$IMG" >/dev/null 2>&1 || { echo "<absent>"; return; }
+    fs_dump "$IMG" "$1" "$out" || { echo "<absent>"; return; }
     [ -f "$out" ] || { echo "<absent>"; return; }
     cat "$out"; rm -f "$out"
 }

@@ -25,6 +25,8 @@ Usage:
       <pristine.vmlinux> <expected-site-hex> <enclosing-branch-file-offset>
   check-patched-kernel-site.py --group-a <patcher.py> <patched.bzImage> \
       <pristine.vmlinux> <expected-site-hex>
+  check-patched-kernel-site.py --tsc-threshold <patcher.py> <patched.bzImage> \
+      <pristine.vmlinux>
 """
 
 from __future__ import annotations
@@ -351,8 +353,88 @@ def check_group_a(patcher_path: str, bzimage: str, pristine: str, expected: str)
     return 0
 
 
+ENTRY_TSC = "tsc_read_refs_threshold"
+
+# The SMI-threshold compare, as the pristine and the patched bytes the check
+# expects.  Pinned here rather than read from the patcher, so a patch that wrote
+# the wrong width or offset cannot pass by being compared with itself: the 11 bytes
+# in front and the `ja` after must stay, and exactly the imm32 at +11 changes.
+TSC_STOCK = "29f919eb83fb00771581f94fc3000077"
+TSC_IMM_OFF = 11
+TSC_STOCK_LIMIT = 0xC34F           # 49999: "SMI_TRESHOLD = 50000", compared with ja
+TSC_LIMIT = 0xFFFFF
+# Sanity bound on the limit: far above the stock one, far below a stall long enough
+# to wreck a calibration.
+TSC_LIMIT_MAX = 0xFFFFFF
+
+
+def check_tsc_threshold(patcher_path: str, bzimage: str, pristine: str) -> int:
+    """The `tsc_read_refs_threshold` patch, read back out of the artifact.
+
+    The 16-byte compare must keep every byte but the imm32 at +11, and the imm32
+    must be the new limit.  The pristine kernel is consulted so that the check can
+    tell the patcher wrote these bytes rather than finding them already there.
+    """
+    pk = load_patcher(patcher_path)
+    try:
+        out = pk.find_elf_member(Path(bzimage).read_bytes())[2]
+    except SystemExit as exc:
+        print(f"not a patched kernel image: {exc}")
+        return 1
+    before = Path(pristine).read_bytes()
+
+    def site_of(payload):
+        return next((s for s in pk.locate_sites(payload)[0]
+                     if s.name == ENTRY_TSC and s.hits), None)
+
+    site, pre_site = site_of(out), site_of(before)
+    if site is None:
+        print(f"no site for {ENTRY_TSC} in {bzimage} "
+              "(its signature does not match the installed payload)")
+        return 1
+    if pre_site is None:
+        print(f"the pristine image has no {ENTRY_TSC} site to compare against")
+        return 1
+    if len(site.hits) != 1 or len(pre_site.hits) != 1:
+        print(f"the {ENTRY_TSC} signature matched {len(pre_site.hits)} place(s) in "
+              f"the pristine kernel and {len(site.hits)} in the patched one; "
+              "expected exactly one each")
+        return 1
+    m = pre_site.hits[0]
+    if site.hits[0] != m:
+        print(f"the {ENTRY_TSC} match moved from 0x{m:x} to 0x{site.hits[0]:x}")
+        return 1
+
+    stock, now = bytes.fromhex(TSC_STOCK), out[m:m + len(bytes.fromhex(TSC_STOCK))]
+    if before[m:m + len(stock)] != stock:
+        print(f"the pristine kernel does not carry the stock compare at 0x{m:x}: "
+              f"{before[m:m + len(stock)].hex()}")
+        return 1
+    if now[:TSC_IMM_OFF] != stock[:TSC_IMM_OFF] \
+            or now[TSC_IMM_OFF + 4:] != stock[TSC_IMM_OFF + 4:]:
+        print(f"the patch touched bytes besides the imm32: {now.hex()} "
+              f"(stock {stock.hex()})")
+        return 1
+    limit = struct.unpack_from("<I", now, TSC_IMM_OFF)[0]
+    if limit == TSC_STOCK_LIMIT:
+        print("the threshold is still the stock 0xc34f: the patch was not written")
+        return 1
+    if limit != TSC_LIMIT or not TSC_STOCK_LIMIT < limit < TSC_LIMIT_MAX:
+        print(f"the threshold is 0x{limit:x}, expected 0x{TSC_LIMIT:x}")
+        return 1
+
+    print(f"site={now.hex()} limit=0x{limit:x}")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
+    if args and args[0] == "--tsc-threshold":
+        if len(args) != 4:
+            print("usage: check-patched-kernel-site.py --tsc-threshold <patcher.py> "
+                  "<patched.bzImage> <pristine.vmlinux>", file=sys.stderr)
+            return 2
+        return check_tsc_threshold(args[1], args[2], args[3])
     if args and args[0] == "--group-a":
         if len(args) != 5:
             print("usage: check-patched-kernel-site.py --group-a <patcher.py> "

@@ -95,6 +95,9 @@ def unlock_case(tmp: Path) -> None:
 
     raw = output.read_bytes()
     check("unlock output is TAC", raw.startswith(b"\x36\x91\x4a"))
+    mode = os.stat(output).st_mode & 0o777
+    check("unlock output is world-readable (the container reads it as root without DAC_OVERRIDE)",
+          mode & 0o044 == 0o044, f"mode is {mode:o}")
     payload = decrypt.decrypt_bytes(raw)
     with tarfile.open(fileobj=BytesIO(payload), mode="r:gz") as tar:
         metadata = tar.extractfile("metadata").read().decode()

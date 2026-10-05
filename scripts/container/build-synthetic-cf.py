@@ -23,6 +23,7 @@ optional configuration backup (`image/backup.bak`, staged at
 """
 
 from pathlib import Path
+import atexit
 import importlib.util
 import os
 from shutil import copyfile, which
@@ -41,8 +42,12 @@ base = Path(__file__).resolve().parent
 runtime = Path(os.environ.get("RUNTIME_DIR") or base)
 rootfs = runtime / "image" / "rootfs.ext2"
 kernel_src = runtime / "image" / "bzImage"   # raw; patch below for QEMU
-disk = Path(os.environ.get("SYNTHETIC_DISK", runtime / "synthetic-cf.img"))
-disk.parent.mkdir(parents=True, exist_ok=True)
+final_disk = Path(os.environ.get("SYNTHETIC_DISK", runtime / "synthetic-cf.img"))
+final_disk.parent.mkdir(parents=True, exist_ok=True)
+# Build into a sibling temp file and os.replace() it over final_disk at the end,
+# so a mid-build failure never leaves a half-written disk at the final path.
+disk = final_disk.with_name(final_disk.name + ".tmp")
+atexit.register(lambda: disk.unlink(missing_ok=True))
 
 SECTOR = 512
 H1, C1 = 62, 84506          # boot (/boot)
@@ -55,12 +60,44 @@ if rootfs.stat().st_size > C2 * SECTOR:
     raise SystemExit("rootfs does not fit in root partition")
 
 
+_bootfs_module = None
+
+
+def bootfs():
+    """The build-bootfs.py module (also supplies the checked debugfs helpers)."""
+    global _bootfs_module
+    if _bootfs_module is None:
+        spec = importlib.util.spec_from_file_location("zd_build_bootfs", base / "build-bootfs.py")
+        _bootfs_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_bootfs_module)
+    return _bootfs_module
+
+
 def build_bootfs() -> bytes:
     """Build the boot area (MBR + stage1_5 + sda1 fs) from the firmware's restore initramfs."""
-    spec = importlib.util.spec_from_file_location("zd_build_bootfs", base / "build-bootfs.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.build_bootfs()
+    return bootfs().build_bootfs()
+
+
+def debugfs_write(img, writes: list, pre_cmds: list = (), extra_cmds: list = ()) -> None:
+    """debugfs `write` each (src, dest) into img, then fail unless every file is
+    present with its source's size.  debugfs exits 0 on a failed command, so its
+    output is checked for errors and the result is stat'ed afterwards."""
+    mod = bootfs()
+    with tempfile.NamedTemporaryFile("w", suffix=".cmds", delete=False) as handle:
+        handle.write("\n".join(list(pre_cmds)
+                               + [f"write {src} {dest}" for src, dest in writes]
+                               + list(extra_cmds)) + "\n")
+        cmdfile = Path(handle.name)
+    try:
+        mod.run_debugfs(["-w", "-f", str(cmdfile), str(img)])
+    finally:
+        cmdfile.unlink()
+    for src, dest in writes:
+        want = Path(src).stat().st_size
+        got = mod.debugfs_size(img, dest)
+        if got != want:
+            raise SystemExit(f"debugfs write {dest} into {img}: {got} bytes on disk, "
+                             f"expected {want} (filesystem full?)")
 
 mke2fs = os.environ.get("MKE2FS") or which("mke2fs")
 if not mke2fs:
@@ -75,7 +112,7 @@ with tempfile.TemporaryDirectory() as _kp:
     _kp = Path(_kp)
     patched = _kp / "bzImage.patched"
     _patch = subprocess.run(
-        ["python3", str(base / "patch-kernel.py"),
+        [sys.executable, str(base / "patch-kernel.py"),
          "--in", str(kernel_src), "--out", str(patched)],
         capture_output=True, text=True)
     if _patch.returncode != 0:
@@ -88,6 +125,7 @@ with tempfile.TemporaryDirectory() as _kp:
     _kf = tempfile.NamedTemporaryFile(prefix="bzImage.patched.", suffix=".bin", delete=False)
     _kf.write(kernel); _kf.close()
     kernel_file = Path(_kf.name)
+    atexit.register(lambda: kernel_file.unlink(missing_ok=True))
 
 
 def seed_writable_config(ext2_path):
@@ -97,20 +135,12 @@ def seed_writable_config(ext2_path):
         print("  dropbear-provision/passwd/shadow missing; leaving /writable unseeded")
         return
     # /etc already exists (mke2fs -d creates it from the staged tree).
-    cmds = ["mkdir /etc/config",
-            f"write {passwd_src} /etc/config/passwd",
-            f"write {shadow_src} /etc/config/shadow",
-            "set_inode_field /etc/config/shadow mode 0100640"]
-    # Write the debugfs command file somewhere writable: BASE (/opt/zd1200 in
-    # the container) is read-only when this runs as an unprivileged user.
-    with tempfile.NamedTemporaryFile("w", suffix=".cmds", delete=False) as handle:
-        handle.write("\n".join(cmds) + "\n")
-        cmdfile = Path(handle.name)
-    try:
-        subprocess.run(["debugfs", "-w", "-f", str(cmdfile), ext2_path],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    finally:
-        cmdfile.unlink()
+    # The command file lives in the temp dir: BASE (/opt/zd1200 in the container)
+    # is read-only when this runs as an unprivileged user.
+    debugfs_write(ext2_path,
+                  [(passwd_src, "/etc/config/passwd"), (shadow_src, "/etc/config/shadow")],
+                  pre_cmds=["mkdir /etc/config"],
+                  extra_cmds=["set_inode_field /etc/config/shadow mode 0100640"])
 
 
 with disk.open("wb") as handle:
@@ -127,13 +157,12 @@ with tempfile.TemporaryDirectory() as td:
     h1_fs = kb[H1 * SECTOR:H1 * SECTOR + C1 * SECTOR]
     h1_tmp = td / "h1_fs.img"
     open(h1_tmp, "wb").write(h1_fs)
-    ker_cmds = td / "ker.cmds"
-    cmds = [f"write {kernel_file} /bzImage"]
+    writes = [(kernel_file, "/bzImage")]
     # The vendor /boot also carried the rescue initrd; menu.lst's "System rescue
     # from image" entry needs it at (hd0,0)/restoreinitramfs.gz.
     rescue = runtime / "image" / "restoreinitramfs.gz"
     if rescue.exists():
-        cmds.append(f"write {rescue} /restoreinitramfs.gz")
+        writes.append((rescue, "/restoreinitramfs.gz"))
     # The vendor upgrade compares /boot/restoreinitramfs.ver with the payload's
     # restoreinitramfs.ver (ac_upg.sh:_upg_boot); when they differ it replaces
     # /boot/lib/grub/i386-pc/menu.lst with the vendor template (root=/dev/sda*,
@@ -142,16 +171,30 @@ with tempfile.TemporaryDirectory() as td:
     ver = runtime / "image" / "restoreinitramfs.ver"
     if not ver.exists():
         raise SystemExit(f"missing {ver} — run scripts/build/prepare-vendor-image.sh")
-    cmds.append(f"write {ver} /restoreinitramfs.ver")
-    ker_cmds.write_text("\n".join(cmds) + "\n")
-    subprocess.run(["debugfs", "-w", "-f", str(ker_cmds), str(h1_tmp)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    writes.append((ver, "/restoreinitramfs.ver"))
+    debugfs_write(h1_tmp, writes)
     h1_fs = open(h1_tmp, "rb").read()
     kb = kb[:H1 * SECTOR] + h1_fs + kb[H1 * SECTOR + len(h1_fs):]
     bootfs_bytes = kb
 
     with disk.open("r+b") as h:
         h.write(bootfs_bytes)                                # sectors 0..H1+C1-1
+
+def place_root_kernel(rt, kernel) -> bool:
+    """Give a rootfs copy its /bzImage; True when the patched kernel was written.
+
+    A firmware's rootfs has no /bzImage, so the patched kernel goes in.  A card
+    dump's rootfs already carries its own, matching the kernel modules in that
+    same rootfs.  The kernel here comes from the dump's /boot, a different build
+    on some cards, and booting it against the rootfs's modules fails (unknown
+    symbols in igb2.ko/af.ko, no ethernet devices, an oops).  So an existing
+    /bzImage stays, and prepare-vm-disks.sh patches that kernel in place at start.
+    """
+    if bootfs().debugfs_size(rt, "/bzImage") >= 0:
+        return False
+    debugfs_write(rt, [(kernel, "/bzImage")])
+    return True
+
 
 # ---- sda2/sda3 rootfs (with kernel at /bzImage) ----
 rfs = rootfs.read_bytes()
@@ -160,10 +203,8 @@ with tempfile.TemporaryDirectory() as td2:
     # add /bzImage to the rootfs copy via debugfs
     rt = td2 / "rt.img"
     open(rt, "wb").write(rfs)
-    cmds = td2 / "r.cmds"
-    cmds.write_text(f"write {kernel_file} /bzImage\n")
-    subprocess.run(["debugfs", "-w", "-f", str(cmds), str(rt)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not place_root_kernel(rt, kernel_file):
+        print("  rootfs already carries its own /bzImage; leaving it for prepare-vm-disks.sh to patch in place")
     # ac_upg.sh _upg_rootfs resize2fs's the freshly written root to fill its
     # partition; do the same so the guest sees the full partition, not the size
     # of the rootfs.ext2 we were shipped.  A CF-dump rootfs is already
@@ -227,6 +268,10 @@ def stage_payload(stage: Path) -> None:
         print("  payload tarball (*-payload.tar.gz) missing; /writable left without AP images/aidfs")
         return
     import tarfile
+    if len(payloads) > 1:
+        print(f"  warning: {len(payloads)} payload tarballs in {runtime / 'image'} "
+              f"({', '.join(p.name for p in payloads)}); using {payloads[0].name}",
+              file=sys.stderr)
     with tarfile.open(payloads[0], "r:gz") as tar:
         members = [m for m in tar.getmembers()
                    if m.name.split("/", 1)[0] in ("aidfs", "firmwares")]
@@ -312,7 +357,9 @@ else:
         finally:
             os.unlink(tf_path)
 
-print(f"created {disk} ({DISK_SIZE // (1024 * 1024)} MiB)")
+os.replace(disk, final_disk)
+
+print(f"created {final_disk} ({DISK_SIZE // (1024 * 1024)} MiB)")
 print(f"  sda1 boot : sectors {H1}..{H1 + C1} (bootfs + kernel)")
 print(f"  sda2 rootA: sectors {H2}..{H2 + C2} (rootfs)")
 print(f"  sda3 rootB: sectors {H3}..{H3 + C3} (rootfs)")

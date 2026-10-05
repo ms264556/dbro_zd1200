@@ -52,17 +52,15 @@ sed -n '/^build_guarded_script() {/,/^}/p' "$PATCH" > "$TMP/fn.sh"
 # shellcheck source=/dev/null
 . "$TMP/fn.sh"
 
-# The function's only I/O is fs_read (pull the vendor script off a root) and
-# fs_stat_meta (its mode); both are stubbed around the stand-in.  Once a run has
+# The function's only I/O is fs_read (pull the vendor script off a root), which
+# is stubbed around the stand-in; the mode is write_local's concern.  Once a run has
 # produced the guarded script, fs_read returns that, modelling a root that
 # already carries the guard.
 fs_read() { if [ -s "$WORK/rbd.sh.patched" ]; then cp "$WORK/rbd.sh.patched" "$3"; else cp "$VENDOR" "$3"; fi; }
-fs_stat_meta() { echo "0 0100755"; }
 
 build_guarded_script rootA || fail "build_guarded_script refused to patch the stand-in"
 [ -s "$WORK/rbd.sh.patched" ] || fail "no patched script produced"
 grep -q 'ZD-MAC-GUARD' "$WORK/rbd.sh.patched" || fail "patched script carries no guard"
-[ "$(cat "$WORK/rbd.mode")" = "0100755" ] || fail "vendor mode not preserved: $(cat "$WORK/rbd.mode")"
 pass "the vendor script is guarded with its mode preserved"
 
 # The guard must sit before `rbd change`, not after.

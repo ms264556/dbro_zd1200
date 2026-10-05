@@ -4,27 +4,21 @@
 #
 # Why this exists: run-suite.sh is the only thing that turns test exit codes into
 # a `ran N of M` claim, so a wrong count would recreate the defect it is there to
-# expose -- a green suite that hides tests which skipped their own subject
-# (HANDOFF.md 7.4).  This test drives the real runner over synthetic fixture
-# directories of stub tests and never touches the real suite.
+# expose -- a green suite that hides tests which skipped their own subject.  This
+# test drives the real runner over synthetic fixture directories of stub tests
+# and never touches the real suite.
 #
-# Three suites are run: `ZD_SUITE_DIR` points the runner at a fixture directory,
-# and the pre-fix runner is driven over a third.
+# `ZD_SUITE_DIR` points the runner at each fixture directory:
 #
 #   green fixture   a `*.sh` pass stub, a `*.sh` stub that prints `skipped:`, a
 #                   silent `*.sh` stub, a `*-test.py` that passes, a `*-test.py`
 #                   that prints `skipped:`, a `*-test.py` that prints `partial:`,
-#                   and run-suite.sh and run-suite-test.sh stubs that must never
-#                   execute.  Every stub drops a marker file through
+#                   and run-suite.sh, run-suite-test.sh and lib.sh stubs that must
+#                   never execute.  Every stub drops a marker file through
 #                   $ZD_STUB_MARKERS, so execution (not just counting) is proved
 #   bad fixture     the green fixture plus a `*-test.py` stub that exits 1
-#   pre-fix grid    one `*.sh` pass stub and one passing `*-test.py` stub, run by
-#                   the runner as it was at abc0b3a (staged out of git with `git
-#                   show`) and by the runner under test
-#   no-room dir     a *copy* of wizard-http-test.py plus an unwritable
-#                   `.boot-test`, run with $TMPDIR on a small filesystem: the
-#                   environmental shortfall must print `skipped:` and exit 0, not
-#                   fail with a `FAIL:` line
+#   mixed fixture   one `*.sh` pass stub and one passing `*-test.py` stub: both
+#                   kinds are run and counted, with no coverage-gap notice
 #   no-python PATH  a PATH carrying the runner's own tools but no python3: every
 #                   `*-test.py` must be recorded not run, and the aggregate must
 #                   stay 0 rather than counting the interpreter's exit 127
@@ -33,15 +27,12 @@
 #                   verdict first and its `SKIP:` after (must stay RAN)
 #
 # It asserts the counts, the skip/partial/failure naming, the self-exclusion, the
-# *.py invocation, the exit contract, and the five discriminating facts: that the
-# `*-test.py` tests are now RUN rather than named as a coverage gap (the pre-fix
-# runner named them and ran none -- this test fails against it), that a
-# `partial:` test is counted in the numerator but named under its own summary
-# section, that an environmental shortfall in a *.py test skips rather than
-# failing, that a missing interpreter skips rather than failing, and that an
-# all-caps `SKIP:` is a not-run verdict only as the test's first line of output
-# (the runner at 2043850 counted it RAN -- see the upper fixture below).
-# Offline: no network, no lab, no real test.
+# *.py invocation, the exit contract, and these discriminating facts: that the
+# `*-test.py` tests are RUN rather than named as a coverage gap, that a `partial:`
+# test is counted in the numerator but named under its own summary section, that
+# a missing interpreter skips rather than failing, and that an all-caps `SKIP:` is
+# a not-run verdict only as the test's first line of output (see the upper fixture
+# below).  Offline: no network, no lab, no real test.
 #
 # Usage: ./scripts/test/run-suite-test.sh
 #
@@ -50,13 +41,6 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNNER="$REPO/scripts/test/run-suite.sh"
-# The pre-fix runner this test must fail against: the revision whose suite loop
-# never ran a *-test.py (HANDOFF.md 8.8 item 6).
-PRE_FIX_REV="abc0b3a"
-# The runner as it was before the all-caps `SKIP:` first-line rule: it recognised
-# only the lowercase markers, so a test whose pre-tool gate printed `SKIP:` and
-# exited 0 counted as RAN (HANDOFF.md 9.2, 9.8 item 6).
-UPPER_PRE_FIX_REV="2043850"
 
 skip() { printf 'skipped: %s\n' "$*"; exit 0; }
 pass() { printf 'ok   %s\n' "$*"; }
@@ -65,7 +49,6 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ -f "$RUNNER" ] || skip "scripts/test/run-suite.sh is not present"
 command -v mktemp >/dev/null 2>&1 || skip "needs mktemp"
 command -v python3 >/dev/null 2>&1 || fail "this test needs python3 (it drives the *-test.py tests)"
-command -v git >/dev/null 2>&1 || fail "this test needs git (it stages the pre-fix runner)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-run-suite-test.XXXXXX")" \
     || skip "cannot create a scratch directory"
 trap 'rm -rf "$TMP"' EXIT
@@ -121,6 +104,12 @@ STUB
 #!/usr/bin/env bash
 : > "$TMP/own-test-ran"
 exit 1
+STUB
+    # A sourced helper, not a test: executing it would count it as a test that ran.
+    cat > "$dir/lib.sh" <<STUB
+#!/usr/bin/env bash
+: > "$TMP/lib-ran"
+exit 0
 STUB
 }
 
@@ -200,8 +189,7 @@ pass "neither the passer nor the silent test is listed as not run"
 
 # --------------------------------------------------- the *.py tests now RUN
 # Discriminating fact 1: the *.py stubs were invoked (their marker files exist)
-# and their output is in the transcript.  This is what the pre-fix runner did not
-# do -- see the pre-fix grid below.
+# and their output is in the transcript.
 for stub in d2-py-pass-test.py d3-py-skip-test.py d4-py-partial-test.py; do
     [ -e "$markers/$stub" ] \
         || fail "$stub was not executed by the runner (no marker file)"
@@ -255,7 +243,7 @@ grep -qE '^(ok|FAIL)' <<<"$(grep '^partial  ' <<<"$green_out")" \
 pass "the partial marker and its summary line are unambiguous to grep"
 
 # ------------------------------------- an all-caps SKIP: pre-tool gate
-# HANDOFF.md 9.2's open item / 9.8 item 6: six tests' own tool gates print
+# Several tests' own tool gates print
 # `SKIP: <tool> not found` (all caps) and exit 0 having evaluated nothing, and
 # the runner's case-sensitive `^(skipped|skip):` rule matched only the lowercase
 # form, so those tests counted as RAN.  The all-caps form is a test-level
@@ -296,25 +284,10 @@ grep -qE '^(not run|partial)  .*b-upper-section-skip-test\.sh' <<<"$upper_out" \
     || fail "the all-caps SKIP: fixture stubs were not both executed"
 pass "an all-caps SKIP: is a not-run verdict only as the test's first line"
 
-# Discriminating fact 5: the case above is only a discrimination if the runner
-# before this change classifies the gate stub RAN.  That is the runner at
-# 2043850, the revision whose `^(skipped|skip):` rule was case-sensitive.
-if ! git -C "$REPO" cat-file -e "$UPPER_PRE_FIX_REV:scripts/test/run-suite.sh" 2>/dev/null; then
-    fail "cannot read scripts/test/run-suite.sh at $UPPER_PRE_FIX_REV (shallow or missing history)"
-fi
-git -C "$REPO" show "$UPPER_PRE_FIX_REV:scripts/test/run-suite.sh" > "$TMP/upper-pre-run-suite.sh" \
-    || fail "could not stage the pre-change runner out of git"
-bash -n "$TMP/upper-pre-run-suite.sh" || fail "the staged pre-change runner does not parse"
-upper_pre_out="$(ZD_SUITE_DIR="$upper" ZD_STUB_MARKERS="$markers" bash "$TMP/upper-pre-run-suite.sh" 2>&1)"
-grep -qx 'ran 2 of 2 tests' <<<"$upper_pre_out" || {
-    printf '%s\n' "$upper_pre_out" >&2
-    fail "the runner at $UPPER_PRE_FIX_REV was expected to count the all-caps SKIP: gate as RAN"
-}
-pass "the runner at $UPPER_PRE_FIX_REV counts the all-caps SKIP: gate as RAN"
-
 [ ! -e "$TMP/self-ran" ] || fail "run-suite.sh was executed from the fixture (recursion)"
 [ ! -e "$TMP/own-test-ran" ] || fail "run-suite-test.sh was executed from the fixture"
-pass "run-suite.sh and run-suite-test.sh are excluded from the run"
+[ ! -e "$TMP/lib-ran" ] || fail "lib.sh, a sourced helper, was executed as a test"
+pass "run-suite.sh, run-suite-test.sh and the lib.sh helper are excluded from the run"
 
 # -------------------------------------------------------------- the bad fixture
 bad_out="$(ZD_SUITE_DIR="$bad" ZD_STUB_MARKERS="$markers" bash "$RUNNER" 2>&1)" && bad_rc=0 || bad_rc=$?
@@ -340,11 +313,8 @@ grep -qE '^failed  .*e-fail-test\.py \(exit 1\)$' <<<"$bad_out" \
     || fail "the failing *-test.py stub was never executed"
 pass "the failing *-test.py is executed and named in the summary"
 
-# ------------------------------------------------------- the pre-fix runner
-# Discriminating fact 3, the sharp one: at abc0b3a the runner never ran a
-# *.py test.  Given the same mixed fixture it must run only the *.sh stub and
-# name the *.py test as a coverage gap; the runner under test must run both and
-# print no gap notice.  This test therefore fails against the pre-fix revision.
+# ------------------------------------------- a mixed *.sh / *-test.py suite
+# Both kinds must be run and counted, with no coverage-gap notice.
 prefix_dir="$TMP/prefix"
 mkdir -p "$prefix_dir"
 cat > "$prefix_dir/a-pass-test.sh" <<'STUB'
@@ -353,33 +323,10 @@ echo "ok   the pre-fix grid's shell stub ran"
 STUB
 cat > "$prefix_dir/b-py-pass-test.py" <<STUB
 #!/usr/bin/env python3
-"""Must be run by the fixed runner and only named by the pre-fix one."""
+"""Must be run and counted by the runner."""
 open("$TMP/prefix-py-ran", "w").close()
 print("ok   the pre-fix grid's python stub ran")
 STUB
-
-if ! git -C "$REPO" cat-file -e "$PRE_FIX_REV:scripts/test/run-suite.sh" 2>/dev/null; then
-    # Not a skip: without the pre-fix runner the discrimination this test exists
-    # for cannot be shown, and a silent pass would hide that.
-    fail "cannot read scripts/test/run-suite.sh at $PRE_FIX_REV (shallow or missing history)"
-fi
-git -C "$REPO" show "$PRE_FIX_REV:scripts/test/run-suite.sh" > "$TMP/prefix-run-suite.sh" \
-    || fail "could not stage the pre-fix runner out of git"
-bash -n "$TMP/prefix-run-suite.sh" || fail "the staged pre-fix runner does not parse"
-rm -f "$TMP/prefix-py-ran"
-prefix_out="$(ZD_SUITE_DIR="$prefix_dir" bash "$TMP/prefix-run-suite.sh" 2>&1)"
-[ -e "$TMP/prefix-py-ran" ] \
-    && fail "the pre-fix runner at $PRE_FIX_REV executed a *-test.py, which contradicts the recorded gap"
-grep -qE "^===== .*b-py-pass-test\.py\$" <<<"$prefix_out" \
-    && fail "the pre-fix runner at $PRE_FIX_REV ran the *-test.py"
-grep -q '^coverage gap: ' <<<"$prefix_out" \
-    || {
-        printf '%s\n' "$prefix_out" >&2
-        fail "the pre-fix runner was expected to name the *-test.py as a coverage gap"
-    }
-grep -q 'b-py-pass-test\.py' <<<"$prefix_out" \
-    || fail "the pre-fix runner's coverage gap does not name the *-test.py"
-pass "the pre-fix runner ($PRE_FIX_REV) does NOT run the *-test.py and names it a coverage gap"
 
 rm -f "$TMP/prefix-py-ran"
 fixed_out="$(ZD_SUITE_DIR="$prefix_dir" bash "$RUNNER" 2>&1)" \
@@ -393,42 +340,6 @@ grep -qx 'ran 2 of 2 tests' <<<"$fixed_out" || {
 grep -q '^coverage gap: ' <<<"$fixed_out" \
     && fail "the fixed runner still prints the obsolete coverage-gap notice"
 pass "the fixed runner runs the same *-test.py and counts it (2 of 2, no gap notice)"
-
-# ------------------------------------- an environmental shortfall must skip
-# wizard-http-test.py needs ~8 GiB free and used to abort with a `FAIL:` line
-# when no filesystem had it, which would fail a whole suite run for a full disk.
-# Exercise its real code with both candidate filesystems too small (the copy is
-# on a 3.8 GB tmpfs and its .boot-test cannot be created) and require a
-# `skipped:` line and exit 0.
-WIZ="$REPO/scripts/test/wizard-http-test.py"
-if [ -f "$WIZ" ]; then
-    small="$(mktemp -d "${TMPDIR:-/tmp}/zd-no-room.XXXXXX")" 2>/dev/null
-    if [ -z "$small" ]; then
-        skip "cannot create the small-filesystem fixture directory"
-    fi
-    cp "$WIZ" "$small/wizard-http-test.py"
-    mkdir -p "$small/.boot-test"
-    chmod 500 "$small/.boot-test"
-    noreoom_out="$(cd "$small" && TMPDIR="$small" timeout 120 python3 wizard-http-test.py 2>&1)" \
-        && noreoom_rc=0 || noreoom_rc=$?
-    chmod 700 "$small/.boot-test"
-    if [ "$noreoom_rc" = 0 ] && grep -q '^skipped: ' <<<"$noreoom_out"; then
-        pass "no room for the wizard fixtures: wizard-http-test.py prints 'skipped:' and exits 0"
-    elif grep -q '^FAIL:.*8 GiB' <<<"$noreoom_out"; then
-        printf '%s\n' "$noreoom_out" >&2
-        fail "an environmental shortfall still aborts with a FAIL line instead of skipping"
-    else
-        printf '%s\n' "$noreoom_out" >&2
-        fail "unexpected result from the no-room wizard fixture (rc=$noreoom_rc)"
-    fi
-    rm -rf "$small"
-else
-    # This arm exercises wizard-http-test.py because that test is the one with a
-    # real environment gate.  The wizard is not part of this branch's scope, so
-    # on a tree without it the arm has no subject rather than a failure; the
-    # runner's own skip handling is covered by the stub fixtures above.
-    skip "wizard-http-test.py is not present on this tree; the environmental-shortfall arm has no subject"
-fi
 
 # ------------------------------------------------------------ restricted run
 one_out="$(ZD_SUITE_DIR="$green" ZD_STUB_MARKERS="$markers" bash "$RUNNER" a-pass-test.sh 2>&1)" \

@@ -48,22 +48,11 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
 TARGET="/etc/init.d/S46zd_bmc_watchdog"
-
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
-
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
-
-rm -rf "$WORK"; mkdir -p "$WORK"
 
 cat > "$WORK/S46zd_bmc_watchdog" <<'ZD_BMC_WATCHDOG'
 #!/bin/sh
@@ -202,48 +191,19 @@ esac
 ZD_BMC_WATCHDOG
 chmod 755 "$WORK/S46zd_bmc_watchdog"
 
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
-
-patched_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     say "[$name] installing $TARGET"
     write_local "$IMG" "$TARGET" "$WORK/S46zd_bmc_watchdog" 0755
+    PATCH_APPLIED=1
+}
 
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-    read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$TARGET")"
-    [ "$t" = "regular" ] || { echo "FAIL $name: $TARGET missing" >&2; exit 1; }
+verify() { # <name> <img>: the root as re-read from the disk
+    local name="$1"
+    read -r t _ _ _ <<< "$(fs_stat_meta "$2" "$TARGET")"
+    [ "$t" = "regular" ] || { echo "FAIL $name: $TARGET missing" >&2; return 1; }
     echo "OK   $name: $TARGET installed"
-done
+    return 0
+}
 
-say "done — BMC watchdog feeder installed in $QCOW"
+patch_main apply verify

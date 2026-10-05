@@ -3,12 +3,11 @@
 # scripts/container/zd1200-guest-address — the guest's current address.
 #
 # It lives beside the entrypoint because that is the path the entrypoint
-# computes for it ("$work_dir/zd1200-guest-address", entrypoint.sh:37) in every
-# flow: the Docker image, the Proxmox LXC container and the mkosi VM all copy
-# scripts/container/.  It is not Proxmox-specific.  The historical path
-# scripts/container/proxmox/zd1200-guest-address is a symlink to this file,
-# because the LXC/VM configuration names it (mkosi.extra/etc/zd1200.conf,
-# zd1200-ct-bootstrap.sh) and the Docker image excludes proxmox/.
+# computes for it ("$work_dir/zd1200-guest-address") in every flow: the Docker
+# image and the Proxmox LXC container both carry scripts/container/.  It is not
+# Proxmox-specific.  scripts/container/proxmox/zd1200-guest-address is a
+# symlink to this file, because zd1200-ct-bootstrap.sh installs it from that
+# path and the Docker image excludes proxmox/.
 #
 # The guest is the authority on its own lease: it asked the LAN's DHCP server for
 # it, so it is asked here over the container control channel (ttyS1, the same
@@ -24,12 +23,14 @@
 #
 # Options:
 #   --ask         ask the guest now even if a cached value exists
-#   --probe       ask for the address AND whether the guest's management service
-#                 is bound, as "ZD-GUEST-IP=<addr>" / "ZD-SERVICE-443=<state>"
-#                 (state is "listening" or "-").  Used by the healthcheck: the
-#                 container cannot probe the guest over IP once the guest's
-#                 address is held locally for display, so the guest is asked
-#                 directly over the control channel instead.
+#   --probe       ask the guest now (never the cache, never a pinned address)
+#                 for the address AND whether its management service is bound,
+#                 as "ZD-GUEST-IP=<addr>" / "ZD-SERVICE-443=<state>"
+#                 (state is "listening" or "-").  Used by the healthcheck:
+#                 once the guest's address is held locally for display, an IP
+#                 probe from the container would test the container's own
+#                 stack, so the guest is asked over the control channel
+#                 instead.
 #   --timeout SEC budget for the guest's answer (default 10)
 #   --file PATH   cache file (default $ZD_GUEST_IP_FILE)
 #   --sock PATH   control socket (default $ZD_CONTROL_SOCK)
@@ -56,7 +57,7 @@ while [ $# -gt 0 ]; do
         --diag) DIAG=1; shift ;;
         --file) LEASE_FILE="${2:?}"; shift 2 ;;
         --sock) CONTROL_SOCK="${2:?}"; shift 2 ;;
-        -h|--help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -103,12 +104,14 @@ PYEOF
     exit 0
 fi
 
-# An operator-pinned address wins, as does a cached answer.
-if [ -n "${ZD_GUEST_IP:-}" ]; then
+# An operator-pinned address wins, as does a cached answer -- except for
+# --probe, which exists to find out whether the guest answers NOW: a pinned or
+# cached address there would make every health verdict "healthy" for ever.
+if [ "$PROBE" = 0 ] && [ -n "${ZD_GUEST_IP:-}" ]; then
     emit "$ZD_GUEST_IP"
     exit 0
 fi
-if [ "$ASK" = 0 ] && [ -r "$LEASE_FILE" ]; then
+if [ "$PROBE" = 0 ] && [ "$ASK" = 0 ] && [ -r "$LEASE_FILE" ]; then
     cached="$(head -n1 "$LEASE_FILE" 2>/dev/null | tr -d ' \r\n')"
     case "$cached" in
         ""|*[!0-9.]*) : ;;
@@ -162,11 +165,14 @@ PY
 # on the serial port; each is its own query on its own connection.
 if [ "$PROBE" = 1 ]; then
     addr="$(query_guest address ZD-GUEST-IP= || true)"
+    # A guest that did not give its address is not asked a second question: the
+    # caller's verdict is already "silent", and the second wait would double it.
+    [ -n "$addr" ] || exit 1
+    emit "$addr" >/dev/null || true
     svc="$(query_guest ready ZD-SERVICE-443= || true)"
-    [ -n "$addr" ] && printf 'ZD-GUEST-IP=%s\n' "$addr"
+    printf 'ZD-GUEST-IP=%s\n' "$addr"
     [ -n "$svc" ] && printf 'ZD-SERVICE-443=%s\n' "$svc"
-    [ -n "$addr" ] && exit 0
-    exit 1
+    exit 0
 fi
 
 reply="$(query_guest address ZD-GUEST-IP= || true)"

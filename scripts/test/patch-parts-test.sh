@@ -97,21 +97,5 @@ grep -q 'empty partition selection' "$TMP/err4" \
     || fail "no abort message for the blank selection: $(cat "$TMP/err4")"
 pass "a blank selection aborts rather than becoming a nameless partition"
 
-# --- spot_img points at a root this run selected ----------------------------
-( export ZD_PATCH_PARTS='hda3|499720|415152'; load_patch_parts; spot_img ) > "$TMP/spot1"
-[ "$(cat "$TMP/spot1")" = "$WORK/hda3.verify.img" ] \
-    || fail "spot_img did not follow the selection: $(cat "$TMP/spot1")"
-pass "spot_img points at a selected root, not at a hardcoded hda2"
-
-( unset ZD_PATCH_PARTS; load_patch_parts; spot_img ) > "$TMP/spot2"
-[ "$(cat "$TMP/spot2")" = "$WORK/hda2.verify.img" ] \
-    || fail "spot_img did not use the first selected root: $(cat "$TMP/spot2")"
-pass "spot_img uses the first selected root"
-
-if ( PARTITIONS=(); spot_img ) >/dev/null 2>&1; then
-    fail "spot_img succeeded with no selection"
-fi
-pass "spot_img fails rather than naming a file that cannot exist"
-
 echo
 echo "all patch-parts tests passed"

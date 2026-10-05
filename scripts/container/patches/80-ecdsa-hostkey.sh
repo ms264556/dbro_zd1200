@@ -25,11 +25,9 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
 INIT_TARGET="/etc/init.d/dropbear"
 INIT_BACKUP="/etc/init.d/dropbear.vendor"
@@ -37,19 +35,11 @@ KEYGEN_TARGET="/etc/init.d/S59zd_ecdsa_hostkey"
 ECDSA_KEY="/etc/airespider/dropbear/dropbear_host_ecdsa_key"
 RSA_REF="-r /etc/airespider/dropbear/dropbear_host_rsa_key"
 
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
-
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
-
 ecdsa_enabled=1
 case "${ZD_ECDSA_SSH:-1}" in
     0|false|no|off) ecdsa_enabled=0 ;;
 esac
 
-rm -rf "$WORK"; mkdir -p "$WORK"
 if [ "$ecdsa_enabled" = 1 ]; then
     say "ECDSA host key: ENABLED"
 else
@@ -133,18 +123,8 @@ revert_ecdsa() {
     remove_path "$img" "$KEYGEN_TARGET"
 }
 
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
-
-patched_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     if [ "$ecdsa_enabled" = 1 ]; then
         say "[$name] adding the ECDSA host key"
         install_ecdsa "$WORK/$name.img"
@@ -152,48 +132,25 @@ for part in "${PARTITIONS[@]}"; do
         say "[$name] reverting the ECDSA host key"
         revert_ecdsa "$WORK/$name.img"
     fi
+    PATCH_APPLIED=1
+}
 
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
+verify() { # <name> <img>: the root as re-read from the disk
+    local name="$1"
     if [ "$ecdsa_enabled" = 1 ]; then
-        read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$KEYGEN_TARGET")"
-        [ "$t" = "regular" ] || { echo "FAIL $name: $KEYGEN_TARGET missing" >&2; exit 1; }
-        debugfs -R "dump $INIT_TARGET $WORK/init.check" "$WORK/$name.verify.img" >/dev/null 2>&1
+        read -r t _ _ _ <<< "$(fs_stat_meta "$2" "$KEYGEN_TARGET")"
+        [ "$t" = "regular" ] || { echo "FAIL $name: $KEYGEN_TARGET missing" >&2; return 1; }
+        debugfs -R "dump $INIT_TARGET $WORK/init.check" "$2" >/dev/null 2>&1
         if grep -q -- "$ECDSA_KEY" "$WORK/init.check"; then
             echo "OK   $name: $INIT_TARGET passes the ECDSA host key"
         else
             echo "FAIL $name: $INIT_TARGET does not reference the ECDSA host key" >&2
-            exit 1
+            return 1
         fi
     else
         echo "OK   $name: ECDSA host key reverted"
     fi
-done
+    return 0
+}
 
-if [ "$ecdsa_enabled" = 1 ]; then
-    say "done — ECDSA host key installed in $QCOW"
-else
-    say "done — ECDSA host key reverted in $QCOW"
-fi
+patch_main apply verify

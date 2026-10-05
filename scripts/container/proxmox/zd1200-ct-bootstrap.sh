@@ -13,8 +13,8 @@
 #   * /dev/kvm   (passed through by the installer when the host has it) — the
 #                guest boots in ~1-2 minutes with KVM, minutes without;
 #   * /dev/net/tun (passed through by the installer) — QEMU's tap device;
-#   * a bridge with the container's eth0 as a port, so the guest's tap is an
-#     ordinary L2 neighbour (the Proxmox host can reach it; macvtap cannot).
+#   * a bridge for the guest's tap (the uplink is cross-connected to it, not a
+#     port of it), so the guest is an L2 neighbour the Proxmox host can reach.
 #
 # Design: the container is the "runtime image".  Everything host-only stays on
 # the host: the PVE host never builds or patches guest images.  All the vendor
@@ -66,6 +66,7 @@
 #   -h | --help
 #
 # Every step is skipped when its output already exists, so a re-run is cheap.
+
 set -euo pipefail
 
 REPO_DIR="${CT_REPO_DIR:-/opt/zd1200}"
@@ -143,7 +144,7 @@ while [ $# -gt 0 ]; do
         --skip-image)           DO_IMAGE=0; shift ;;
         --skip-disks)           DO_DISKS=0; shift ;;
         --reconfigure)          RECONFIGURE=1; shift ;;
-        -h|--help)              sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)              sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -257,8 +258,8 @@ fi
 log "linking the runtime layout"
 ln -sfn "$STATE_DIR/image" "$CC/image"
 ln -sfn "$REPO_DIR/packages" "$CC/packages"
-# Links left by the pre-packages/ layout (analytics/, bl7/, dropbear/ at the repo
-# root) would now dangle; drop them so only one payload location exists.
+# Drop dangling links to payload directories at the old repo-root location
+# (analytics/, bl7/, dropbear/) so only one payload location exists.
 for legacy in bl7 analytics dropbear; do
     [ -L "$CC/$legacy" ] && rm -f "$CC/$legacy"
 done
@@ -383,6 +384,12 @@ if [ "$DO_IMAGE" = 1 ] && [ ! -f "$IMAGE_DIR/rootfs.ext2" ]; then
     prepare_args=("$SOURCE")
     [ -n "$WRITABLE_FROM" ] && prepare_args+=(--writable-from "$WRITABLE_FROM")
     [ -n "$WRITABLE_PARTITION" ] && prepare_args+=(--writable-partition "$WRITABLE_PARTITION")
+    # The same preparation the Docker installer runs with --backup: it checks the
+    # file is a configuration backup and that its release matches the firmware's,
+    # and fails here, naming the firmware to pass.  Staged only by 4b below, a
+    # backup of another release would install "successfully" and the guest would
+    # reject it at first boot and keep the factory configuration.
+    [ -n "$BACKUP" ] && [ -f "$BACKUP" ] && prepare_args+=(--backup "$BACKUP")
     # sys_* temp files must not land in the image dir: the script replaces its
     # output directory's contents.  TMPDIR under $STATE_DIR keeps the extraction
     # staging on the same filesystem (a rename-free copy, and enough room).
@@ -485,10 +492,10 @@ ZD_MAC1="${MAC:-00:0c:e6:12:00:01}"
 ZD_MAC2="${MAC2:-}"
 # dump_board_serial <dump-boarddata>: the board serial a card dump carries, or
 # nothing.  A card dump's board record is written to $IMAGE_DIR/dump-boarddata by
-# step 3 (prepare-vendor-image.sh), and the normal path in entrypoint.sh already
-# reuses it so a restored appliance keeps the identity the dead unit had.  An LXC
-# install that did not would restore the same unit under a different serial --
-# visible to Ruckus licensing and support.  The MAC still comes from this
+# step 4 (prepare-vendor-image.sh), and entrypoint.sh reuses it so a restored
+# appliance keeps the identity the dead unit had; without the same here, an LXC
+# install would restore the unit under a different serial -- visible to Ruckus
+# licensing and support.  The MAC still comes from this
 # instance's seed, so a clone does not collide on the LAN.  No record, or a
 # record without a serial, is not an error: the caller's own serial stands.
 dump_board_serial() {
@@ -544,17 +551,15 @@ fi
     printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 || echo 1)"
     # The entrypoint's high-CPU guard: QEMU sustained above 95% CPU means the
     # guest is spinning, and a spinning guest is exactly how the appliance wedges.
-    # Both flows ship 24 samples -- the Docker flow sets the same value in
-    # docker/docker-compose.yml, and the entrypoint's own fallback of 4 is used by
-    # neither flow.  Keep it on, because a legitimate boot and the first-boot key
-    # generation are bursty.  24 samples = 120s of continuous saturation before
+    # Both flows ship 24 samples (docker/docker-compose.yml sets the same value),
+    # not the entrypoint's smaller fallback, because a legitimate boot and the
+    # first-boot key generation are bursty.  24 samples = 120s of continuous saturation before
     # QEMU is stopped; systemd then restarts the stack, which reboots the guest.
     # Set ZD_CPU_GUARD=0 to disable.
     printf 'ZD_CPU_GUARD=%s\n' "${ZD_CPU_GUARD:-24}"
-    # Auto-reboot the guest if it stops answering.  The appliance this replaced
-    # had its guest OS wedge solid (QEMU alive, guest silent, both LAN addresses
-    # dark) and nothing noticed for hours; this turns that into a self-healing
-    # event.  Set ZD_GUEST_WATCHDOG=0 to disable.
+    # Auto-reboot the guest if it stops answering.  A wedged guest (QEMU alive,
+    # guest silent, both LAN addresses dark) is otherwise invisible; this turns it
+    # into a self-healing event.  Set ZD_GUEST_WATCHDOG=0 to disable.
     printf 'ZD_GUEST_WATCHDOG=%s\n' "${ZD_GUEST_WATCHDOG:-1}"
     printf 'ZD_GUEST_WATCHDOG_FAILURES=%s\n' "${ZD_GUEST_WATCHDOG_FAILURES:-5}"
     # This flow supervises the watchdog as zd1200-watchdog.service, so the
@@ -565,9 +570,9 @@ fi
     printf 'ZD_GUEST_WATCHDOG_CHILD=0\n'
     printf 'ZD_CONTAINER_MAC=%s\n' "$CONTAINER_MAC"
     printf 'ZD_BOARDDATA_FROM_MAC=1\n'
-    # Informational (the topology is now always cross-connected): records that
-    # MAC1 is the container's own uplink MAC, which is the point of the
-    # cross-connect.
+    # Tells launch-vm.sh that the guest wears the container's own uplink MAC, so
+    # it follows the live MAC and re-asserts it in the board data.  The topology
+    # is cross-connected either way.
     printf 'ZD_SHARE_UPLINK_MAC=%s\n' "$SHARE_MAC"
     printf 'ZD_SERIAL=%s\n' "$ZD_SERIAL"
     printf 'ZD_MAC1=%s\n' "$ZD_MAC1"
@@ -655,11 +660,10 @@ ExecStart=/usr/local/sbin/zd1200-ct-net
 WantedBy=multi-user.target
 UNIT
 
-# Live health, not a log marker.  The old check grepped the serial log for the
-# guest's READY line, which stays there forever: once the guest wedged (QEMU
-# alive, guest not answering, both interfaces dark) the container still reported
-# healthy.  Probe the running appliance instead -- reachability of its own
-# address at L2, its web port, and a fresh DHCP lease for its MAC.
+# Live health, not a log marker: the guest's READY line stays in the serial log
+# forever, so a wedged guest (QEMU alive, guest not answering, both interfaces
+# dark) would still read healthy.  The check asks the running guest over the
+# serial control channel (see zd1200-guest-healthcheck).
 cat > /etc/systemd/system/zd1200-healthcheck.service <<'UNIT'
 [Unit]
 Description=Probe the running ZD1200 guest

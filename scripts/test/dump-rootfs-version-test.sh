@@ -25,8 +25,13 @@ VERSION="$BASE/dump-rootfs-version.sh"
 # The fixtures are real (if small) filesystem images and the helper copies a
 # partition out of the dump, so they go on the working filesystem next to the
 # repo rather than under TMPDIR: /tmp is a tmpfs on many hosts and this test
-# would fill it.
-TMP="$(mktemp -d "${ZD_TEST_TMPDIR:-${HOME:-/tmp}}/.zd-rootver-test.XXXXXX")"
+# would fill it.  No socket is created here, so a long TMPDIR is harmless; when
+# HOME is unset or not writable (a sandbox, a bare CI user) fall back to TMPDIR
+# rather than failing on the mktemp.
+fixture_base="${ZD_TEST_TMPDIR:-${HOME:-}}"
+[ -n "$fixture_base" ] && [ -d "$fixture_base" ] && [ -w "$fixture_base" ] \
+    || fixture_base="${TMPDIR:-/tmp}"
+TMP="$(mktemp -d "$fixture_base/.zd-rootver-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 for tool in mke2fs debugfs python3; do

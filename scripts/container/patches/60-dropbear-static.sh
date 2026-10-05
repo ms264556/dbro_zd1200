@@ -33,20 +33,13 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
-DROPBEAR_DIR="${ZD_DROPBEAR_DIR:-$(dirname "$BASE")/packages/dropbear}"
+DROPBEAR_DIR="${DROPBEAR_DIR:-$(dirname "$BASE")/packages/dropbear}"
 INIT_SRC="$DROPBEAR_DIR/zd1200-root-ssh-init.sh"
 AUTHORIZED_KEYS="${ZD_ROOT_SSH_AUTHORIZED_KEYS:-/opt/zd1200/dropbear-provision/authorized_keys}"
-
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
 
 PAYLOAD_BIN=(dropbear dropbearkey dropbearconvert sftp-server)
 
@@ -76,9 +69,6 @@ if [ "$enabled" = 1 ]; then
     esac
 fi
 
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
-
-rm -rf "$WORK"; mkdir -p "$WORK"
 if [ "$enabled" = 1 ]; then
     printf '%s\n' "$key_line" > "$WORK/authorized_keys"
     chmod 600 "$WORK/authorized_keys"
@@ -89,9 +79,6 @@ if [ "$enabled" = 1 ]; then
 else
     say "static dropbear replacement: disabled (vendor dropbear left/restored)"
 fi
-
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
 
 install_payload() {
     local img="$1"
@@ -162,15 +149,8 @@ revert_payload() {
     remove_path "$img" /etc/init.d/S61zd_root_ssh
 }
 
-patched_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     if [ "$enabled" = 1 ]; then
         say "[$name] installing the static dropbear replacement"
         install_payload "$WORK/$name.img"
@@ -178,52 +158,29 @@ for part in "${PARTITIONS[@]}"; do
         say "[$name] reverting any previous static dropbear install"
         revert_payload "$WORK/$name.img"
     fi
+    PATCH_APPLIED=1
+}
 
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
+verify() { # <name> <img>: the root as re-read from the disk
+    local name="$1"
     if [ "$enabled" = 1 ]; then
         for b in dropbear dropbearkey dropbearconvert sftp-server; do
             case "$b" in
                 dropbear|sftp-server) p="/usr/sbin/$b" ;;
                 *) p="/usr/bin/$b" ;;
             esac
-            read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$p")"
-            [ "$t" = "regular" ] || { echo "FAIL $name: $p is not a regular file" >&2; exit 1; }
+            read -r t _ _ _ <<< "$(fs_stat_meta "$2" "$p")"
+            [ "$t" = "regular" ] || { echo "FAIL $name: $p is not a regular file" >&2; return 1; }
         done
-        read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" /etc/init.d/S61zd_root_ssh)"
-        [ "$t" = "regular" ] || { echo "FAIL $name: S61zd_root_ssh missing" >&2; exit 1; }
+        read -r t _ _ _ <<< "$(fs_stat_meta "$2" /etc/init.d/S61zd_root_ssh)"
+        [ "$t" = "regular" ] || { echo "FAIL $name: S61zd_root_ssh missing" >&2; return 1; }
         echo "OK   $name: static dropbear + 2222 listener installed"
     else
-        read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" /usr/sbin/dropbear)"
-        [ "$t" = "regular" ] || { echo "FAIL $name: vendor /usr/sbin/dropbear missing" >&2; exit 1; }
+        read -r t _ _ _ <<< "$(fs_stat_meta "$2" /usr/sbin/dropbear)"
+        [ "$t" = "regular" ] || { echo "FAIL $name: vendor /usr/sbin/dropbear missing" >&2; return 1; }
         echo "OK   $name: vendor dropbear in place"
     fi
-done
+    return 0
+}
 
-if [ "$enabled" = 1 ]; then
-    say "done — static dropbear + root SSH on 2222 installed in $QCOW"
-else
-    say "done — static dropbear reverted in $QCOW"
-fi
+patch_main apply verify

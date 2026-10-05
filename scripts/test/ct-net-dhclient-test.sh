@@ -3,62 +3,49 @@
 # ct-net-dhclient-test.sh — the DHCP-client stop in zd1200-ct-net.sh must be
 # scoped to the interface it is about, and must never match a command line.
 #
-# Why this exists: at abc0b3a, scripts/container/proxmox/zd1200-ct-net.sh:230
-# ran
-#     pkill -f "dhclient.*$HOST_IF"
-# in the ZD_CT_DHCP branch.  `-f` matches the full command line of EVERY process
-# on the host, so any unrelated process whose arguments happened to contain that
-# text -- a shell running this very script with --host-if among its arguments,
-# for one -- was SIGTERM'd too.  That is the pkill -f hazard this project forbids
-# (HANDOFF.md 8.8 item 11, raised by session 8's independent review of a
-# different fix).  The kill itself is there for a real reason: Proxmox's DHCP
-# client keeps its lease keyed on the interface and re-adds the address to the
-# uplink after the lines below it move the address onto the bridge, so the client
-# that holds $HOST_IF has to be stopped.
+# Why this exists: the stop used to be `pkill -f "dhclient.*$HOST_IF"` in the
+# ZD_CT_DHCP branch.  `-f` matches the full command line of EVERY process on the
+# host, so any unrelated process whose arguments happened to contain that text --
+# a shell running this very script with --host-if among its arguments, for one --
+# was SIGTERM'd too.  The kill itself is needed: Proxmox's DHCP client keeps its
+# lease keyed on the interface and re-adds the address to the uplink after the
+# lines below it move the address onto the bridge, so the client that holds
+# $HOST_IF has to be stopped.  The block now walks /proc, requires the process's
+# own executable to be dhclient AND $HOST_IF to be one of ITS OWN argv elements,
+# and kills those PIDs by number.  No pattern is matched anywhere.
 #
-# The fix keeps that kill and scopes it: walk /proc, require the process's own
-# executable to be dhclient AND $HOST_IF to be one of ITS OWN argv elements, and
-# kill those PIDs by number.  No pattern is matched anywhere.  This test is the
-# before/after for exactly that.
-#
-# HOW FAR THIS DRIVES THE REAL SCRIPT.  zd1200-ct-net.sh manipulates tc,
-# addresses and bridges on a live host, so the script as a whole is not run here.
-# What is run is the ZD_CT_DHCP block itself, extracted verbatim from a staged
-# revision (abc0b3a's from git, HEAD's from the working tree), under the same
-# `set -euo pipefail` the script sets at :30, with a stub `dhclient` first on
-# PATH (the guard at :228) and three decoy processes up:
-#     a  a process whose command line merely says "dhclient $IFACE" while its own
-#        executable is sleep -- a look-alike, not really dhclient;
+# How far this drives the real script: zd1200-ct-net.sh manipulates tc, addresses
+# and bridges on a live host, so the script as a whole is not run here.  What is
+# run is the ZD_CT_DHCP block itself, extracted verbatim from the working tree,
+# under the same `set -euo pipefail` the script sets, with a stub `dhclient` first
+# on PATH (the block's `command -v dhclient` guard) and four decoy processes up:
+#     a  a look-alike by command line: its argv0 says "dhclient $IFACE" but its
+#        executable is sleep (the argv check spares it);
 #     b  a real-shaped client: its own executable is dhclient and $IFACE is one
 #        of its own arguments (the argv is the Proxmox shape, with the interface
 #        in the -pf/-lf paths as well);
-#     c  the control: the same shape, but for a DIFFERENT interface.
-# The two revisions are then required to differ exactly where the defect is: the
-# pre-fix block kills (a) and (b); the fixed block kills only (b).  Cleanup is by
-# PID; liveness is read with `ps -eo pid=,stat=` and /proc.  If the pre-fix blob
-# is not in this clone the discriminating half prints `skipped:` and the fixed
-# half is still measured, as in boot-test-runscope-test.sh.
+#     c  the control: the same shape, but for a DIFFERENT interface;
+#     d  a look-alike by argv: $IFACE is one of its own arguments, but its
+#        executable is bash, not dhclient (only the executable check spares it).
+# Only b may be stopped.  Cleanup is by PID; liveness is read with
+# `ps -eo pid=,stat=` and /proc.
 #
-# SAFETY, because the pre-fix half is a host-global match by construction:
+# SAFETY:
 #   * The interface name is a fresh synthetic token per run (zddhcp<RANDOM><pid>
 #     style), never eth0 or the real uplink, so the only command lines on the
 #     host that can match it are this test's own decoys.  Deliberate.
 #   * The harness's own shell never carries the pattern in its argv: the block
-#     under test is written to a file and run as `bash <file>`, so the pattern
-#     exists only inside that file.  Before the pre-fix block is allowed to run,
-#     assert_only_decoys() scans `ps -eo pid=,args=` with the same regex and
-#     REFUSES to run it unless the only matching processes are decoys a and b.
-#     (setsid does not help here: pkill signals each PID it matched from its own
-#     /proc scan, so a process group bounds nothing.  The gate is the bound.)
+#     under test is written to a file and run as `bash <file>`.  Before it runs,
+#     assert_only_decoys() scans `ps -eo pid=,args=` with the old pkill regex and
+#     REFUSES to run unless the only matching processes are this test's decoys,
+#     so a regression to a host-global match could never signal a bystander.
 #   * A TERM trap records any signal the harness itself receives; the test fails
 #     if that file is not empty.
-#   * No pgrep -f / pkill -f is run by this test.  The only pattern match is the
-#     one inside the staged pre-fix code.
+#   * No pgrep -f / pkill -f is run by this test.
 #   * Decoy b is a COPY OF BASH named dhclient, not the dhclient program: it runs
 #     `read` from a FIFO and can touch no network state.  Its own executable
-#     being dhclient is what makes it the post-fix target; nothing real is
-#     signalled, and no real dhclient (which is not installed on this host) is
-#     ever executed -- the stub on PATH answers `dhclient -r`.
+#     being dhclient is what makes it the target; nothing real is signalled, and
+#     no real dhclient is ever executed -- the stub on PATH answers `dhclient -r`.
 #
 # Runs unprivileged: everything it signals is a process it started itself.
 #
@@ -67,9 +54,6 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO/scripts/container/proxmox/zd1200-ct-net.sh"
-# The revision whose block carries the defect; the whole point of this harness is
-# that it still exhibits it.
-PRE_FIX_REV="abc0b3a"
 
 pass() { printf 'ok   %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -154,7 +138,7 @@ trap cleanup EXIT
 
 # ------------------------------------------------------------------ the block
 # block_of <script file>: print the ZD_CT_DHCP block, from its `if` line to the
-# first column-0 `fi`.  The same anchor is used on both revisions.
+# first column-0 `fi`.
 block_of() {
     awk '
         $0 == "if [ -n \"${ZD_CT_DHCP:-}\" ]; then" { inblock = 1 }
@@ -163,9 +147,9 @@ block_of() {
     ' "$1"
 }
 
-# stage_block <script file> <dir>: write that revision's block, with the same
-# set -euo pipefail the script itself runs under (zd1200-ct-net.sh:30), to
-# <dir>/block.sh so that the pattern never reaches any invoking command line.
+# stage_block <script file> <dir>: write the block, with the same set -euo
+# pipefail the script itself runs under, to <dir>/block.sh so that the pattern
+# never reaches any invoking command line.
 stage_block() {
     local src="$1" dir="$2"
     mkdir -p "$dir" || fail "cannot create $dir"
@@ -194,6 +178,10 @@ launch_decoys() {  # <dir>
         -lf "/var/lib/dhcp/dhclient.$OTHER_IF.leases" -I \
         -df "/var/lib/dhcp/dhclient6.$OTHER_IF.leases" "$OTHER_IF" &
     p=$!; printf '%s\n' "$p" > "$dir/pid-c"; DECOY_PIDS="$DECOY_PIDS $p"
+    # (d) the interface is one of its own arguments, but the executable is bash:
+    #     only the executable check keeps the block's hands off it.
+    "$BASH_BIN" -c "read _ < $FIFO" decoy-d "$IFACE" &
+    p=$!; printf '%s\n' "$p" > "$dir/pid-d"; DECOY_PIDS="$DECOY_PIDS $p"
 }
 
 # await_shape <pid> <comm> <argv element>: bounded wait until that pid has run
@@ -212,14 +200,14 @@ await_shape() {
     return 1
 }
 
-# assert_only_decoys <dir> <label>: the hardening gate.  Same regex pkill -f
-# uses (ERE over the space-joined command line), over `ps -eo`, and the pre-fix
-# block is not allowed to run unless the ONLY matching processes are decoys a and
-# b -- the two it is meant to signal.  Anything else, including this harness, and
-# we stop before running a host-global match.
+# assert_only_decoys <dir> <label>: the hardening gate.  Same regex the old
+# pkill -f used (ERE over the space-joined command line), over `ps -eo`: the block
+# is not allowed to run unless the ONLY matching processes are this test's own
+# decoys.  Anything else, including this harness, and we stop before running
+# anything that could be a host-global match.
 assert_only_decoys() {
     local dir="$1" label="$2" want pid args
-    want=" $(tr '\n' ' ' < "$dir/pid-a") $(tr '\n' ' ' < "$dir/pid-b") "   # space-delimited
+    want=" $(cat "$dir"/pid-? | tr '\n' ' ') "   # space-delimited
     : > "$dir/matchers.txt"
     : > "$dir/matchers-extra.txt"
     while read -r pid args; do
@@ -243,8 +231,8 @@ run_block() {
     return $?
 }
 
-# measure <dir> <label>: three decoys, shaped and gated, then that revision's
-# block.  Leaves state-{a,b,c} (alive|killed), rc, block.out, stub.log and the
+# measure <dir> <label>: four decoys, shaped and gated, then the
+# block.  Leaves state-{a,b,c,d} (alive|killed), rc, block.out, stub.log and the
 # observed exe/cmdline of each decoy in <dir>.
 measure() {
     local dir="$1" label="$2" c p
@@ -256,7 +244,9 @@ measure() {
         || fail "$label: decoy b never came up as the dhclient for $IFACE (harness problem)"
     await_shape "$(cat "$dir/pid-c")" dhclient "$OTHER_IF" \
         || fail "$label: decoy c never came up as the dhclient for $OTHER_IF (harness problem)"
-    for c in a b c; do
+    await_shape "$(cat "$dir/pid-d")" bash "$IFACE" \
+        || fail "$label: decoy d never came up as a bash with $IFACE among its arguments (harness problem)"
+    for c in a b c d; do
         p="$(cat "$dir/pid-$c")"
         readlink "/proc/$p/exe" 2>/dev/null > "$dir/exe-$c" || printf '?\n' > "$dir/exe-$c"
         tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null > "$dir/cmd-$c" || true
@@ -268,7 +258,7 @@ measure() {
         "$label" "$(wc -l < "$dir/matchers.txt")" "$IFACE"
     run_block "$dir" "$STUB_DIR:$PATH"
     printf '%s\n' "$?" > "$dir/rc"
-    for c in a b c; do
+    for c in a b c d; do
         if alive "$(cat "$dir/pid-$c")"; then printf 'alive\n' > "$dir/state-$c"
         else printf 'killed\n' > "$dir/state-$c"; fi
     done
@@ -288,44 +278,6 @@ grep -qF 'ip addr flush dev "$HOST_IF"' "$SCRIPT" || fail "the address move that
 grep -qF 'kill -TERM' "$FIXED/block.body" || fail "the fixed block does not kill anything by PID"
 pass "the fixed block kills by PID and keeps the guard, the dhclient -r release and the address move"
 
-PREFIX="$TMP/prefix"
-mkdir -p "$PREFIX" || fail "cannot create $PREFIX"
-HAVE_PRE_FIX=0
-if command -v git >/dev/null 2>&1 \
-        && git -C "$REPO" cat-file -e "$PRE_FIX_REV:scripts/container/proxmox/zd1200-ct-net.sh" 2>/dev/null; then
-    git -C "$REPO" show "$PRE_FIX_REV:scripts/container/proxmox/zd1200-ct-net.sh" \
-        > "$PREFIX/script.sh" 2>/dev/null || true
-fi
-if [ -s "$PREFIX/script.sh" ]; then
-    stage_block "$PREFIX/script.sh" "$PREFIX"
-    grep -q 'pkill -f' "$PREFIX/block.body" \
-        || fail "$PRE_FIX_REV: the extracted block has no pkill -f; the harness is not measuring the defect"
-    HAVE_PRE_FIX=1
-    printf '     measured pre-fix line: %s:%s\n' "$PRE_FIX_REV" \
-        "$(grep -n 'pkill -f' "$PREFIX/script.sh" | cut -d: -f1)"
-    sed -e 's/^/     /' "$PREFIX/block.body"
-fi
-
-# ------------------------------------------------------ the baseline, first
-# The pre-fix revision has to exhibit the defect, so it is measured before the
-# fixed one and with the gate above in place.
-if [ "$HAVE_PRE_FIX" = 1 ]; then
-    measure "$PREFIX" "$PRE_FIX_REV"
-    [ "$(cat "$PREFIX/rc")" = 0 ] \
-        || fail "$PRE_FIX_REV block exited $(cat "$PREFIX/rc"), not 0"
-    [ ! -s "$PREFIX/block.out" ] \
-        || fail "$PRE_FIX_REV block printed output: $(cat "$PREFIX/block.out")"
-    grep -qF -- "-r $IFACE" "$PREFIX/stub.log" \
-        || fail "$PRE_FIX_REV: the stubbed dhclient -r was never called; the harness did not drive the branch"
-    [ "$(cat "$PREFIX/state-b")" = killed ] \
-        || fail "$PRE_FIX_REV: the real-shaped dhclient for $IFACE survived; the harness is not reproducing the kill"
-    [ "$(cat "$PREFIX/state-a")" = killed ] \
-        || fail "$PRE_FIX_REV: the cmdline-only look-alike survived; the harness is NOT reproducing the defect"
-    [ "$(cat "$PREFIX/state-c")" = alive ] \
-        || fail "$PRE_FIX_REV: the control dhclient for $OTHER_IF was killed"
-    pass "$PRE_FIX_REV: the host-global match kills the look-alike AND the real client, and spares the control"
-fi
-
 # ------------------------------------------------------------- the fixed one
 measure "$FIXED" "HEAD"
 [ "$(cat "$FIXED/rc")" = 0 ] || fail "the fixed block exited $(cat "$FIXED/rc"), not 0"
@@ -338,32 +290,12 @@ pass "the fixed block stops the dhclient whose own executable is dhclient and wh
 [ "$(cat "$FIXED/state-a")" = alive ] \
     || fail "the fixed block killed a process whose cmdline merely says 'dhclient $IFACE' but whose executable is not dhclient"
 pass "the fixed block leaves the cmdline-only look-alike alone"
+[ "$(cat "$FIXED/state-d")" = alive ] \
+    || fail "the fixed block killed a process that has $IFACE among its arguments but whose executable is not dhclient"
+pass "the fixed block leaves a non-dhclient executable alone even when $IFACE is one of its arguments"
 [ "$(cat "$FIXED/state-c")" = alive ] \
     || fail "the fixed block killed the dhclient for $OTHER_IF"
 pass "the fixed block leaves another interface's dhclient alone"
-
-# -------------------------------------------------------- before and after
-if [ "$HAVE_PRE_FIX" = 1 ]; then
-    word() { [ "$1" = killed ] && printf 'decoy killed' || printf 'decoy survived'; }
-    printf '     a  cmdline-only look-alike (exe %s, argv0 "dhclient %s"): before: %s; after: %s\n' \
-        "$(cat "$PREFIX/exe-a")" "$IFACE" "$(word "$(cat "$PREFIX/state-a")")" "$(word "$(cat "$FIXED/state-a")")"
-    printf '     b  dhclient for %s (exe %s, argv names it): before: %s; after: %s\n' \
-        "$IFACE" "$(cat "$PREFIX/exe-b")" "$(word "$(cat "$PREFIX/state-b")")" "$(word "$(cat "$FIXED/state-b")")"
-    printf '     c  control dhclient for %s (exe %s): before: %s; after: %s\n' \
-        "$OTHER_IF" "$(cat "$PREFIX/exe-c")" "$(word "$(cat "$PREFIX/state-c")")" "$(word "$(cat "$FIXED/state-c")")"
-    [ "$(cat "$PREFIX/state-a")" = killed ] && [ "$(cat "$FIXED/state-a")" = alive ] \
-        || fail "the harness is not discriminating: the look-alike was not killed before the fix and spared after it"
-    [ "$(cat "$PREFIX/state-b")" = killed ] && [ "$(cat "$FIXED/state-b")" = killed ] \
-        || fail "the fix dropped the kill it exists to make: the real client must die on both revisions"
-    [ "$(cat "$FIXED/state-c")" = alive ] \
-        || fail "the fix reaches another interface's client"
-    pass "before: look-alike killed, real client killed; after: look-alike survived, real client killed, control untouched"
-    pass "the harness is discriminating: $PRE_FIX_REV exhibits the defect the fixed revision removes"
-else
-    echo "skipped: $PRE_FIX_REV:scripts/container/proxmox/zd1200-ct-net.sh is not in this clone"
-    echo "         (shallow or rewritten history); the fixed block is still checked,"
-    echo "         but the harness is not shown discriminating."
-fi
 
 # ------------------------------------------------- degrading safely, on the fix
 # (d) nothing to stop at all: a silent, successful no-op.
@@ -390,7 +322,7 @@ assert_only_decoys "$GUARD" "guard case"
 run_block "$GUARD" "$MIN_DIR" || fail "the fixed block exited non-zero with no dhclient on PATH"
 [ ! -s "$GUARD/block.out" ] || fail "the fixed block printed output with no dhclient on PATH: $(cat "$GUARD/block.out")"
 [ ! -e "$GUARD/stub.log" ] || fail "a dhclient was run although none is on PATH"
-for c in a b c; do
+for c in a b c d; do
     [ "$(if alive "$(cat "$GUARD/pid-$c")"; then echo alive; else echo killed; fi)" = alive ] \
         || fail "the fixed block signalled decoy $c although no dhclient is on PATH"
 done

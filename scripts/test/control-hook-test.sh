@@ -59,6 +59,62 @@ if [ "${#leaks[@]}" -gt 0 ]; then
 fi
 pass "every ZD-* reply redirects to /dev/ttyS1 (${#writers[@]} writers checked)"
 
+# --- guest_address() follows the controller onto a management VLAN ---------
+# With a management VLAN (CLI: config > system > interface > vlan <id>) the stock
+# stack moves the controller's address from br0 to the br0.<vid> device and br0
+# keeps no IPv4, so a function that only looked at br0/uif0/eth0 answered
+# "no address": the host-side healthcheck then reported a healthy guest as not
+# responding and the Proxmox display address went stale.  A separate management
+# interface (config > system > mgmt-if) is an alias, labelled br0.<vid>:<n>, and
+# is not the controller's address.  The fixtures are `ip -4 -o addr show` lines in
+# the guest's own iproute format.
+awk '/^    guest_address\(\) \{/{copy=1} copy{print} copy && /^    \}$/{exit}' \
+    "$TMP/S98zd_container_control" | sed "s#/sys/class/net#$TMP/sysnet#g" > "$TMP/guest_address.sh"
+[ -s "$TMP/guest_address.sh" ] || fail "could not extract guest_address() from the hook"
+
+DEV_ADDR='5: br0    inet 10.222.1.129/24 brd 10.222.1.255 scope global br0'
+VLAN_DEV='9: br0.300    inet 172.31.30.53/24 brd 172.31.30.255 scope global br0.300'
+MGMT_ALIAS='10: br0.100    inet 172.31.100.10/24 brd 172.31.100.255 scope global br0.100:0'
+
+# addr_case <label> <expected> [dev=line ...]: the devices exist in sysfs, and
+# each dev=line is what `ip -4 -o addr show dev <dev>` prints for it.
+addr_case() {
+    local label="$1" want="$2" got spec
+    shift 2
+    rm -rf "$TMP/sysnet" "$TMP/ipfix"
+    mkdir -p "$TMP/sysnet" "$TMP/ipfix"
+    touch "$TMP/sysnet/br0" "$TMP/sysnet/uif0" "$TMP/sysnet/eth0"
+    for spec in "$@"; do
+        touch "$TMP/sysnet/${spec%%=*}"
+        printf '%s\n' "${spec#*=}" >> "$TMP/ipfix/${spec%%=*}"
+    done
+    got="$(
+        ip() { cat "$TMP/ipfix/${*: -1}" 2>/dev/null || true; }
+        . "$TMP/guest_address.sh"
+        guest_address || true
+    )"
+    [ "$got" = "$want" ] || fail "guest_address ($label): got '${got}', expected '${want}'"
+    pass "guest_address: $label"
+}
+
+addr_case "address on br0" 10.222.1.129 "br0=$DEV_ADDR"
+addr_case "br0's address wins over a management alias" 10.222.1.129 \
+    "br0=$DEV_ADDR" "br0.100=$MGMT_ALIAS"
+addr_case "controller on a management VLAN (br0 has no IPv4)" 172.31.30.53 \
+    "br0.300=$VLAN_DEV"
+addr_case "controller on a VLAN, management interface on another" 172.31.30.53 \
+    "br0.100=$MGMT_ALIAS" "br0.300=$VLAN_DEV"
+addr_case "the alias is skipped even when listed before the primary" 172.31.30.53 \
+    "br0.300=9: br0.300    inet 172.31.100.77/24 brd 172.31.100.255 scope global br0.300:1" \
+    "br0.300=$VLAN_DEV"
+addr_case "the label is not the last field (lifetimes follow it)" 172.31.30.53 \
+    "br0.100=10: br0.100    inet 172.31.100.10/24 brd 172.31.100.255 scope global br0.100:0 valid_lft forever preferred_lft forever" \
+    "br0.300=9: br0.300    inet 172.31.30.53/24 brd 172.31.30.255 scope global br0.300 valid_lft forever preferred_lft forever"
+addr_case "only a management alias exists" 172.31.100.10 "br0.100=$MGMT_ALIAS"
+addr_case "an alias on br0 itself is the last resort" 10.222.1.77 \
+    "br0=3: br0    inet 10.222.1.77/24 brd 10.222.1.255 scope global br0:0"
+addr_case "no address at all" ""
+
 # The specific regression: the tcp-table detail must not print to stdout.
 if grep -nE '(echo|printf).*ZD-NET-TCP' "$TMP/S98zd_container_control" | grep -v '/dev/ttyS1' >"$TMP/net"; then
     cat "$TMP/net" >&2

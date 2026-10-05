@@ -83,7 +83,7 @@ RUN mkdir -p /out \
 # ---------------------------------------------------------------------------
 # Optional: static ZD1200 dropbear replacement (public-key root SSH on 2222).
 #
-# Only built when ZD_ROOT_SSH=1 (build-container.sh --root-ssh-key), because it
+# Only built when ZD_ROOT_SSH=1 (install-zd1200-docker.sh --root-ssh-key), because it
 # downloads a ~110 MB musl.cc cross toolchain and builds zlib + dropbear +
 # OpenSSH from source.  That toolchain is a cross compiler, so these stages run
 # natively on the BUILD platform (amd64/arm64) and need no i386 container -

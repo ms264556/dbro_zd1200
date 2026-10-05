@@ -115,6 +115,15 @@ expect_err "unknown input" "is not a ZD1200 firmware" "$unknown"
 expect_err "foreign imageUSB header" "is not a ZD1200 firmware" "$foreignish"
 pass "both-inputs, two-firmwares and unrecognised inputs are refused"
 
+# An unrecognised input is refused even beside a valid one, and a path that does
+# not exist says so rather than naming the wrong kind of file.
+expect_err "missing path" "input not found" "$TMP/no-such-backup.bak"
+expect_err "typo'd backup + firmware" "input not found: $TMP/ruckus_db_typo.bak" \
+    "$TMP/ruckus_db_typo.bak" "$TMP/zd1200_10.5.1.0.282.img"
+expect_err "junk + backup + firmware" "is not a ZD1200 firmware" \
+    "$unknown" "$TMP/ruckus_db_040623.bak" "$TMP/zd1200_10.5.1.0.282.img"
+pass "an unrecognised or missing input is never silently dropped"
+
 # --- the --backup/--writable-from aliases feed the same rules ----------------
 aliased="$( { POSITIONALS=("$dump"); OPT_FIRMWARE=""; OPT_BACKUP="$TMP/ruckus_db_040623.bak"; OPT_WRITABLE=""; \
               resolve_inputs; printf 'OK %s' "$INPUT_KIND"; } 2>&1 )" || true

@@ -30,12 +30,9 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-# Work dir holds the partition scratch images, so keep it on disk-backed storage.
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
 # Passphrase helpers, newest name first.  Whichever exists on a partition is
 # patched; a release that ships only one of them simply skips the other.
@@ -45,105 +42,41 @@ TARGETS=(
 )
 SCRIPT=$'#!/bin/sh\nexit 0\n'
 
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
-
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
-
-rm -rf "$WORK"; mkdir -p "$WORK"
-
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
-
 printf '%s' "$SCRIPT" > "$WORK/helper.new"
 
-patched_any=0
-present_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
-    part_changed=0
-    for TARGET in "${TARGETS[@]}"; do
-        read -r type_old _ _ _ <<< "$(fs_stat_meta "$IMG" "$TARGET")"
+apply() { # <name> <img>
+    local name="$1" img="$2" target type_old
+    for target in "${TARGETS[@]}"; do
+        read -r type_old _ _ _ <<< "$(fs_stat_meta "$img" "$target")"
         if [ -z "$type_old" ]; then
-            echo "  - $TARGET not present on $name"
+            echo "  - $target not present on $name"
             continue
         fi
-        present_any=1
-        # Already patched?  Compare the current content to the exit-0 script.
         if [ "$type_old" = "regular" ] \
-           && fs_read "$IMG" "$TARGET" "$WORK/target.cur" \
+           && fs_read "$img" "$target" "$WORK/target.cur" \
            && cmp -s "$WORK/target.cur" "$WORK/helper.new"; then
-            echo "  $TARGET is already the exit-0 script on $name; leaving as-is"
+            echo "  $target is already the exit-0 script on $name; leaving as-is"
             continue
         fi
-
-        echo "  replacing $TARGET (was '$type_old') with an exit-0 script"
-        # Keep the vendor helper in the rollback store, then force the metadata a
-        # replacement executable needs (debugfs 'write' lands mode 0644).
-        pr_save "$IMG" "$TARGET"
-        fs_write "$IMG" "$TARGET" "$WORK/helper.new" 0755 0 0
-
-        read -r type_new mode_new _ _ <<< "$(fs_stat_meta "$IMG" "$TARGET")"
-        if [ "$type_new" != "regular" ] || [ "$mode_new" != "0755" ]; then
-            echo "  !! unexpected result on $name: type=$type_new mode=$mode_new; aborting" >&2
-            exit 1
-        fi
-        part_changed=1
+        echo "  replacing $target (was '$type_old') with an exit-0 script"
+        # Not write_local: the replacement must be a 0755 regular file whatever
+        # the vendor helper was, and write_local keeps the vendor's metadata.
+        pr_save "$img" "$target"
+        fs_write "$img" "$target" "$WORK/helper.new" 0755 0 0
+        PATCH_APPLIED=1
     done
+}
 
-    if [ "$part_changed" = 0 ]; then
-        echo "  no byte changes for $name"
-        continue
-    fi
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name (already patched on the disk?)"
-    fi
-done
-
-if [ "$present_any" = 0 ]; then
-    say "no passphrase helper (${TARGETS[*]}) found on any root partition; nothing to patch"
-    exit 0
-fi
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-    for TARGET in "${TARGETS[@]}"; do
-        read -r t m _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$TARGET")"
-        [ -z "$t" ] && continue          # helper absent in this release
-        if [ "$t" = "regular" ] && [ "$m" = "0755" ] \
-           && fs_read "$WORK/$name.verify.img" "$TARGET" "$WORK/target.final" \
-           && cmp -s "$WORK/target.final" "$WORK/helper.new"; then
-            echo "OK   $name: $TARGET is a regular exit-0 script (mode $m)"
-        else
-            echo "FAIL $name: $TARGET is not the exit-0 script after patch (type '$t' mode '$m')" >&2
-            exit 1
-        fi
+verify() { # <name> <img>: every helper present is the 0755 exit-0 script
+    local img="$2" target t m
+    for target in "${TARGETS[@]}"; do
+        read -r t m _ _ <<< "$(fs_stat_meta "$img" "$target")"
+        [ -n "$t" ] || continue
+        [ "$t" = "regular" ] && [ "$m" = "0755" ] \
+            && fs_read "$img" "$target" "$WORK/target.final" \
+            && cmp -s "$WORK/target.final" "$WORK/helper.new" \
+            || { echo "  $target is not the exit-0 script (type '$t' mode '$m')" >&2; return 1; }
     done
-done
+}
 
-say "done — passphrase helper replaced with an exit-0 script in $QCOW"
+patch_main apply verify

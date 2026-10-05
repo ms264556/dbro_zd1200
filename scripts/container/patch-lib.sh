@@ -220,22 +220,27 @@ pr_reset() {
               debugfs -w -R "rm $path" "$img" >/dev/null 2>&1 || true
               debugfs -w -R "rmdir $path" "$img" >/dev/null 2>&1 || true
           done
-    # Restore replaced vendor files.
-    debugfs -R "cat $PR_REPLACED_LIST" "$img" 2>/dev/null | awk 'NF' | while read -r name; do
+    # Restore replaced vendor files.  A file that cannot be put back fails the
+    # reset: the patches that follow assume the vendor rootfs.
+    local failed=0
+    while read -r name; do
         path="$(pr_unmangle "$name")"
         read -r type mode uid gid \
             <<< "$(debugfs -R "cat $PR_REPLACED/$name.meta" "$img" 2>/dev/null | head -n1)"
         [ -n "$type" ] || continue
         if [ "$type" = "symlink" ]; then
             target="$(debugfs -R "cat $PR_REPLACED/$name" "$img" 2>/dev/null | head -c 4096)"
-            fs_symlink "$img" "$path" "$target"
-        else
-            fs_read "$img" "$PR_REPLACED/$name" "$WORK/.patchlib.restore" || continue
-            fs_write "$img" "$path" "$WORK/.patchlib.restore" "$mode" "$uid" "$gid" || true
+            fs_symlink "$img" "$path" "$target" || failed=1
+        elif fs_read "$img" "$PR_REPLACED/$name" "$WORK/.patchlib.restore"; then
+            fs_write "$img" "$path" "$WORK/.patchlib.restore" "$mode" "$uid" "$gid" || failed=1
             rm -f "$WORK/.patchlib.restore"
+        else
+            echo "  !! no pristine copy of $path in the rollback store" >&2
+            failed=1
         fi
-    done
+    done < <(debugfs -R "cat $PR_REPLACED_LIST" "$img" 2>/dev/null | awk 'NF')
     _pr_list_for=""
+    [ "$failed" = 0 ]
 }
 
 # --- store-aware filesystem helpers ------------------------------------------
@@ -380,10 +385,13 @@ file_list_append_added() { # <img>
 # --- delta write -------------------------------------------------------------
 # write_deltas <name> <start-sector>: write only the changed 512-byte blocks of
 # $WORK/<name>.img (against the $WORK/<name>.orig.img snapshot) to $QCOW.
-# Returns 0 when bytes were written, 1 when nothing changed.
+# Returns 0 when bytes were written and 1 when nothing changed.  A comparison or
+# disk write that fails is neither: it exits, because every caller would
+# otherwise read it as "nothing changed" and carry on with a disk that does not
+# hold what the scratch image does.
 write_deltas() {
     local name="$1" start="$2" off len abs_start
-    python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
+    if ! python3 - "$WORK/$name.orig.img" "$WORK/$name.img" "$ALIGN" > "$WORK/$name.runs" <<'PYEOF'
 import sys
 orig = open(sys.argv[1], 'rb').read()
 new  = open(sys.argv[2], 'rb').read()
@@ -399,15 +407,19 @@ for b in blocks:
 for s, e in runs:
     print(s, e - s)
 PYEOF
+    then
+        echo "write_deltas: could not compare $name against its snapshot; aborting" >&2
+        exit 1
+    fi
     if [ ! -s "$WORK/$name.runs" ]; then
         return 1
     fi
     abs_start=$((start * ALIGN))
     while read -r off len; do
-        dd if="$WORK/$name.img" of="$WORK/chunk.bin" bs=$ALIGN \
-           skip=$((off / ALIGN)) count=$((len / ALIGN)) status=none
-        dd if="$WORK/chunk.bin" of="$QCOW" bs=$ALIGN \
-           seek=$(((abs_start + off) / ALIGN)) count=$((len / ALIGN)) conv=notrunc status=none
+        dd if="$WORK/$name.img" of="$QCOW" bs=$ALIGN \
+           skip=$((off / ALIGN)) seek=$(((abs_start + off) / ALIGN)) \
+           count=$((len / ALIGN)) conv=notrunc status=none \
+            || { echo "write_deltas: writing $name to $QCOW failed; aborting" >&2; exit 1; }
     done < "$WORK/$name.runs"
     return 0
 }
@@ -476,21 +488,78 @@ load_patch_parts() {
     }
 }
 
-# spot_img: the verify image of a root this run actually patched, for the
-# content spot-checks some patches print at the end.
+# --- the per-root driver every patch runs ------------------------------------
+# patch_main <apply_fn> [verify_fn]
 #
-# Those checks used to name $WORK/hda2.verify.img unconditionally.  That file
-# only exists when hda2 was part of the run, so when the caller selects just the
-# other root -- an in-guest firmware upgrade passes only the stale root -- the
-# debugfs fails, and under `set -e` with `pipefail` the spot-check aborts the
-# whole patch.  Always point them at a root that is in the selection.
-spot_img() {
-    local first="${PARTITIONS[0]:-}"
-    [ -n "$first" ] || return 1
-    printf '%s' "$WORK/${first%%|*}.verify.img"
+#   apply_fn  <name> <img>   Edit <img>, the scratch image of root <name>,
+#                            through the store-aware helpers above, and set
+#                            PATCH_APPLIED=1 if it changed anything.  Leaving it
+#                            0 means "nothing to do on this root": the scratch
+#                            image is discarded and the root is not written.
+#   verify_fn <name> <img>   Optional.  <img> is the root as re-read from the
+#                            disk; a non-zero return fails the patch.
+#
+# Both run under the patch's own `set -e`, so a helper that fails aborts the
+# patch.  Only the roots in ZD_PATCH_PARTS are visited (see patch_parts), and
+# only a root that was written is verified.  Returns with PATCHED_ROOTS holding
+# the names of the roots written.
+patch_main() {
+    local apply_fn="$1" verify_fn="${2:-}" part name start sectors
+    local -a written=()
+    PATCHED_ROOTS=()
+    load_patch_parts
+    for part in "${PARTITIONS[@]}"; do
+        IFS='|' read -r name start sectors <<< "$part"
+        say "[$name] $(basename "$0" .sh)"
+        extract_part "$name" "$start" "$sectors"
+        snapshot_orig "$name"
+        pr_init "$WORK/$name.img"
+        PATCH_APPLIED=0
+        "$apply_fn" "$name" "$WORK/$name.img"
+        if [ "$PATCH_APPLIED" != 1 ]; then
+            echo "  nothing to do on $name"
+            continue
+        fi
+        if write_deltas "$name" "$start"; then
+            written+=("$part")
+            PATCHED_ROOTS+=("$name")
+        else
+            echo "  no byte changes for $name"
+        fi
+    done
+    if [ "${#written[@]}" = 0 ]; then
+        say "nothing written to $QCOW"
+        return 0
+    fi
+    say "verifying: re-reading each patched root from the disk"
+    for part in "${written[@]}"; do
+        IFS='|' read -r name start sectors <<< "$part"
+        dd if="$QCOW" of="$WORK/$name.verify.img" bs=$ALIGN \
+           skip="$start" count="$sectors" status=none
+        if ! cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
+            echo "FAIL $name: the disk does not match the patched partition image" >&2
+            exit 1
+        fi
+        if [ -n "$verify_fn" ] && ! "$verify_fn" "$name" "$WORK/$name.verify.img"; then
+            echo "FAIL $name: the patched root did not verify" >&2
+            exit 1
+        fi
+        echo "OK   $name: the disk holds the patched root"
+    done
+    say "done — $(basename "$0" .sh) applied to ${PATCHED_ROOTS[*]}"
 }
 
-# extract_part / write_part are used by prepare-vm-disks.sh rather than by the
-# patches (which extract their own copy so they can run standalone).
+# patch_env: what every patch needs before patch_main -- the disk, and a fresh
+# scratch directory it can stage its payload in.  A patch sets BASE (its own
+# directory) and calls this straight after sourcing this file.
+patch_env() {
+    QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
+    # The scratch images are ~200 MB each, so the default is disk-backed.
+    WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
+    ALIGN=512
+    [ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
+    rm -rf "$WORK"; mkdir -p "$WORK"
+}
+
+# extract_part <name> <start-sector> <sectors>: the root's scratch image.
 extract_part() { dd if="$QCOW" of="$WORK/$1.img" bs=$ALIGN skip="$2" count="$3" status=none; }
-write_part()   { dd if="$WORK/$1.img" of="$QCOW" bs=$ALIGN seek="$2" count="$3" conv=notrunc status=none; }

@@ -21,8 +21,8 @@ and `docker/` are unaffected.
   the guest needs QEMU's `igb` NIC model, which Debian 12's QEMU 7.2 lacks. If
   you pass a template that cannot work, the install stops before provisioning
   rather than leaving a container that boot-loops.
-- `/dev/kvm` on the host for sensible boot times (the wizard warns when it is
-  missing and falls back to TCG).
+- `/dev/kvm` on the host for sensible boot times (the installer warns when it is
+  missing; the guest then runs under TCG).
 - A bridge with your LAN uplink, normally `vmbr0`.
 - One of the firmware/CF-dump inputs described in the top-level `README.md`.
 
@@ -36,9 +36,10 @@ cd dbro_zd1200
 ./install-zd1200-lxc.sh /path/to/zd1200_10.5.1.0.282.ap_10.5.1.0.282.img
 ```
 
-The wizard asks as little as it can:
+The installer asks as little as it can.  An input given on the command line, as
+above, skips the first question:
 
-1. **Which input** — it lists the firmware/dump files it finds on the host (PVE
+1. **Which input** (only when none was passed) — it lists the firmware/dump files it finds on the host (PVE
    storages, `/root`, `/root/zd-inputs`), classifies each, and offers a path
    entry and an "Advanced" entry.
 2. **Which bridge** — only when the host has more than one, because that decides
@@ -49,15 +50,16 @@ The wizard asks as little as it can:
    pieces) and the guest's MAC.
 
 Everything not asked has a default derived from the host: CT ID (first free),
-hostname `zd1200`, storage (first with room), Debian 13 template (fetched if
+hostname `zd1200`, storage (the first that holds container rootfs), Debian 13 template (fetched if
 absent), DHCP, ECDSA host key, Network Monitor and the R600 repair on, and:
 
 | size | default | why |
 |---|---|---|
 | cores | 4 | the guest itself is `-smp 2`; the rest is headroom for QEMU's I/O and the guest's own threads |
 | memory | 4096 MiB | the guest's QEMU is configured for 2048 MiB, plus QEMU and the `debugfs`/`dd` work on the images; 4 GiB is the tested floor |
-| disk | 20 GiB | userland + QEMU ~0.5, prepared artifacts ~1.1, the synthetic CF ~1.9 and briefly duplicated while built (a CF-dump build also extracts a writable); thin storage only allocates what is used | `--advanced` asks for those, and every one is a flag
-(`--help`).
+| disk | 20 GiB | userland + QEMU ~0.5, prepared artifacts ~1.1, the synthetic CF ~1.9 and briefly duplicated while built (a CF-dump build also extracts a writable); thin storage only allocates what is used |
+
+`--advanced` asks for those, and every one is a flag (`--help`).
 
 Then it creates the container, copies the project in, installs packages, decrypts
 the firmware, builds the payloads, builds and patches the guest disk, installs the
@@ -216,7 +218,7 @@ different failure modes:
 
 | mechanism | catches | behaviour |
 |---|---|---|
-| `ZD_GUEST_WATCHDOG` (default on) | the guest wedging inside QEMU | the timer probes the guest; after 5 consecutive failures it reboots it over the guest control channel, then waits a 15-minute cooldown |
+| `ZD_GUEST_WATCHDOG` (default on) | the guest wedging inside QEMU | the timer probes the guest; after 5 consecutive failures it reboots it over the guest control channel, then waits a 15-minute cooldown. A guest whose MAC is still in the bridge's FDB (alive, just not answering the probe) is left alone and logged as "not wedged" |
 | `ZD_CPU_GUARD` (default 24) | a guest spinning at 100% CPU | the entrypoint stops QEMU after 120s of continuous >95% CPU; systemd restarts the stack, which reboots the guest |
 | the installer's QEMU pre-flight | a template whose QEMU cannot run the guest | aborts the install **before** the container can enter a boot loop |
 
@@ -293,7 +295,7 @@ Proxmox host
     └── /etc/zd1200.conf                runtime settings for zd1200.service
 ```
 
-- `install-zd1200-lxc.sh` — runs on the PVE host: whiptail wizard, `pct`
+- `install-zd1200-lxc.sh` — runs on the PVE host: whiptail prompts, `pct`
   plumbing, copies the project in and invokes the bootstrap.
 - `scripts/container/proxmox/zd1200-ct-bootstrap.sh` — runs **inside** the CT:
   packages, payload builds, vendor-image preparation, guest-disk preparation,
@@ -379,5 +381,7 @@ pct exec <id> -- rm -rf /var/lib/zd1200 && pct exec <id> -- reboot
 # then re-run the bootstrap (or the full installer)
 ```
 
-`/opt/zd1200` is a plain checkout: `git pull` inside the CT, then re-run the
-bootstrap, is enough to pick up project changes.
+`/opt/zd1200` is a copy of the checkout without its `.git` (the installer's tar
+leaves it out), so there is nothing to `git pull` there.  Pull on the Proxmox
+host and run `./install-zd1200-lxc.sh --upgrade`, which copies the current
+checkout in and re-customises the guest's roots.

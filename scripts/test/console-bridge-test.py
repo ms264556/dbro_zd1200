@@ -22,13 +22,30 @@ import os
 import pty
 import select
 import socket
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BRIDGE = os.path.join(REPO, "scripts", "container", "proxmox", "zd1200-console-bridge.py")
-TMP = "/tmp/zd1200-console-bridge-test"
+
+
+def _short_tmpdir():
+    """A private directory short enough to hold AF_UNIX sockets.
+
+    sun_path is ~108 bytes, so sockets under a long $TMPDIR fail to bind.
+    $TMPDIR is honoured when short; otherwise the directory goes under /tmp.
+    A fresh mkdtemp also keeps concurrent runs from colliding.
+    """
+    base = os.environ.get("TMPDIR") or "/tmp"
+    if len(base) > 40:
+        base = "/tmp"
+    return tempfile.mkdtemp(prefix="zd-cb.", dir=base)
+
+
+TMP = _short_tmpdir()
 QEMU = os.path.join(TMP, "qemu.sock")
 PUBLIC = os.path.join(TMP, "public.sock")
 STDERR = os.path.join(TMP, "bridge.err")
@@ -204,6 +221,7 @@ def main():
                 print(stderr[:2000])
         except OSError:
             pass
+        shutil.rmtree(TMP, ignore_errors=True)
     if test.failures:
         print(f"FAILURES: {test.failures}")
         return 1

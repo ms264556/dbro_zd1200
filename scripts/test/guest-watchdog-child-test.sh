@@ -6,8 +6,8 @@
 # child.  That is how the DOCKER flow supervises it (the container has no
 # systemd), but the LXC flow runs the same script as zd1200-watchdog.service, so
 # without an explicit switch the LXC flow would run two copies: the child's L2
-# lookup is the Docker flow's macvtap shape (ZD_WATCHDOG_LINK_KIND=iface,
-# ZD_WATCHDOG_GUEST_LINK=eth0) rather than the LXC flow's bridge (br-zd), and
+# lookup is the Docker flow's macvtap shape (ZD_WATCHDOG_LINK_KIND=macvtap,
+# ZD_WATCHDOG_GUEST_LINK=mvt0) rather than the LXC flow's bridge (br-zd), and
 # both copies write the same $STATE_FILE, so recovery would be duplicated and
 # one of the two would be looking for the guest in the wrong place.
 #
@@ -54,6 +54,7 @@ printf 'stub-watchdog-started\n'
 {
     printf 'ZD_GUEST_WATCHDOG_INTERVAL=%s\n' "${ZD_GUEST_WATCHDOG_INTERVAL:-}"
     printf 'ZD_GUEST_WATCHDOG_FAILURES=%s\n' "${ZD_GUEST_WATCHDOG_FAILURES:-}"
+    printf 'ZD_GUEST_WATCHDOG_SILENT=%s\n' "${ZD_GUEST_WATCHDOG_SILENT:-}"
     printf 'ZD_WATCHDOG_LINK_KIND=%s\n' "${ZD_WATCHDOG_LINK_KIND:-}"
     printf 'ZD_WATCHDOG_GUEST_LINK=%s\n' "${ZD_WATCHDOG_GUEST_LINK:-}"
     printf 'ZD_MAC1=%s\n' "${ZD_MAC1:-}"
@@ -74,7 +75,11 @@ run_block() {
     local ran="$TMP/ran.$label" envout="$TMP/env.$label" out="$TMP/out.$label" pid="$TMP/pid.$label"
     rm -f "$ran" "$envout" "$pid"
     (
-        unset ZD_GUEST_WATCHDOG ZD_GUEST_WATCHDOG_CHILD
+        unset ZD_GUEST_WATCHDOG ZD_GUEST_WATCHDOG_CHILD \
+              ZD_MACVTAP_IF ZD_WATCHDOG_LINK_KIND ZD_WATCHDOG_GUEST_LINK
+        # The Docker flow runs in macvtap mode (docker-compose.yml); a case that
+        # wants another launch mode passes network_mode=... as a knob.
+        export network_mode=macvtap
         export work_dir="$TMP/work" log_file="$TMP/console.$label.log" \
                control_sock="$TMP/ctl.sock" zd_mac1="02:00:00:00:00:01" \
                state_dir="$TMP/state" address_helper="$TMP/work/zd1200-guest-address" \
@@ -92,17 +97,32 @@ run_block() {
 # --- 1. the Docker flow: no knob, so the child starts ------------------------
 run_block default
 [ -e "$TMP/ran.default" ] || fail "the child watchdog did not start with no knob set (Docker flow); output: $(cat "$TMP/out.default")"
-grep -qx 'ZD_WATCHDOG_LINK_KIND=iface' "$TMP/env.default" \
+grep -qx 'ZD_WATCHDOG_LINK_KIND=macvtap' "$TMP/env.default" \
     || fail "the child was not told to use the macvtap L2 lookup: $(cat "$TMP/env.default" 2>/dev/null)"
-grep -qx 'ZD_WATCHDOG_GUEST_LINK=eth0' "$TMP/env.default" \
-    || fail "the child was not told which uplink to look in: $(cat "$TMP/env.default" 2>/dev/null)"
+grep -qx 'ZD_WATCHDOG_GUEST_LINK=mvt0' "$TMP/env.default" \
+    || fail "the child was not told which macvtap to watch: $(cat "$TMP/env.default" 2>/dev/null)"
 grep -qx 'ZD_GUEST_WATCHDOG_INTERVAL=60' "$TMP/env.default" \
     || fail "the child's probe interval default changed: $(cat "$TMP/env.default" 2>/dev/null)"
 grep -qx 'ZD_GUEST_WATCHDOG_FAILURES=5' "$TMP/env.default" \
     || fail "the child's failure threshold default changed: $(cat "$TMP/env.default" 2>/dev/null)"
+grep -qx 'ZD_GUEST_WATCHDOG_SILENT=600' "$TMP/env.default" \
+    || fail "the child was not given the ten-minute layer-2 silence limit: $(cat "$TMP/env.default" 2>/dev/null)"
 grep -Eq '^watchdog_pid=[0-9]+$' "$TMP/pid.default" \
     || fail "the child was started but not recorded for supervision: $(cat "$TMP/pid.default")"
 pass "no knob (Docker flow): the child watchdog starts with the macvtap L2 lookup"
+
+# A second instance on the same host names its own macvtap (ZD_MACVTAP_IF, written
+# into .env by the installer); the watchdog must watch that one, not mvt0.
+run_block named ZD_MACVTAP_IF=mvt-zdx
+grep -qx 'ZD_WATCHDOG_GUEST_LINK=mvt-zdx' "$TMP/env.named" \
+    || fail "an instance's own macvtap name did not reach the watchdog: $(cat "$TMP/env.named" 2>/dev/null)"
+pass "a non-default ZD_MACVTAP_IF is the interface the watchdog watches"
+
+# Any launch mode other than macvtap has no macvtap to read a counter from.
+run_block usermode network_mode=user
+grep -qx 'ZD_WATCHDOG_LINK_KIND=none' "$TMP/env.usermode" \
+    || fail "a non-macvtap launch mode was not given the no-evidence kind: $(cat "$TMP/env.usermode" 2>/dev/null)"
+pass "outside macvtap mode the watchdog is told there is no layer-2 evidence"
 
 # --- 1b. the child's stdout is NOT also piped into the console log -----------
 # $log_file is the correlated boot record (board data, the launcher transcript

@@ -30,14 +30,18 @@
 # Options:
 #   --ctid N                 container ID (default: first free id >= 120)
 #   --hostname NAME          container hostname (default zd1200)
-#   --storage STORAGE        PVE storage for the rootfs (default: local-lvm)
-#   --bridge BRIDGE          LAN bridge (default: vmbr0)
+#   --storage STORAGE        PVE storage for the rootfs (default: the first storage
+#                            `pvesm status` lists that holds container rootfs)
+#   --bridge BRIDGE          LAN bridge (default: the host's only bridge, else the
+#                            one carrying the default route; unattended runs fail
+#                            when several bridges and no default route leave it open)
 #   --rootfs SIZE            container disk size in GiB (default: 20; the
 #                            guest artifacts need ~5, and a CF-dump build peaks
 #                            near 9 while the writable is extracted)
 #   --cores N / --memory MB  container sizing (defaults: 4 / 4096)
 #   --start-on-boot / --no-start-on-boot
 #   --source PATH            named alias for the firmware positional argument
+#                            (also spelled --firmware)
 #   --upgrade                upgrade an existing ZD1200 container in place: copy
 #                            the current checkout into it and re-customise the
 #                            roots from their rollback store, keeping /writable.
@@ -81,10 +85,12 @@
 #                            (e.g. 10.222.1.180/24; gateway from --gateway)
 #   --gateway IP             default gateway for --static-ip
 #   --template PATH          LXC template to use (default: newest local debian-*)
-#   --timeout SEC            guest readiness deadline (default 1200)
+#   --timeout SEC            guest readiness deadline (default 1200); the installer
+#                            exits 1, after its summary, if the guest is not READY by then
 #   --yes                    do not ask for confirmation
 #   --non-interactive        fail instead of prompting (implies --yes)
 #   -h | --help
+
 set -euo pipefail
 
 # This script lives at the repository root.  Resolve the root from its own
@@ -124,25 +130,46 @@ ECDSA_SET=0; NETWORK_MONITOR_SET=0; CONSOLE_TTY_SET=0; KEEP_CT_ADDRESS_SET=0
 WT=(whiptail --backtitle "ZD1200 LXC installer" --title "ZD1200" --cancel-button Cancel)
 
 
+# Accept --opt=value as well as --opt value (parity with the Docker installer):
+# split each --opt=value token into two before the loop reads it.
+_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --*=*) _args+=("${_a%%=*}" "${_a#*=}") ;;
+        *)     _args+=("$_a") ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+# The value for an option flag: it must be present and must not itself look like
+# an option, so `--ctid --yes` fails cleanly instead of taking "--yes" as the id.
+optval() {
+    case "${2-}" in
+        "")   die "$1 requires a value" ;;
+        -?*)  die "$1 requires a value (got option '$2')" ;;
+    esac
+    printf '%s' "$2"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ctid)                 CTID="${2:?}"; shift 2 ;;
-        --hostname)             CT_HOSTNAME="${2:?}"; shift 2 ;;
-        --storage)              STORAGE="${2:?}"; shift 2 ;;
-        --bridge)               BRIDGE="${2:?}"; shift 2 ;;
-        --rootfs)               ROOTFS_SIZE="${2:?}"; shift 2 ;;
-        --cores)                CORES="${2:?}"; shift 2 ;;
-        --memory)               MEMORY="${2:?}"; shift 2 ;;
+        --ctid)                 CTID="$(optval "$1" "${2-}")"; shift 2 ;;
+        --hostname)             CT_HOSTNAME="$(optval "$1" "${2-}")"; shift 2 ;;
+        --storage)              STORAGE="$(optval "$1" "${2-}")"; shift 2 ;;
+        --bridge)               BRIDGE="$(optval "$1" "${2-}")"; shift 2 ;;
+        --rootfs)               ROOTFS_SIZE="$(optval "$1" "${2-}")"; shift 2 ;;
+        --cores)                CORES="$(optval "$1" "${2-}")"; shift 2 ;;
+        --memory)               MEMORY="$(optval "$1" "${2-}")"; shift 2 ;;
         --start-on-boot)        ONBOOT=1; shift ;;
         --no-start-on-boot)     ONBOOT=0; shift ;;
-        --source|--firmware)    OPT_FIRMWARE="${2:?}"; shift 2 ;;
+        --source|--firmware)    OPT_FIRMWARE="$(optval "$1" "${2-}")"; shift 2 ;;
         --upgrade)              UPGRADE=1; shift ;;
-        --container-mac)        CONTAINER_MAC_OVERRIDE="${2:?}"; shift 2 ;;
+        --container-mac)        CONTAINER_MAC_OVERRIDE="$(optval "$1" "${2-}")"; shift 2 ;;
         --advanced)             ADVANCED=1; shift ;;
-        --writable-from)        OPT_WRITABLE="${2:?}"; shift 2 ;;
-        --writable-partition)   WRITABLE_PARTITION="${2:?}"; shift 2 ;;
-        --backup)               OPT_BACKUP="${2:?}"; shift 2 ;;
-        --root-ssh-key)         ROOT_SSH_KEY="${2:?}"; shift 2 ;;
+        --writable-from)        OPT_WRITABLE="$(optval "$1" "${2-}")"; shift 2 ;;
+        --writable-partition)   WRITABLE_PARTITION="$(optval "$1" "${2-}")"; shift 2 ;;
+        --backup)               OPT_BACKUP="$(optval "$1" "${2-}")"; shift 2 ;;
+        --root-ssh-key)         ROOT_SSH_KEY="$(optval "$1" "${2-}")"; shift 2 ;;
         --ecdsa)                ECDSA=1; ECDSA_SET=1; shift ;;
         --no-ecdsa)             ECDSA=0; ECDSA_SET=1; shift ;;
         --network-monitor)      NETWORK_MONITOR=1; NETWORK_MONITOR_SET=1; shift ;;
@@ -153,13 +180,13 @@ while [ $# -gt 0 ]; do
         --keep-ct-address)      KEEP_CT_ADDRESS=1; KEEP_CT_ADDRESS_SET=1; shift ;;
         --share-mac)            SHARE_UPLINK_MAC=1; SHARE_UPLINK_MAC_SET=1; shift ;;
         --no-shared-mac)        SHARE_UPLINK_MAC=0; SHARE_UPLINK_MAC_SET=1; shift ;;
-        --static-ip)            STATIC_IP="${2:?}"; shift 2 ;;
-        --gateway)              GATEWAY="${2:?}"; shift 2 ;;
-        --template)             TEMPLATE="${2:?}"; shift 2 ;;
-        --timeout)              TIMEOUT="${2:?}"; shift 2 ;;
+        --static-ip)            STATIC_IP="$(optval "$1" "${2-}")"; shift 2 ;;
+        --gateway)              GATEWAY="$(optval "$1" "${2-}")"; shift 2 ;;
+        --template)             TEMPLATE="$(optval "$1" "${2-}")"; shift 2 ;;
+        --timeout)              TIMEOUT="$(optval "$1" "${2-}")"; shift 2 ;;
         --yes)                  ASSUME_YES=1; shift ;;
         --non-interactive)      ASSUME_YES=1; INTERACTIVE=0; shift ;;
-        -h|--help)              sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)              sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)                     die "unknown option: $1" ;;
         *)                      POSITIONALS+=("$1"); shift ;;
     esac
@@ -173,6 +200,19 @@ step "checking the Proxmox host"
 for c in pct pvesm pveam qm whiptail; do
     command -v "$c" >/dev/null || die "$c not found — is this a Proxmox VE host?"
 done
+# `pct exec` forwards this shell's environment into the container.  A TMPDIR that
+# names a directory on this host (say, one on a larger disk) then does not exist
+# in the container and breaks the tools run there (dpkg-deb, apt hooks).  Scrub it
+# for every exec; host-side code still reads it as a shell variable.
+pct() {
+    if [ "${1:-}" = exec ] && [ "${3:-}" = -- ]; then
+        local ctid="$2"
+        shift 3
+        command pct exec "$ctid" -- env -u TMPDIR "$@"
+    else
+        command pct "$@"
+    fi
+}
 NODE="$(hostname -s)"
 PVE_VER="$(pveversion 2>/dev/null | head -1)"
 info "node $NODE — $PVE_VER"
@@ -190,8 +230,13 @@ mapfile -t STORAGES < <(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 {
 free_gb() { pvesm status --content rootdir 2>/dev/null | awk -v s="$1" '$1==s {printf "%d", $6/1048576}'; }
 storage_menu_label() { printf '%s (%s GB free)' "$1" "$(free_gb "$1")"; }
 
-# Bridges: the LAN the guest should join.
-mapfile -t BRIDGES < <(awk '/^iface (vmbr|vmbr[0-9])/ {print $2}' /etc/network/interfaces 2>/dev/null | sort -u)
+# Bridges: the LAN the guest should join.  List real bridge interfaces from the
+# kernel so br0, OVS and SDN bridges are offered too, not only the vmbr* names in
+# /etc/network/interfaces.  Fall back to that file, then to vmbr0.
+mapfile -t BRIDGES < <(ip -o link show type bridge 2>/dev/null \
+    | awk -F': ' '{print $2}' | cut -d'@' -f1 | sort -u)
+[ "${#BRIDGES[@]}" -gt 0 ] \
+    || mapfile -t BRIDGES < <(awk '/^iface[[:space:]]+vmbr/ {print $2}' /etc/network/interfaces 2>/dev/null | sort -u)
 [ "${#BRIDGES[@]}" -gt 0 ] || BRIDGES=(vmbr0)
 
 list_templates() {
@@ -236,6 +281,21 @@ bridge_hint() {
     fi
 }
 
+# The detected bridge that carries the host's default route, or non-zero when the
+# default-route device is not one of them.  An unattended run (--yes or
+# --non-interactive) uses this to choose a bridge without prompting, so the LAN
+# bridge is picked deterministically rather than by alphabetical accident.
+default_route_bridge() {
+    local dev br
+    dev="$(ip -4 route show default 2>/dev/null \
+        | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+    [ -n "$dev" ] || return 1
+    for br in "${BRIDGES[@]}"; do
+        [ "$br" = "$dev" ] && { printf '%s' "$br"; return 0; }
+    done
+    return 1
+}
+
 next_free_ctid() {
     # A CT id whose /etc/pve/lxc/<id>.conf and /etc/pve/qemu-server/<id>.conf are
     # both absent — avoids colliding with an existing VM as well.
@@ -271,12 +331,53 @@ ct_conf_get() {
     pct exec "$1" -- bash -c "sed -n 's/^$2=//p' /etc/zd1200.conf 2>/dev/null | head -n1" 2>/dev/null || true
 }
 
+# wait_for_ready: poll until the guest prints its READY line, leaving the last
+# address read in guest_ip and GUEST_READY=1 only when it did.  A deadline or a
+# service that stopped early is reported here; the caller prints its summary and
+# then exits non-zero, so an unattended run can tell a ready appliance from one
+# that merely finished installing.
+GUEST_READY=0
+guest_ip=""
+wait_for_ready() {
+    local deadline=$((SECONDS + TIMEOUT))
+    GUEST_READY=0
+    guest_ip=""
+    info "waiting up to ${TIMEOUT}s for the guest to report READY (watch: pct exec $CTID -- journalctl -fu zd1200)"
+    while (( SECONDS < deadline )); do
+        guest_ip="$(pct exec "$CTID" -- bash -c 'cat /var/lib/zd1200/guest-ip 2>/dev/null' || true)"
+        if pct exec "$CTID" -- bash -c 'grep -qF "System go into READY status." /tmp/zd1200-console.log 2>/dev/null'; then
+            printf '  [%4ds] guest READY\n' "$((SECONDS - (deadline - TIMEOUT)))"
+            GUEST_READY=1
+            # The address comes from the guest's DHCP lease, which can land just
+            # after READY; give it a moment so the summary can name the URL.
+            local grace
+            for grace in 1 2 3 4 5 6; do
+                [ -n "$guest_ip" ] && break
+                sleep 5
+                guest_ip="$(pct exec "$CTID" -- bash -c 'cat /var/lib/zd1200/guest-ip 2>/dev/null' || true)"
+            done
+            return 0
+        fi
+        if ! pct exec "$CTID" -- systemctl is-active --quiet zd1200.service; then
+            warn "the zd1200 service stopped early"
+            pct exec "$CTID" -- journalctl -u zd1200 -n 40 --no-pager || true
+            return 0
+        fi
+        sleep 5
+    done
+    warn "the guest did not report READY within ${TIMEOUT}s (--timeout); it may still be booting: pct exec $CTID -- tail -f /tmp/zd1200-console.log"
+}
+
 upgrade_existing_container() {
     if [ "${#POSITIONALS[@]}" -gt 0 ] || [ -n "$OPT_FIRMWARE$OPT_BACKUP$OPT_WRITABLE" ]; then
         die "--upgrade takes no input: it keeps the existing appliance and its configuration.  Restore a backup from the appliance's Web UI, or reset the state and install."
     fi
     [ -z "$CTID" ] && CTID="$(detect_zd1200_ctid)"
     [ -f "/etc/pve/lxc/$CTID.conf" ] || die "container $CTID does not exist"
+    # The upgrade stops services and replaces trees inside the container, so an
+    # explicit --ctid must name one this installer made, not any container.
+    grep -q 'installed by dbro_zd1200/install-zd1200-lxc.sh' "/etc/pve/lxc/$CTID.conf" \
+        || die "container $CTID does not carry this installer's description marker, so it is not a ZD1200 container made by it; refusing to upgrade it"
     pct status "$CTID" >/dev/null 2>&1 || die "cannot query container $CTID"
 
     info "upgrading container $CTID in place (keeping /writable and its keys)"
@@ -378,22 +479,7 @@ upgrade_existing_container() {
     # the guest's READY line, and a stale one would pass instantly.
     pct exec "$CTID" -- rm -f /tmp/zd1200-console.log
     pct exec "$CTID" -- systemctl start --no-block zd1200.service
-    info "waiting up to ${TIMEOUT}s for the guest to report READY (watch: pct exec $CTID -- journalctl -fu zd1200)"
-    deadline=$((SECONDS + TIMEOUT))
-    guest_ip=""
-    while (( SECONDS < deadline )); do
-        guest_ip="$(pct exec "$CTID" -- bash -c 'cat /var/lib/zd1200/guest-ip 2>/dev/null' || true)"
-        if pct exec "$CTID" -- bash -c 'grep -qF "System go into READY status." /tmp/zd1200-console.log 2>/dev/null'; then
-            printf '  [%4ds] guest READY\n' "$((SECONDS - (deadline - TIMEOUT)))"
-            break
-        fi
-        if ! pct exec "$CTID" -- systemctl is-active --quiet zd1200.service; then
-            warn "the zd1200 service stopped early"
-            pct exec "$CTID" -- journalctl -u zd1200 -n 40 --no-pager || true
-            break
-        fi
-        sleep 5
-    done
+    wait_for_ready
 
     if [ -n "$guest_ip" ]; then
         guest_url="https://$guest_ip/"
@@ -413,6 +499,7 @@ EOF
     if [ -n "$key_line" ]; then
         printf '  Root SSH ........ ssh -p 2222 -i <key> root@%s\n' "${guest_ip:-<guest-ip>}"
     fi
+    [ "$GUEST_READY" = 1 ] || exit 1
 }
 
 if [ "$UPGRADE" = 1 ]; then
@@ -460,6 +547,8 @@ for f in "$INPUT_PATH" "$FIRMWARE_PATH"; do
     [ -f "$f" ] || die "input is not a regular file: $f"
     [ -r "$f" ] || die "input is not readable: $f"
 done
+[ -z "$CONTAINER_MAC_OVERRIDE" ] || is_mac "$CONTAINER_MAC_OVERRIDE" \
+    || die "--container-mac is not a MAC address: $CONTAINER_MAC_OVERRIDE"
 if [ -n "$WRITABLE_PARTITION" ]; then
     case "$INPUT_KIND" in
         zd1200-dump|foreign-dump) : ;;
@@ -481,13 +570,32 @@ esac
 # Everything else has a usable default derived from what the host actually
 # provides, and is shown in the summary before anything is created; all of it can
 # be set with the flags (`--help`), or via the source menu's Advanced entry.
-if [ "$INTERACTIVE" = 1 ] && [ "${#BRIDGES[@]}" -gt 1 ] && [ -z "$BRIDGE" ]; then
-    bridge_choices=()
-    for br in "${BRIDGES[@]}"; do
-        bridge_choices+=("$br" "$(bridge_hint "$br")")
-    done
-    BRIDGE="$("${WT[@]}" --menu "Which bridge should the guest join?" 20 84 10 "${bridge_choices[@]}" 3>&1 1>&2 2>&3)" || die "cancelled"
+# Resolve the LAN bridge.  An explicit --bridge wins; a single bridge is used
+# unconditionally; with several, a human (interactive and not --yes) is asked,
+# while an unattended run (--yes or --non-interactive) picks the bridge that
+# carries the host's default route and fails if none does -- so an unattended
+# install never hangs on the menu (the --yes bug) and never silently lands on an
+# alphabetical first bridge that may not be the LAN.
+if [ -z "$BRIDGE" ]; then
+    if [ "${#BRIDGES[@]}" -eq 1 ]; then
+        BRIDGE="${BRIDGES[0]}"
+    elif [ "$INTERACTIVE" = 1 ] && [ "$ASSUME_YES" = 0 ]; then
+        bridge_choices=()
+        for br in "${BRIDGES[@]}"; do
+            bridge_choices+=("$br" "$(bridge_hint "$br")")
+        done
+        BRIDGE="$("${WT[@]}" --menu "Which bridge should the guest join?" 20 84 10 "${bridge_choices[@]}" 3>&1 1>&2 2>&3)" || die "cancelled"
+    else
+        BRIDGE="$(default_route_bridge)" || die "the host has several bridges (${BRIDGES[*]}) and none carries the default route; pass --bridge to choose one"
+        info "bridge: $BRIDGE (carries the host default route)"
+    fi
 fi
+# A --bridge the host does not actually have is almost always a typo; warn rather
+# than die, since the detection can miss exotic bridge types.
+case " ${BRIDGES[*]} " in
+    *" $BRIDGE "*) : ;;
+    *) warn "bridge '$BRIDGE' is not among the host's detected bridges (${BRIDGES[*]}); continuing" ;;
+esac
 
 if [ "$INTERACTIVE" = 1 ] && [ "$ADVANCED" = 1 ]; then
     [ -n "$STORAGE" ] || STORAGE="${STORAGES[0]}"
@@ -558,7 +666,9 @@ lock_host() {
             warn "flock is not available: two installs started together may pick the same container id"
             return 0
         fi
-        if ! exec {LOCK_FD}>"$LOCK_FILE" 2>/dev/null; then
+        # The group scopes the 2>/dev/null to the open; on a bare `exec` it would
+        # redirect this shell's stderr for the rest of the install.
+        if ! { exec {LOCK_FD}>"$LOCK_FILE"; } 2>/dev/null; then
             LOCK_FD=""
             warn "cannot open $LOCK_FILE: two installs started together may pick the same container id; continuing unlocked"
             return 0
@@ -580,13 +690,30 @@ unlock_host() {
 lock_host
 [ -n "$CTID" ] || CTID="$(next_free_ctid)"
 [ -n "$STORAGE" ] || STORAGE="${STORAGES[0]}"
-[ -n "$BRIDGE" ] || BRIDGE="${BRIDGES[0]}"
-if [ -z "$TEMPLATE" ] && [ "${#TEMPLATES[@]}" -gt 0 ]; then
-    TEMPLATE="$(printf '%s\n' "${TEMPLATES[@]}" | sort -V | tail -1)"
-fi
+# BRIDGE is already resolved in section 2 (explicit --bridge, the sole bridge, a
+# prompt, or the default-route bridge), so there is no silent first-bridge
+# fallback here.
 # The guest needs Debian 13 (its QEMU provides the `igb` NIC model; Debian 12's
-# does not).  A user with no template at all should not have to know that, so
-# fetch the right one rather than failing with a hint.
+# does not).  A template whose name says an older Debian is never chosen here and
+# is refused below, before any container exists, rather than at the igb probe
+# after the container is built.  A name that carries no Debian number is left to
+# that probe.
+template_major() {
+    local m
+    m="$(basename "$1" | sed -n 's/^debian-\([0-9][0-9]*\)-.*/\1/p')"
+    printf '%s' "${m:-99}"
+}
+if [ -z "$TEMPLATE" ] && [ "${#TEMPLATES[@]}" -gt 0 ]; then
+    usable_templates=()
+    for t in "${TEMPLATES[@]}"; do
+        [ "$(template_major "$t")" -ge 13 ] && usable_templates+=("$t")
+    done
+    if [ "${#usable_templates[@]}" -gt 0 ]; then
+        TEMPLATE="$(printf '%s\n' "${usable_templates[@]}" | sort -V | tail -1)"
+    fi
+fi
+# A user with no usable template should not have to know that, so fetch the
+# right one rather than failing with a hint.
 if [ -z "$TEMPLATE" ]; then
     step "fetching a Debian 13 LXC template"
     pveam update >/dev/null 2>&1 || true
@@ -594,14 +721,21 @@ if [ -z "$TEMPLATE" ]; then
         | awk '$2 ~ /^debian-13-standard_/ && $2 ~ /_amd64\.tar\.zst$/ {print $2}' \
         | sort -V | tail -1)"
     if [ -n "$tpl_name" ]; then
-        pveam download local "$tpl_name" >/dev/null 2>&1 || true
-        TEMPLATE="/var/lib/vz/template/cache/$tpl_name"
+        if pveam download local "$tpl_name" >/dev/null 2>&1; then
+            TEMPLATE="/var/lib/vz/template/cache/$tpl_name"
+        else
+            warn "could not download $tpl_name"
+        fi
     fi
 fi
 [ -n "$TEMPLATE" ] || die "could not fetch a Debian 13 template; download one yourself:
        pveam update && pveam download local debian-13-standard_<version>_amd64.tar.zst
      and pass it with --template"
 [ -f "$TEMPLATE" ] || die "template not found: $TEMPLATE"
+[ "$(template_major "$TEMPLATE")" -ge 13 ] \
+    || die "$(basename "$TEMPLATE") is Debian $(template_major "$TEMPLATE"); the guest needs Debian 13 (its QEMU provides the 'igb' NIC model):
+       pveam update && pveam download local debian-13-standard_<version>_amd64.tar.zst
+     and pass it with --template"
 [ -f "/etc/pve/lxc/$CTID.conf" ] && die "container $CTID already exists"
 [ -f "/etc/pve/qemu-server/$CTID.conf" ] && die "VM $CTID already exists"
 [[ "$CTID" =~ ^[0-9]+$ ]] || die "--ctid must be numeric"
@@ -729,7 +863,9 @@ if [ "$SHARE_UPLINK_MAC" = 1 ]; then
     is_mac "$ct_mac" || die "could not read the container's allocated MAC (net0 hwaddr)"
     GUEST_MAC="$ct_mac"
     info "guest MAC: $GUEST_MAC (the container's own uplink MAC, shared)"
-elif [ -z "$CONTAINER_MAC_OVERRIDE" ]; then
+else
+    # Unshared, the guest has a MAC of its own whether or not --container-mac
+    # pinned the container's: that option names the container's net0 hwaddr only.
     mac_prefix="$(printf '%s' "$ct_mac" | cut -d: -f1-3)"
     if [ -n "$mac_prefix" ]; then
         GUEST_MAC="$(perl -MPVE::Tools -e 'print PVE::Tools::random_ether_addr($ARGV[0])' \
@@ -853,9 +989,6 @@ fi
 [ -n "$ROOT_SSH_KEY_LINE" ] && bootstrap_args+=(--root-ssh-key "$ROOT_SSH_KEY_LINE")
 if [ "$SHARE_UPLINK_MAC" = 1 ]; then
     bootstrap_args+=(--share-mac)
-elif [ -n "$CONTAINER_MAC_OVERRIDE" ]; then
-    is_mac "$CONTAINER_MAC_OVERRIDE" || die "--container-mac is not a MAC address: $CONTAINER_MAC_OVERRIDE"
-    bootstrap_args+=(--container-mac "$CONTAINER_MAC_OVERRIDE")
 elif [ -n "$GUEST_MAC" ]; then
     bootstrap_args+=(--container-mac "$GUEST_MAC")
 fi
@@ -935,23 +1068,22 @@ step "starting the appliance"
 # readiness check below.
 pct exec "$CTID" -- rm -f /tmp/zd1200-console.log
 pct exec "$CTID" -- systemctl start --no-block zd1200.service
-info "waiting up to ${TIMEOUT}s for the guest to report READY (watch: pct exec $CTID -- journalctl -fu zd1200)"
-deadline=$((SECONDS + TIMEOUT))
-guest_ip=""
-while (( SECONDS < deadline )); do
-    guest_ip="$(pct exec "$CTID" -- bash -c 'cat /var/lib/zd1200/guest-ip 2>/dev/null' || true)"
-    if pct exec "$CTID" -- bash -c 'grep -qF "System go into READY status." /tmp/zd1200-console.log 2>/dev/null'; then
-        printf '  [%4ds] guest READY\n' "$((SECONDS - (deadline - TIMEOUT)))"
-        break
-    fi
-    if ! pct exec "$CTID" -- systemctl is-active --quiet zd1200.service; then
-        warn "the zd1200 service stopped early"
-        pct exec "$CTID" -- journalctl -u zd1200 -n 40 --no-pager || true
-        break
-    fi
-    sleep 5
-done
+wait_for_ready
 
+# What the first boot does depends on the input: a firmware alone is a factory
+# appliance; a backup is restored (the guest reboots once by itself); a dump
+# already is the configured appliance.
+case "$INPUT_KIND" in
+    backup)
+        first_boot_note="First boot restores the configuration backup and the guest reboots once by
+  itself; then log in with the backup's own admin credentials." ;;
+    zd1200-dump|foreign-dump)
+        first_boot_note="The appliance comes up with the dump's own configuration; log in with its
+  admin credentials." ;;
+    *)
+        first_boot_note="First boot runs the factory setup wizard; complete it, reboot once (so the
+  appliance generates its SSH host key), then log in." ;;
+esac
 url_ip="${guest_ip:-${STATIC_IP%%/*}}"
 # Keep the ANSI codes in variables: a $(printf ...) command substitution inside
 # the heredoc swallows the newline that follows it, which silently glues the next
@@ -980,9 +1112,9 @@ ${bold}Installation complete.${reset}
   Address ......... pct exec $CTID -- cat /var/lib/zd1200/guest-ip
   From another LAN machine:  curl -kI https://<guest-ip>/
 
-  First boot runs the factory setup wizard; complete it, reboot once (so the
-  appliance generates its SSH host key), then log in.
+  $first_boot_note
 EOF
 if [ -n "$ROOT_SSH_KEY_LINE" ]; then
     printf '  Root SSH ........ ssh -p 2222 -i <key> root@%s\n' "${url_ip:-<guest-ip>}"
 fi
+[ "$GUEST_READY" = 1 ] || exit 1

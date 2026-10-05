@@ -31,13 +31,18 @@ ENTRYPOINT="$BASE/entrypoint.sh"
 QEMU_ONCE="$BASE/qemu-once.py"
 
 
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-cpupid.XXXXXX")"
+# qemu-once.py binds its QMP socket under tempfile.gettempdir(), and a long
+# TMPDIR overflows sun_path, so the emulator gets its own short directory.
+SOCK_DIR="$(short_sock_dir)"
 pids=()
 cleanup() {
     if (( ${#pids[@]} )); then
         kill -KILL "${pids[@]}" 2>/dev/null || true
     fi
-    rm -rf "$TMP"
+    rm -rf "$TMP" "$SOCK_DIR"
 }
 trap cleanup EXIT
 
@@ -176,7 +181,7 @@ wait "$wrapper" 2>/dev/null || true
 # --- 3. qemu-once.py publishes a real emulator pid, and removes it ----------
 command -v qemu-system-i386 >/dev/null 2>&1 || skip "qemu-system-i386 is not installed"
 qemu_pid_file="$TMP/real.pid"
-ZD_QEMU_PID_FILE="$qemu_pid_file" python3 "$QEMU_ONCE" -machine none -display none \
+TMPDIR="$SOCK_DIR" ZD_QEMU_PID_FILE="$qemu_pid_file" python3 "$QEMU_ONCE" -machine none -display none \
     >"$TMP/qemu-once.log" 2>&1 &
 once_pid=$!
 pids+=("$once_pid")
@@ -234,7 +239,7 @@ pass "the pid file is removed when the emulator exits"
 # operator may still carry CPU_LIMIT in /etc/zd1200.conf, so the entrypoint must
 # report it once and act on none of it.  entrypoint.sh cannot be sourced (it
 # builds disks and starts QEMU), so lift the compatibility block out and run it.
-awk '/^# CPU_LIMIT is gone/,/^fi$/' "$ENTRYPOINT" > "$TMP/cpu-limit-block.sh"
+awk '/^if \[ -n "\$\{CPU_LIMIT:-\}" \]; then$/,/^fi$/' "$ENTRYPOINT" > "$TMP/cpu-limit-block.sh"
 grep -q 'CPU_LIMIT is set but no longer supported' "$TMP/cpu-limit-block.sh" \
     || fail "no CPU_LIMIT compatibility warning found in $ENTRYPOINT"
 
@@ -269,7 +274,7 @@ pass "CPU_LIMIT survives only as the compatibility warning"
 # --- 5. the supervisor is wired to the pid file -----------------------------
 # The guard loop needs the whole entrypoint around it, so assert on its own
 # lines: sampling /proc/$qemu_pid/stat is the defect.
-awk '/^# Keep supervising the VM/,/exit 3/' "$ENTRYPOINT" > "$TMP/guard.txt"
+awk '/^clock_ticks="\$\(getconf CLK_TCK\)"$/,/exit 3/' "$ENTRYPOINT" > "$TMP/guard.txt"
 grep -q 'read_emulator_pid' "$TMP/guard.txt" || fail "the guard loop does not read the emulator pid file"
 grep -q '/proc/\$qemu_pid/stat' "$TMP/guard.txt" && fail "the guard loop still samples the wrapper's /proc stat"
 grep -q 'ZD_QEMU_PID_FILE="\$qemu_pid_file"' "$ENTRYPOINT" || fail "the launcher is not given the pid file path"
@@ -290,8 +295,7 @@ pass "ZD_CPU_GUARD still defaults to 4"
 # saturate: a KVM guest of this appliance settles near 50% of a core, so 95%
 # there is abnormal, while a TCG emulator holding a full core is in its normal
 # steady state.  entrypoint.sh cannot be sourced, so lift the arming block out
-# and run it in a subshell -- the same idiom accel-selection-test.sh uses for the
-# ACCEL block.  vm_accel and cpu_guard are set for real, so this exercises the
+# and run it in a subshell.  vm_accel and cpu_guard are set for real, so this exercises the
 # decision the entrypoint actually makes rather than a copy of it.
 awk 'f && index($0, "echo \"ZD1200 is starting; waiting for the web service") == 1 { exit }
      index($0, "case \"$cpu_guard\" in") == 1 { f = 1 }
@@ -328,21 +332,17 @@ grep -q 'stopping QEMU after 24 samples' "$TMP/arm.kvm" \
 pass "a KVM guest arms the trip at 24 samples"
 
 # A TCG guest must not arm it, and must say why exactly once, naming the docs
-# section that records the measurements.  That section is "What the CPU guard is
-# now for": the note on repointing it there is that the guard's own rationale used
-# to live in "Why there is no CPU cap", which is about CPU_LIMIT, not the trip.
+# section that holds the figures.
 arm_accel tcg 24 >"$TMP/arm.tcg"
 grep -q 'armed=0' "$TMP/arm.tcg" \
     || { cat "$TMP/arm.err" >&2; fail "the trip is armed for a TCG guest ($(cat "$TMP/arm.tcg"))"; }
 [ "$(wc -l < "$TMP/arm.err")" = 1 ] \
     || { cat "$TMP/arm.err" >&2; fail "a TCG guest must get exactly one explanatory line, got $(wc -l < "$TMP/arm.err")"; }
 grep -q 'TCG' "$TMP/arm.err" || fail "the TCG explanation does not name TCG"
-grep -q 'What the CPU guard is now for' "$TMP/arm.err" \
+grep -q '"CPU guard" in docs/TROUBLESHOOTING.md' "$TMP/arm.err" \
     || fail "the TCG explanation does not point at the docs section"
 # ...and the section it names has to exist, or the pointer is worse than none.
-# The message used to name "Why there is no CPU cap" (an `##` section about
-# CPU_LIMIT); the guard's own rationale is "What the CPU guard is now for".
-grep -qE '^#{2,3} What the CPU guard is now for$' "$BASE/../../docs/TROUBLESHOOTING.md" \
+grep -qE '^## CPU guard \(`ZD_CPU_GUARD`\)$' "$BASE/../../docs/TROUBLESHOOTING.md" \
     || fail "the docs section the TCG explanation names does not exist"
 pass "a TCG guest leaves the trip unarmed, with one line naming the docs"
 
@@ -367,10 +367,10 @@ grep -q 'rc=2' "$TMP/arm.bad" \
 pass "an unusable ZD_CPU_GUARD is still refused under TCG"
 
 # --- 8. the trip honours that decision, and every launch is accounted for ----
-# A wider lift than section 5's: from the supervisor comment to the exit-status
+# A wider lift than section 5's: from the supervisor's first line to the exit-status
 # handling, so the accounting line after the loop is inside it too.
 awk 'f && index($0, "qemu_rc=0") == 1 { exit }
-     index($0, "# Keep supervising the VM") == 1 { f = 1 }
+     index($0, "clock_ticks=\"$(getconf CLK_TCK)\"") == 1 { f = 1 }
      f { print }' "$ENTRYPOINT" > "$TMP/supervisor.txt"
 grep -qE '^[[:space:]]*exit 3$' "$TMP/supervisor.txt" || fail "the supervisor fragment has no trip"
 
@@ -485,10 +485,10 @@ grep -q '^guard_record_every=60$' "$ENTRYPOINT" \
 pass "the guard records a running launch every 60 samples (~5 minutes)"
 
 # The TERM handler is the exact fix for the ordinary stop rather than a 5-minute
-# bound on it: it must record before cleanup()'s long wait, and must still end
-# with exactly the cleanup call the trap at the top of the script made, so no
-# exit status can change.  The entrypoint's own EXIT trap must stay as it is.
-grep -qF "trap 'cpu_guard_record_current \"\$sample_pid\" || true; cleanup 1' INT TERM" "$TMP/supervisor.txt" \
+# bound on it: it must record before cleanup()'s long wait, then run the same
+# cleanup-and-exit the trap at the top of the script does.  The entrypoint's own
+# EXIT trap must stay as it is.
+grep -qF "trap 'cpu_guard_record_current \"\$sample_pid\" || true; cleanup 1; exit 0' INT TERM" "$TMP/supervisor.txt" \
     || fail "the TERM handler does not record the launch before cleanup runs"
 grep -q "^trap 'cleanup 0' EXIT\$" "$ENTRYPOINT" \
     || fail "the entrypoint's EXIT trap changed"

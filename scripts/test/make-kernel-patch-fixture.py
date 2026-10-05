@@ -12,8 +12,10 @@ exactly the sites the patcher looks for:
 
   * `kernel_halt`             `mov eax,2` then the shutdown path's two calls,
   * `cob7402_reset_watchdog`  the 3-byte entry and its `cmp eax,1` / `cmp eax,3`,
-  * `wdt_timeout_marker`      the u-watchdog timeout block, and
-  * the **inlined** (group-B) `addrconf_dev_config` block.
+  * `wdt_timeout_marker`      the u-watchdog timeout block,
+  * the **inlined** (group-B) `addrconf_dev_config` block, and
+  * `tsc_read_refs_threshold` the 16-byte SMI-threshold compare in tsc_read_refs()
+    (`cmp ecx,0xc34f; ja`) at the real kernel's file offset 0x9ECA (code 0x8ECA).
 
 The inlined block is built at the geometry the five real inlined releases have,
 because the previous fixture did not: it laid 20 inert filler bytes in front of
@@ -85,6 +87,9 @@ SIG_AT = {
     "wdt": 0x3000,
     "addrconf_a": 0x4000,
     "addrconf_b": 0x5000,
+    # The real kernel's `tsc_read_refs_threshold` signature is at file offset
+    # 0x9ECA; HEAD is 0x1000, so the code offset is 0x8ECA.
+    "tsc": 0x8ECA,
 }
 
 # The byte used for every masked ("??") position, and for padding.  It is never
@@ -111,6 +116,12 @@ B_STOCK_WINDOW = ("e8" + "????????" + "85c0" + "8d7600" + "0f84" + "????????"
 # The live fall-through code in front of the anchor, m+0x04 .. m+0x14.  The old
 # entry overwrote this; it is stock in every real kernel and must stay stock.
 B_LIVE = "8b442418" + "89da" + "e8" + "????????" + "e9" + "????????"
+
+# The `tsc_read_refs_threshold` signature in patch-kernel.py: the stock bytes of
+# `sub ecx,edi; sbb ebx,ebp; cmp ebx,0; ja; cmp ecx,0xc34f; ja`.  Every byte is
+# pinned (the write's own four, the imm32, are masked only while locating), so the
+# fixture carries them verbatim -- and the patch's site is the 4 bytes at +11.
+TSC_REFS = "29f919eb83fb00771581f94fc3000077"
 
 
 def _call(from_va: int, to_va: int) -> bytes:
@@ -217,6 +228,11 @@ def wdt_block() -> bytes:
             + b"\xb8" + bytes([FILLER]) * 4             # mov eax,imm32 ("??")
             + _call(va + 34, va + 0x300)                # call <func>
             + _jmp(va + 39, va + 0x400))                # jmp
+
+
+def tsc_block() -> bytes:
+    """The 16 bytes `tsc_read_refs_threshold`'s signature describes, stock."""
+    return bytes.fromhex(TSC_REFS)
 
 
 def addrconf_a_blocks():
@@ -409,6 +425,7 @@ def build_code() -> bytearray:
         "kernel_halt": kernel_halt_block(),
         "cob7402": cob7402_block(),
         "wdt": wdt_block(),
+        "tsc": tsc_block(),
     }
     for name, blob in blocks.items():
         off = SIG_AT[name]

@@ -49,18 +49,11 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$BASE/synthetic-cf.img}"
-WORK="${WORK:-$BASE/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
 CERT_DIR="${1:-$(dirname "$BASE")/image/signing-cert}"
-
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
 
 # The cert payload (signing_cert.pem + the two digital-sig blobs +
 # all_checksums.txt) only ships in the 10.2+/10.5 archives.  Releases up to
@@ -75,11 +68,6 @@ for c in signing_cert.pem digital_sig_sha256.bin digital_sig_sha384.bin all_chec
         have_cert=0
     fi
 done
-
-rm -rf "$WORK"; mkdir -p "$WORK"
-
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
 
 # Pack the cert payload once (content identical on every partition).  Only
 # meaningful when the release ships the cert (see above).
@@ -184,22 +172,13 @@ exit 0
 ZD_NTP_RESULT
 chmod 755 "$WORK/S48zd_ntp_result"
 
-patched_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
-    part_changed=0
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     # ---- 1. /bin/sys_wrapper.sh ----
     say "[$name] patching /bin/sys_wrapper.sh"
     if ! fs_read "$IMG" /bin/sys_wrapper.sh "$WORK/sys_wrapper.orig"; then
         echo "  ! /bin/sys_wrapper.sh not present, skipping partition" >&2
-        continue
+        return 0
     fi
     # Either marker proves the sed already ran: the entitlement shortcuts always
     # insert theirs, and check_sign_cert() inserts its own on cert-bearing
@@ -212,7 +191,7 @@ for part in "${PARTITIONS[@]}"; do
         sed -f "$WORK/sys_wrapper.sed" "$WORK/sys_wrapper.orig" > "$WORK/sys_wrapper.new"
         diff -u "$WORK/sys_wrapper.orig" "$WORK/sys_wrapper.new" | sed 's/^/    /' || true
         write_local "$IMG" /bin/sys_wrapper.sh "$WORK/sys_wrapper.new"
-        part_changed=1
+        PATCH_APPLIED=1
     fi
 
     # ---- 2. /etc/persistent-scripts/patch-storage/ payload ----
@@ -234,50 +213,13 @@ EOF
     [ "$have_cert" = 1 ] && storage_files+=(cert.tgz)
     for f in "${storage_files[@]}"; do
         write_local "$IMG" "/etc/persistent-scripts/patch-storage/$f" "$WORK/$f"
-        part_changed=1
+        PATCH_APPLIED=1
     done
 
     # ---- 3. /etc/init.d/S48zd_ntp_result ----
     say "[$name] installing /etc/init.d/S48zd_ntp_result"
     write_local "$IMG" /etc/init.d/S48zd_ntp_result "$WORK/S48zd_ntp_result" 0755
-    part_changed=1
+    PATCH_APPLIED=1
+}
 
-    if [ "$part_changed" = 0 ]; then
-        echo "  no byte changes for $name"
-        continue
-    fi
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name (already patched on the disk?)"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing was written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk now matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-done
-
-say "patched content spot-checks ($(basename "$(spot_img)" .verify.img)):"
-echo "--- /bin/sys_wrapper.sh (patched anchors) ---"
-debugfs -R "cat /bin/sys_wrapper.sh" "$(spot_img)" 2>/dev/null | grep -n -E "check_sign_cert_unpatched|verify-upload-support-unpatched|wget-support-entitlement-unpatched|Have signed|support-list.xml" | head || true
-echo "--- patch-storage payload ---"
-debugfs -R "ls -l /etc/persistent-scripts/patch-storage" "$(spot_img)" 2>/dev/null | grep -v "^debugfs" || true
-echo "--- /etc/init.d/S48zd_ntp_result (upgrade NTP marker hook) ---"
-debugfs -R "cat /etc/init.d/S48zd_ntp_result" "$(spot_img)" 2>/dev/null | grep -n -E "start-ntpd|ntp_result" | head || true
-
-say "done — signing bypass + upgrade entitlement baked into $QCOW"
+patch_main apply

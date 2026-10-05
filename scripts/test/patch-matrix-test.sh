@@ -104,6 +104,7 @@ stage_layout() { # <rt>: the Docker/LXC layout (scripts at top level, image/ bes
     local rt="$1"
     mkdir -p "$rt"
     cp -a "$REPO/scripts/container/patch-lib.sh" "$REPO/scripts/container/patch-kernel.py" \
+          "$REPO/scripts/container/binpatch.py" "$REPO/scripts/container/patch-file.py" \
           "$REPO/scripts/container/build-synthetic-cf.py" "$REPO/scripts/container/build-bootfs.py" \
           "$REPO/scripts/container/write-boarddata.py" \
           "$REPO/scripts/container/license-fix.awk" "$REPO/scripts/container/backup-restore.sh" \

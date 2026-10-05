@@ -22,22 +22,11 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
+patch_env
 
 TARGET="/etc/init.d/S98zd_container_control"
-
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
-
-[ -f "$QCOW" ] || { echo "QCOW not found: $QCOW" >&2; exit 1; }
-
-rm -rf "$WORK"; mkdir -p "$WORK"
 
 cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
 #!/bin/sh
@@ -90,11 +79,24 @@ cat > "$WORK/S98zd_container_control" <<'ZD_CONTAINER_CONTROL'
     }
 
     guest_address() {
-        # The stock stack manages the interface it created for the management
-        # address; report whatever address that interface holds now.
-        for dev in br0 uif0 eth0; do
+        # The controller's own address is on br0, or -- once it is given a
+        # management VLAN (CLI: config > system > interface > vlan <id>) -- on
+        # the br0.<vid> device the stock stack creates for that VLAN, and br0
+        # then holds no IPv4 at all.  The separate management interface (CLI:
+        # config > system > mgmt-if) is an alias, labelled br0.<vid>:<n>; it is a
+        # second address, not the controller's, so it only counts when nothing
+        # else answers.  An alias is any line with a ':' after the address field
+        # (the label), wherever the kernel puts it among the trailing fields.
+        vlans=$(ls /sys/class/net 2>/dev/null | grep '^br0\.[0-9][0-9]*$')
+        for dev in br0 $vlans uif0 eth0; do
             addr=$(ip -4 -o addr show dev "$dev" 2>/dev/null \
-                   | awk '{print $4}' | cut -d/ -f1 | head -n1)
+                   | awk '{a = 0; for (i = 5; i <= NF; i++) if ($i ~ /:/) a = 1}
+                          !a {print $4; exit}' | cut -d/ -f1)
+            [ -n "$addr" ] && { echo "$addr"; return; }
+        done
+        for dev in br0 $vlans; do
+            addr=$(ip -4 -o addr show dev "$dev" 2>/dev/null \
+                   | awk '{print $4; exit}' | cut -d/ -f1)
             [ -n "$addr" ] && { echo "$addr"; return; }
         done
     }
@@ -194,48 +196,19 @@ ZD_CONTAINER_CONTROL
 chmod 755 "$WORK/S98zd_container_control"
 printf '%s\n' "$TARGET" > /dev/null
 
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
-
-patched_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     say "[$name] installing $TARGET"
     write_local "$WORK/$name.img" "$TARGET" "$WORK/S98zd_container_control" 0755
+    PATCH_APPLIED=1
+}
 
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-    read -r t _ _ _ <<< "$(fs_stat_meta "$WORK/$name.verify.img" "$TARGET")"
-    [ "$t" = "regular" ] || { echo "FAIL $name: $TARGET missing" >&2; exit 1; }
+verify() { # <name> <img>: the root as re-read from the disk
+    local name="$1"
+    read -r t _ _ _ <<< "$(fs_stat_meta "$2" "$TARGET")"
+    [ "$t" = "regular" ] || { echo "FAIL $name: $TARGET missing" >&2; return 1; }
     echo "OK   $name: $TARGET installed"
-done
+    return 0
+}
 
-say "done — container control hook installed in $QCOW"
+patch_main apply verify

@@ -4,7 +4,7 @@
 # (host-netns, macvtap on the host's physical NIC).  This is the Docker entry
 # point, pairing with install-zd1200-lxc.sh for Proxmox: it prepares the
 # vendor image (once), creates .env if absent, then builds and starts the
-# container from docker/docker-compose.yml (GRUB is compiled in the image build).
+# container from docker/docker-compose.yml.
 #
 # Usage:
 #   ./install-zd1200-docker.sh firmware.img            # install from firmware alone
@@ -25,6 +25,20 @@
 #                                                      # replacement and enable public-key
 #                                                      # root SSH on TCP 2222 (slow build)
 #
+# Options:
+#   --no-up                  only build and prepare; do not start the container
+#   --upgrade                upgrade an existing appliance in place (see above)
+#   --root-ssh-key KEY       public-key file or key string for root SSH on TCP 2222
+#   --source / --firmware F  named alias for the firmware positional argument
+#   --backup PATH            named alias for a configuration-backup positional
+#   --writable-from PATH     named alias for a ZD1100/ZD3000 dump positional
+#   --writable-partition S:C override the /writable geometry otherwise read from the
+#                            dump's own partition table (START:COUNT, in 512-byte
+#                            sectors); for a dump whose table cannot be read
+#   --no-r600-repair         do not patch the ap-11n-scorpion (R600) mesh bug out of
+#                            the AP image the guest delivers
+#   -h | --help
+#
 # The inputs are classified by their contents, not their names.  A firmware
 # upgrade file is a complete appliance on its own; a ZD configuration backup
 # needs a ZD1200 firmware of the same release; a ZD1200 card dump carries its own
@@ -38,8 +52,10 @@
 # ECDSA host key and the Network Monitor setting already installed are kept; a key
 # is only replaced when --root-ssh-key is given explicitly.
 #
-# The container runs under host-netns; see README.md ("Host requirements" and
-# "Gotchas") for what the host must provide (MAC-spoofing NIC, KVM optional).
+# The container runs under host-netns, with the guest on a macvtap of the host's
+# NIC (the Docker host itself cannot reach it); /dev/kvm is optional, since TCG is
+# only slow.  docs/TROUBLESHOOTING.md covers what to check when it does not come up.
+
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -83,9 +99,10 @@ while [ $# -gt 0 ]; do
         --backup=*) OPT_BACKUP="${1#*=}"; shift ;;
         --no-r600-repair) r600_repair=0; shift ;;
         -h|--help)
-            sed -n '2,42p' "$0"
+            sed -n '2,/^$/p' "$0"
             exit 0
             ;;
+        -*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
         *) POSITIONALS+=("$1"); shift ;;
     esac
 done
@@ -207,6 +224,10 @@ fi
 # firmware archive or a card dump.  Built from docker/Dockerfile alone; it does
 # not need image/ to exist yet.
 echo "== Building the ZD1200 container image =="
+# BuildKit's default provenance attestation gives every build a new image id even
+# when nothing changed, and `compose up` then recreates -- reboots -- a running
+# appliance on every run of this script.  Without it an unchanged build keeps its id.
+export BUILDX_NO_DEFAULT_ATTESTATIONS=1
 "${compose_cmd[@]}" build
 
 # --- 2. prepare image/ (once), inside that image -----------------------------
@@ -285,6 +306,9 @@ if [ "$prepared" = 1 ]; then
     fi
     [ -n "$writable_partition" ] && prepare_args+=(--writable-partition "$writable_partition")
     echo "== Preparing image/ from $archive (inside the container image) =="
+    # image/ is about to be rewritten: a failed prepare must not leave the old
+    # inputs' stamp over a half-written image/.
+    rm -f "$image_stamp"
     "${docker_cmd[@]}" run --rm \
         --user "$(id -u):$(id -g)" \
         "${run_mounts[@]}" \
@@ -391,7 +415,39 @@ if ! grep -qE '^ZD_VIRTUAL_BUILD_ID=..*' .env 2>/dev/null \
         && echo "== Admin console will report source revision: virtual $ZD_VIRTUAL_BUILD_ID =="
 fi
 
+# The compose file bind-mounts these two directories.  When one is missing Docker
+# creates it as root, and a later install by this user can then not write into it
+# (a firmware install after a card dump cannot extract its signing cert; a
+# --root-ssh-key re-run cannot write its key).  Make them here, as this user; both
+# are legitimately empty when nothing fills them.
+mkdir -p image/signing-cert dropbear-provision
+
 # --- 4. start ---------------------------------------------------------------
+# A failure at start that will not go away (a rejected backup, a disk build that
+# fails) makes the entrypoint exit, and the container's restart policy then loops
+# on it for good while `compose up` reports success.  Watch the container for a
+# minute after it starts and, if it is restarting, say so with its last output
+# instead of printing "Started".  ZD_START_GUARD_SECONDS=0 turns this off.
+guard_start() {
+    local limit="${ZD_START_GUARD_SECONDS:-60}" waited=0 state restarts
+    case "$limit" in ''|*[!0-9]*) limit=60 ;; esac
+    while [ "$waited" -lt "$limit" ]; do
+        sleep 3
+        waited=$((waited + 3))
+        state="$("${docker_cmd[@]}" inspect -f '{{.State.Status}}' "$inst" 2>/dev/null || true)"
+        restarts="$("${docker_cmd[@]}" inspect -f '{{.RestartCount}}' "$inst" 2>/dev/null || true)"
+        case "$restarts" in ''|*[!0-9]*) restarts=0 ;; esac
+        if [ "$state" = restarting ] || [ "$state" = exited ] || [ "$state" = dead ] || [ "$restarts" -gt 0 ]; then
+            echo >&2
+            echo "error: the container '$inst' is not staying up (state: $state, restarts: $restarts). Its last output:" >&2
+            "${docker_cmd[@]}" logs --tail 30 "$inst" >&2 || true
+            echo >&2
+            echo "It keeps restarting until you stop it: ${compose_cmd[*]} down" >&2
+            exit 1
+        fi
+    done
+}
+
 # The image was built in step 1; compose up only creates/starts the container.
 if [ "$no_up" = 1 ]; then
     if [ "$upgrade" = 1 ]; then
@@ -405,12 +461,14 @@ elif [ "$upgrade" = 1 ]; then
     echo "   The state volume (and /writable) is kept; the roots are re-customised"
     echo "   from their rollback store on start."
     "${compose_cmd[@]}" up -d --force-recreate
+    guard_start
     echo
     echo "Upgraded. Follow it:   ${docker_cmd[*]} logs -f $inst"
     echo "Guest console:         ${docker_cmd[*]} exec $inst tail -f $console_log"
 else
     echo "== Starting the ZD1200 container =="
     "${compose_cmd[@]}" up -d
+    guard_start
     echo
     echo "Started. Follow boot:  ${docker_cmd[*]} logs -f $inst"
     echo "Guest console:         ${docker_cmd[*]} exec $inst tail -f $console_log"

@@ -36,26 +36,14 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QCOW="${QCOW:-$(dirname "$BASE")/synthetic-cf.img}"
-WORK="${WORK:-$(dirname "$BASE")/.rootfs-patch-work}"
-SRC_AWK="$(dirname "$BASE")/license-fix.awk"
-INIT_DST=/etc/init.d/S49zd_license
-AWK_DST=/etc/zd-license-fix.awk
-ALIGN=512
 # shellcheck source=../patch-lib.sh
 . "$(dirname "$BASE")/patch-lib.sh"
-
-# The roots this run may touch: prepare-vm-disks.sh passes its per-root
-# selection in ZD_PATCH_PARTS; with none set this is the full root pair
-# (patch-lib.sh:patch_parts), which is how the patch tests drive it.
-load_patch_parts
+patch_env
+INIT_DST=/etc/init.d/S49zd_license
+AWK_DST=/etc/zd-license-fix.awk
+SRC_AWK="$(dirname "$BASE")/license-fix.awk"
 
 [ -f "$SRC_AWK" ] || { echo "25-writable-license: $SRC_AWK missing" >&2; exit 1; }
-
-rm -rf "$WORK"; mkdir -p "$WORK"
-
-say "reading the flat disk $QCOW"
-ln -sf "$QCOW" "$WORK/flat.raw"
 
 # The guest hook.  Constants and comments live here, not in the patch, so the
 # installed file is self-describing.  Single-quoted heredoc: nothing expands.
@@ -142,52 +130,13 @@ exit 0
 ZD_LICENSE
 chmod 755 "$WORK/S49zd_license"
 
-patched_any=0
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    say "[$name] extracting partition (sector $start, ${sectors}s)"
-    extract_part "$name" "$start" "$sectors"
-    snapshot_orig "$name"
-    IMG="$WORK/$name.img"
-    pr_init "$IMG"
-
+apply() { # <name> <img>
+    local name="$1" IMG="$2"
     say "[$name] installing $INIT_DST"
     write_local "$IMG" "$INIT_DST" "$WORK/S49zd_license" 0755
     say "[$name] installing $AWK_DST"
     write_local "$IMG" "$AWK_DST" "$SRC_AWK" 0644
+    PATCH_APPLIED=1
+}
 
-    if write_deltas "$name" "$start"; then
-        patched_any=1
-    else
-        echo "  no byte changes for $name"
-    fi
-done
-
-if [ "$patched_any" = 0 ]; then
-    say "no patch produced changes; nothing written to the disk"
-    exit 0
-fi
-
-say "verifying: re-reading the disk and comparing each partition"
-ln -sf "$QCOW" "$WORK/flat.verify.raw"
-for part in "${PARTITIONS[@]}"; do
-    IFS='|' read -r name start sectors <<< "$part"
-    dd if="$WORK/flat.verify.raw" of="$WORK/$name.verify.img" bs=$ALIGN \
-       skip="$start" count="$sectors" status=none
-    if cmp -s "$WORK/$name.verify.img" "$WORK/$name.img"; then
-        echo "OK   $name: disk matches the patched partition image"
-    else
-        echo "FAIL $name: disk does not match the patched partition image" >&2
-        exit 1
-    fi
-done
-
-say "patched content spot-checks ($(basename "$(spot_img)" .verify.img)):"
-echo "--- $INIT_DST ---"
-debugfs -R "cat $INIT_DST" "$(spot_img)" 2>/dev/null \
-    | grep -n -E "MARKER=|BUILTIN_AP=|license-fix.awk|LISTS=" | head || true
-echo "--- $AWK_DST ---"
-debugfs -R "cat $AWK_DST" "$(spot_img)" 2>/dev/null \
-    | grep -n -E "generated-by|max-ap|inc-ap" | head || true
-
-say "done — /writable license hook installed in $QCOW"
+patch_main apply

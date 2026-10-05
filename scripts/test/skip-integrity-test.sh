@@ -48,6 +48,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PATCH="$REPO/scripts/container/patches/40-skip-integrity.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-skipint.XXXXXX")"
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -75,7 +76,6 @@ MD5_PATTERN='/usr/bin/md5sum -c'
 ALIGN=512
 START=84568                  # the flat disk's hda2 sector, as patch-lib defines it
 SECTORS=32768                # 16 MiB, enough for the fixture root
-ROOT_BYTES=$(( SECTORS * ALIGN ))
 TARGET=/etc/init.d/chk_integrity.sh
 
 # --- the fixture root the clone check copies from ----------------------------
@@ -183,16 +183,12 @@ FIXTURE
 
 # --- helpers -----------------------------------------------------------------
 build_disk() { # <checker> <disk>
-    local stage="$TMP/stage.$$" img="$TMP/part.$$.img"
+    local stage="$TMP/stage.$$"
     rm -rf "$stage"; mkdir -p "$stage/etc/init.d"
     cp "$1" "$stage/etc/init.d/chk_integrity.sh"
     cp "$TMP/file_list.txt" "$stage/file_list.txt"
-    rm -f "$img"
-    mke2fs -q -t ext2 -b 1024 -I 128 -m 0 -F -d "$stage" "$img" \
-        $(( ROOT_BYTES / 1024 )) >/dev/null 2>&1 || fail "mke2fs failed"
-    rm -f "$2"; truncate -s $(( (START + SECTORS) * ALIGN )) "$2"
-    dd if="$img" of="$2" bs=$ALIGN seek="$START" conv=notrunc status=none
-    rm -rf "$stage" "$img"
+    ext2_disk_from_stage "$stage" "$2" "$START" "$SECTORS" "$ALIGN" || fail "mke2fs failed"
+    rm -rf "$stage"
 }
 
 run_patch() { # <disk> <workdir> <log>
@@ -201,9 +197,9 @@ run_patch() { # <disk> <workdir> <log>
 }
 
 read_back() { # <disk> <fspath> <out>
-    dd if="$1" of="$TMP/part.read.img" bs=$ALIGN skip="$START" count=$SECTORS status=none
+    part_image "$1" "$TMP/part.read.img" "$START" "$SECTORS" "$ALIGN"
     rm -f "$3"
-    debugfs -R "dump $2 $3" "$TMP/part.read.img" >/dev/null 2>&1
+    fs_dump "$TMP/part.read.img" "$2" "$3"
     [ -s "$3" ]
 }
 

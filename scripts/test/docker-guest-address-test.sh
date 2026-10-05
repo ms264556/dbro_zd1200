@@ -20,6 +20,7 @@ set -euo pipefail
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/zd-guestaddr.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { printf 'ok   %s\n' "$*"; }
@@ -35,7 +36,7 @@ NO_SOCKET="$TMP/no-such-control.sock"     # never created: proves no socket is n
 
 [ -f "$ENTRYPOINT" ] || fail "not found: $ENTRYPOINT"
 command -v rg >/dev/null 2>&1 \
-    || fail "rg (ripgrep) is required: entrypoint.sh greps the console log with it"
+    || { echo "skipped: rg (ripgrep) is not installed; entrypoint.sh greps the console log with it"; exit 0; }
 
 # --- the staged runtime the entrypoint runs from ----------------------------
 # entrypoint.sh computes work_dir from its own path and calls its neighbours by
@@ -250,13 +251,13 @@ case "$HELPER_REL" in
 esac
 [ -x "$HELPER" ] \
     || fail "no executable helper at $HELPER_REL (the path entrypoint.sh:37 computes): the Docker image would fall back to the static GUEST_IP"
-# The old path is what the LXC/VM configuration names (mkosi.extra/etc/
-# zd1200.conf:115, zd1200-ct-bootstrap.sh:660, units-install.sh:88 makes it the
-# VM's HELPER_DIR), so it must still reach a working helper -- whether that is a
-# symlink to the new path or a delegating wrapper.  Comparing behaviour rather
-# than file identity keeps both implementations acceptable.
+# The old path is what existing LXC installs still name, so it must still reach
+# a working helper -- whether that is a symlink to the new path or a delegating
+# wrapper.
+# Comparing behaviour rather than file identity keeps both implementations
+# acceptable.
 [ -x "$OLD_HELPER" ] \
-    || fail "$OLD_HELPER_REL is gone or not executable, but existing LXC/VM callers name it (mkosi.extra/etc/zd1200.conf:115, zd1200-ct-bootstrap.sh:660)"
+    || fail "$OLD_HELPER_REL is gone or not executable, but existing LXC/VM installs still name it"
 if ! diff <("$HELPER" --help 2>&1) <("$OLD_HELPER" --help 2>&1) >/dev/null; then
     fail "$OLD_HELPER_REL no longer reaches the same helper as $HELPER_REL"
 fi
@@ -269,7 +270,10 @@ pass "the helper is at the Docker path and the old LXC/VM path still reaches it"
 if ! command -v python3 >/dev/null 2>&1; then
     fail "python3 is required: the helper (and the Docker image) query the guest with it"
 fi
-sock="$TMP/real-helper.sock"
+# The socket lives in a short directory: a long TMPDIR overflows sun_path.
+SOCK_DIR="$(short_sock_dir)"
+trap 'rm -rf "$TMP" "$SOCK_DIR"' EXIT
+sock="$SOCK_DIR/real-helper.sock"
 ready="$TMP/real-helper.ready"
 python3 - "$sock" "$ready" "$GUEST_ADDR" <<'PY' &
 import socket, sys

@@ -49,6 +49,8 @@ Usage:
 from pathlib import Path
 import argparse
 import gzip
+import os
+import re
 import shutil
 import struct
 import subprocess
@@ -56,8 +58,10 @@ import sys
 import tempfile
 
 BASE = Path(__file__).resolve().parent
-INITRAMFS = BASE / "image" / "restoreinitramfs.gz"
-MENU_LST = BASE / "image" / "menu.lst"
+# RUNTIME_DIR relocates image/ the same way build-synthetic-cf.py does.
+RUNTIME = Path(os.environ.get("RUNTIME_DIR") or BASE)
+INITRAMFS = RUNTIME / "image" / "restoreinitramfs.gz"
+MENU_LST = RUNTIME / "image" / "menu.lst"
 
 # Where the firmware's restore initramfs keeps GRUB, and what we take from it.
 GRUB_INITRAMFS_DIR = "lib/grub/i386-pc"
@@ -146,6 +150,31 @@ def check(condition: bool, msg: str) -> None:
         fail(msg)
 
 
+# debugfs exits 0 even when an individual command fails, so its output is the
+# only place a failed write/mkdir/set_inode_field shows up.
+DEBUGFS_ERROR = re.compile(
+    r"could not allocate|no space|too small|not found|no such file|already exists"
+    r"|ext2fs_\w+:|do_write_internal:|^(?:write|mkdir|set_inode_field|dump|stat): ",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def run_debugfs(args: list) -> str:
+    """Run debugfs, failing on a non-zero exit or any error text in its output."""
+    r = subprocess.run(["debugfs", *args], capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0 or DEBUGFS_ERROR.search(out):
+        fail(f"debugfs {' '.join(args)} failed (rc={r.returncode}):\n{out.strip()}")
+    return out
+
+
+def debugfs_size(img, path: str) -> int:
+    """Size of `path` in the ext2 image `img`, or -1 when it is absent."""
+    r = subprocess.run(["debugfs", "-R", f"stat {path}", str(img)],
+                       capture_output=True, text=True)
+    m = re.search(r"\bSize:\s*(\d+)", r.stdout or "")
+    return int(m.group(1)) if m and "Inode:" in r.stdout else -1
+
+
 def require_tools() -> None:
     for tool in ("mke2fs", "debugfs"):
         if not shutil.which(tool):
@@ -178,7 +207,8 @@ def extract_grub() -> dict:
                 break
             if name in wanted:
                 found[wanted[name]] = data
-            elif name.startswith(GRUB_SBIN_PREFIX):
+            elif name.startswith(GRUB_SBIN_PREFIX) and (fields[1] & 0o170000) == 0o100000:
+                # regular files only: a symlink/dir entry's data is not file content
                 found[f"{SBIN_DIR}/{name.split('/', 1)[1]}"] = data
     for name in GRUB_FILES:
         check(name in found, f"{INITRAMFS}: {GRUB_INITRAMFS_DIR}/{name} not found")
@@ -222,15 +252,45 @@ def verify_menu_lst(raw: bytes) -> bytes:
 
 
 def patch_menu_cmdline(raw: bytes) -> bytes:
-    """Append no_timer_check to every ZD1200 kernel line in menu.lst."""
+    """Append no_timer_check to every ZD1200 kernel line in menu.lst.
+
+    With ZD_KERNEL_VERBOSE=1, `quiet` is replaced by `ignore_loglevel` on those
+    lines as well.  The vendor boots `... ro quiet`, which suppresses almost the
+    whole kernel log on ttyS0 -- including the clocksource selection, the TSC
+    warp/stability verdict and every driver's probe result.  Those lines are the
+    only place some guest behaviour can be seen at all: this guest has no
+    working in-guest login on a fresh install, so its /var/log is unreachable
+    and the console is the sole channel.  Diagnostic only; it changes no device
+    or driver.  Note it is part of the disk's vendor signature, so toggling it
+    rebuilds the boot area and needs a state reset (see docs/TROUBLESHOOTING.md).
+    """
+    verbose = os.environ.get("ZD_KERNEL_VERBOSE", "0") == "1"
+    # ZD_KERNEL_CLOCKSOURCE selects a clocksource for the guest (empty = vendor
+    # default).  It exists to A/B the remaining candidate for the idle-CPU burn:
+    # with the default HPET clocksource an idle guest reads MMIO ~9000x/s, and
+    # under nested KVM each read is an expensive exit.  `acpi_pm` is the only
+    # other clocksource this kernel offers; it is port I/O rather than MMIO, so
+    # it might be cheaper, at the cost of a 24-bit 3.58 MHz counter.
+    extra = ""
+    if os.environ.get("ZD_KERNEL_CLOCKSOURCE"):
+        extra = " clocksource=" + os.environ["ZD_KERNEL_CLOCKSOURCE"]
     lines = []
     patched = 0
+    devoiced = 0
     for line in raw.decode("ascii").splitlines(keepends=True):
         if line.startswith("\tkernel (hd0,") and "no_timer_check" not in line:
             line = line.rstrip("\n") + TIMER_FIX + "\n"
             patched += 1
+        if verbose and line.startswith("\tkernel (hd0,"):
+            line = line.rstrip("\n") + extra + "\n"
+            if " quiet" in line:
+                line = line.replace(" quiet", " ignore_loglevel")
+                devoiced += 1
         lines.append(line)
     check(patched >= 2, f"menu.lst: expected ZD1200 kernel lines, patched {patched}")
+    if verbose:
+        check(devoiced >= 2, f"menu.lst: expected 2+ quiet lines to voice, got {devoiced}")
+        print(f"  menu.lst: ZD_KERNEL_VERBOSE=1, made {devoiced} kernel lines verbose")
     return "".join(lines).encode("ascii")
 
 
@@ -358,8 +418,17 @@ def build_ext2(files: dict) -> bytes:
                 cmds.append(f"set_inode_field {key} mode 0100755")
         cmdfile = td / "cmds"
         cmdfile.write_text("\n".join(cmds) + "\n")
-        subprocess.run(["debugfs", "-w", "-f", str(cmdfile), str(img)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_debugfs(["-w", "-f", str(cmdfile), str(img)])
+        # A failed `write` (no space) can still leave an inode, so check sizes too.
+        for name in FILES:
+            for d in GRUB_DIRS:
+                got = debugfs_size(img, f"{d}/{name}")
+                check(got == len(files[name]),
+                      f"bootfs: {d}/{name} is {got} bytes, expected {len(files[name])}")
+        for key in sbin:
+            got = debugfs_size(img, key)
+            check(got == len(sbin[key]),
+                  f"bootfs: {key} is {got} bytes, expected {len(sbin[key])}")
         return img.read_bytes()
 
 
@@ -414,8 +483,7 @@ def verify(boot: bytes, stage1_5_len: int) -> list:
             fail("verification failed: /boot/grub exists; GRUB would read it instead "
                  "of the tree the upgrade edits")
         stage2 = Path(td) / "stage2"
-        subprocess.run(["debugfs", "-R", f"dump /lib/grub/i386-pc/stage2 {stage2}", str(fs)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_debugfs(["-R", f"dump /lib/grub/i386-pc/stage2 {stage2}", str(fs)])
         data = stage2.read_bytes()
         checks.append(("stage2 ZD pt sector -> 3927001",
                        struct.pack("<I", ZD_PART_SECTOR_ZD1200) in data
@@ -424,8 +492,7 @@ def verify(boot: bytes, stage1_5_len: int) -> list:
                        STAGE2_CONFIG_NEW + b"\x00" in data
                        and STAGE2_CONFIG_OLD not in data))
         menu = Path(td) / "menu.lst"
-        subprocess.run(["debugfs", "-R", f"dump /lib/grub/i386-pc/menu.lst {menu}", str(fs)],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_debugfs(["-R", f"dump /lib/grub/i386-pc/menu.lst {menu}", str(fs)])
         checks.append(("menu.lst kernel cmdline has no_timer_check",
                        menu.read_bytes().count(b"no_timer_check") >= 2))
     return checks
@@ -463,8 +530,9 @@ def main() -> None:
     boot = build_bootfs()
     if args.out:
         out = Path(args.out)
-        with gzip.GzipFile(filename="", mode="wb", fileobj=out.open("wb"), mtime=0) as gz:
-            gz.write(boot)
+        with out.open("wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+                gz.write(boot)
         print(f"build-bootfs: wrote {out} ({out.stat().st_size} bytes compressed, "
               f"{len(boot)} bytes uncompressed)")
     else:

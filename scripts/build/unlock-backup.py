@@ -107,6 +107,10 @@ def unlock(source_path: Path, destination_path: Path) -> None:
             destination.write(encrypted)
             destination.flush()
             os.fsync(destination.fileno())
+        # mkstemp makes the file 0600.  The Docker container mounts image/
+        # read-only and runs as root without CAP_DAC_OVERRIDE, so it can only read
+        # what the host user made world-readable -- as the other image/ files are.
+        os.chmod(temporary_name, 0o644)
         os.replace(temporary_name, destination_path)
     except BaseException:
         try:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/container/proxmox/zd1200-guest-healthcheck — ask the running ZD1200 guest whether it is
+# scripts/container/zd1200-guest-healthcheck — ask the running ZD1200 guest whether it is
 # healthy, over the serial control channel and nothing else.
 #
 # Exit 0 = the guest answered and says it is up; non-zero = it did not, and
@@ -20,7 +20,7 @@
 #     cannot: whether its management service is answering, on whatever address
 #     and family it chose to bind.
 #
-# TtyS1 is a private, non-networked channel, so a reply that comes back proves
+# ttyS1 is a private, non-networked channel, so a reply that comes back proves
 # the guest's kernel, its init and its userspace are all still running.  The
 # guest answers two questions in one round trip:
 #
@@ -29,9 +29,9 @@
 #
 # The guest performs that request locally (see the `ready` command in
 # scripts/container/patches/70-container-control.sh): a real HTTPS request
-# against 127.0.0.1, not a socket-table read.  A table read was tried and was
-# wrong in the dangerous direction -- it reported "not listening" on an
-# appliance that was demonstrably serving the wizard.
+# against 127.0.0.1, not a socket-table read: a table read can report "not
+# listening" on an appliance that is in fact serving, which fails a healthy
+# guest.
 set -u
 
 STATE_DIR="${STATE_DIR:-/var/lib/zd1200}"
@@ -60,10 +60,12 @@ if [ ! -x "$HELPER" ]; then
 fi
 
 # The address first.  Accept the marked form ("ZD-GUEST-IP=...") and a bare
-# address: the helper has emitted both, and a healthcheck should not turn a
-# helper's formatting choice into "the guest is dead".
+# address: a healthcheck should not turn the helper's formatting choice into
+# "the guest is dead".
 err_file="$(mktemp 2>/dev/null || echo /dev/null)"
-probe_out="$("$HELPER" --timeout "$TIMEOUT" 2>"$err_file" || true)"
+# --probe: ask the guest now; without it the helper returns the cached address
+# and a dead guest reads as healthy.
+probe_out="$("$HELPER" --probe --timeout "$TIMEOUT" 2>"$err_file" || true)"
 probe_err="$(head -n1 "$err_file" 2>/dev/null || true)"
 [ "$err_file" = "/dev/null" ] || rm -f "$err_file"
 
