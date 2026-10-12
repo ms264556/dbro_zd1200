@@ -40,7 +40,7 @@ Docker:
 The backup restores on the first boot.
 
 > Later you can upgrade from the Web UI, beyond what the dead unit ran. See the
-> [Firmware Guide](https://ms264556.net/ruckus/FirmwareGuide?p=ZoneDirector&q=ZD1200) for AP support.
+> [Firmware Guide](https://ms264556.net/ruckus/ZoneDirectorFirmwareGuide?p=ZD1200) for AP support.
 
 ## Recipe 2: you have the storage from the dead unit
 
@@ -95,7 +95,7 @@ Docker:
 ```
 
 > Later you can upgrade from the Web UI, beyond what the dead unit ran. See the
-> [Firmware Guide](https://ms264556.net/ruckus/FirmwareGuide?p=ZoneDirector&q=ZD1200) for AP support.
+> [Firmware Guide](https://ms264556.net/ruckus/ZoneDirectorFirmwareGuide?p=ZD1200) for AP support.
 
 ## Recipe 3: you don't have a backup or dump
 
