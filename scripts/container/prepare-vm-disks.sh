@@ -69,6 +69,10 @@ ZD_ROOT_SSH_AUTHORIZED_KEYS="${ZD_ROOT_SSH_AUTHORIZED_KEYS:-/opt/zd1200/dropbear
 ZD_ECDSA_SSH="${ZD_ECDSA_SSH:-1}"
 # Optional Network Monitor page + collectors (patch 50); 0 installs nothing.
 ZD_NETWORK_MONITOR="${ZD_NETWORK_MONITOR:-1}"
+# Optional ap-11n-scorpion (R600) mesh repair of the AP images seeded into
+# /writable; opt-in, so 0 (deliver the vendor AP image) unless asked for.  The
+# repair has been observed to bootloop APs, which is why it is not the default.
+ZD_R600_REPAIR="${ZD_R600_REPAIR:-0}"
 MARKER="${MARKER:-$STATE_DIR/.disk-built}"
 # The container's own record that a configuration backup was seeded into the
 # built /writable.  The guest's half (patch 26) applies and consumes the staged
@@ -216,7 +220,7 @@ EOF
     # existing appliance whose rootfs changed and refuse to rebuild it.
     NEW_DISK="$DISK.building"
     rm -f "$NEW_DISK"
-    SYNTHETIC_DISK="$NEW_DISK" ZD_R600_REPAIR="${ZD_R600_REPAIR:-1}" \
+    SYNTHETIC_DISK="$NEW_DISK" ZD_R600_REPAIR="$ZD_R600_REPAIR" \
         python3 "$BASE/build-synthetic-cf.py"
     say "Writing board data (serial=${ZD_SERIAL:-123456000789}, MAC1=${ZD_MAC1:-00:0c:e6:12:00:01})"
     python3 "$BASE/write-boarddata.py" --disk "$NEW_DISK" \

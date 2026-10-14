@@ -38,7 +38,13 @@
 #                            (builds the static dropbear replacement; slow)
 #   --no-ecdsa               do not add an ECDSA host key to the SSH service
 #   --no-network-monitor     skip the Network Monitor page + collectors
-#   --no-r600-repair         skip the ap-11n-scorpion (R600) mesh repair
+#   --r600-repair            enable the ap-11n-scorpion (R600) mesh repair of the
+#                            AP images seeded into /writable.  Opt-in: off by
+#                            default, because the repaired image has been observed
+#                            to bootloop APs.  The APs must already run Solo 104
+#                            or 106 firmware before the repaired image is accepted.
+#   --no-r600-repair         leave the vendor AP images alone (the default);
+#                            accepted so a re-run can turn an inherited repair off
 #   --no-console-tty         leave /dev/tty1 as a login prompt instead of
 #                            putting the guest's serial console on it
 #   --keep-ct-address        keep the container's own IP address while the guest
@@ -81,7 +87,8 @@ BACKUP_MODE=""
 ROOT_SSH_KEY=""
 ECDSA=1
 NETWORK_MONITOR=1
-R600_REPAIR=1
+# Opt-in: leave the vendor AP images alone unless the repair was asked for.
+R600_REPAIR=0
 CONSOLE_TTY=1
 KEEP_CT_ADDRESS=0
 SHARE_MAC=0
@@ -117,6 +124,19 @@ run_logged() {
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# ruckus_tool_is_placeholder <path>: is this the inert `#!/bin/sh; exit 0` script
+# an older version of this bootstrap wrote for the Ruckus squashfs tools when the
+# R600 repair was disabled?  Such a file is executable, so a plain -x test would
+# accept it as "already built" and a later opt-in would silently repair nothing.
+ruckus_tool_is_placeholder() {
+    [ -f "$1" ] || return 1
+    # Check the shebang two bytes at a time first: reading a whole line of a real
+    # ELF tool (the common case) would spill null bytes into the substitution.
+    [ "$(head -c 2 "$1" 2>/dev/null)" = "#!" ] || return 1
+    [ "$(head -n1 "$1" 2>/dev/null)" = "#!/bin/sh" ] || return 1
+    [ "$(sed -n 2p "$1" 2>/dev/null)" = "exit 0" ]
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --source)               SOURCE="${2:?--source needs a path}"; shift 2 ;;
@@ -130,6 +150,7 @@ while [ $# -gt 0 ]; do
         --root-ssh-key)         ROOT_SSH_KEY="${2:?}"; shift 2 ;;
         --no-ecdsa)             ECDSA=0; shift ;;
         --no-network-monitor)   NETWORK_MONITOR=0; shift ;;
+        --r600-repair)          R600_REPAIR=1; shift ;;
         --no-r600-repair)       R600_REPAIR=0; shift ;;
         --no-console-tty)       CONSOLE_TTY=0; shift ;;
         --keep-ct-address)      KEEP_CT_ADDRESS=1; shift ;;
@@ -280,7 +301,8 @@ if [ "$DO_PAYLOADS" = 1 ]; then
     # LZMA squashfs tools, built from the pinned GPL-2.0 source (the Dockerfile
     # builds the same revision in its ruckus-squashfs-tools stage).
     if [ "$R600_REPAIR" = 1 ]; then
-        if [ ! -x "$REPO_DIR/ruckus-squashfs/mksquashfs" ]; then
+        if [ ! -x "$REPO_DIR/ruckus-squashfs/mksquashfs" ] \
+           || ruckus_tool_is_placeholder "$REPO_DIR/ruckus-squashfs/mksquashfs"; then
             log "building the Ruckus squashfs tools (R600 mesh repair)"
             RUCKUS_SRC="$STATE_DIR/build/ruckus_ap_firmware_mod"
             RUCKUS_REV=3d9e4add414228eac4091f301e813d14130c3d61
@@ -298,13 +320,14 @@ if [ "$DO_PAYLOADS" = 1 ]; then
                "$REPO_DIR/ruckus-squashfs/"
         fi
     else
-        # Without the repair the tools are never called, but
-        # build-synthetic-cf.py insists they exist.  Leave inert placeholders.
+        # Without the repair the tools are never called: build-synthetic-cf.py
+        # returns before it checks for them, so no placeholder is needed.  Remove
+        # any an older version wrote, so that opting in later builds the real
+        # tools instead of finding an executable no-op.
         for t in mksquashfs unsquashfs; do
-            [ -x "$REPO_DIR/ruckus-squashfs/$t" ] || {
-                printf '#!/bin/sh\nexit 0\n' > "$REPO_DIR/ruckus-squashfs/$t"
-                chmod +x "$REPO_DIR/ruckus-squashfs/$t"
-            }
+            if ruckus_tool_is_placeholder "$REPO_DIR/ruckus-squashfs/$t"; then
+                rm -f "$REPO_DIR/ruckus-squashfs/$t"
+            fi
         done
     fi
 
@@ -612,14 +635,20 @@ printf 'ZD_CT_ADDRESS_FOLLOW_QEMU=%s\n' "$([ "$KEEP_CT_ADDRESS" = 1 ] && echo 0 
 # file.  Reconcile them here so an upgrade that changes a feature (say --no-ecdsa)
 # is not re-patched with the new value and then undone by the start.
 #
+# ZD_R600_REPAIR is not part of the patch signature (it only decides what is
+# seeded into /writable when the disk is built), but it belongs here all the same:
+# a later disk rebuild on start, and an --upgrade that inherits the setting, both
+# read it back from this file.
+#
 # ZD_ROOT_SSH is derived rather than flagged, because the 2222 listener is
 # installed from the built payload: the switch must follow whether
 # packages/dropbear carries the binary, or an upgrade that builds (or drops) it
 # would leave the file claiming the old state.  Nothing at runtime reads it --
 # patch 60 decides from the payload and the authorized key.
-sed -i '/^ZD_ECDSA_SSH=/d; /^ZD_NETWORK_MONITOR=/d; /^ZD_ROOT_SSH=/d' "$CONF"
+sed -i '/^ZD_ECDSA_SSH=/d; /^ZD_NETWORK_MONITOR=/d; /^ZD_R600_REPAIR=/d; /^ZD_ROOT_SSH=/d' "$CONF"
 printf 'ZD_ECDSA_SSH=%s\n' "$ECDSA" >> "$CONF"
 printf 'ZD_NETWORK_MONITOR=%s\n' "$NETWORK_MONITOR" >> "$CONF"
+printf 'ZD_R600_REPAIR=%s\n' "$R600_REPAIR" >> "$CONF"
 printf 'ZD_ROOT_SSH=%s\n' "$([ -x "$REPO_DIR/packages/dropbear/dropbear" ] && echo 1 || echo 0)" >> "$CONF"
 
 # Single source of truth from here on: the file is what the service reads.

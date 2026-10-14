@@ -232,11 +232,17 @@ def patch_scorpion(stage: Path) -> None:
     signed FSI image to unsigned UI, patches wlan.ko, and resizes the control
     files of every model that aliases that image.  Non-R600 payloads (and
     non-10.5.1 builds) are left alone by the helper.
+
+    Opt-in: the repair only runs when ZD_R600_REPAIR=1 (the installers'
+    --r600-repair), so the default deliverable is the vendor AP image.  The
+    repair has been observed to bootloop APs, hence the default.
     """
-    # ZD_R600_REPAIR=0 delivers the vendor AP images unmodified (the LXC
-    # installer's --no-r600-repair and the Docker entry point's equivalent).
-    if (os.environ.get("ZD_R600_REPAIR") or "").strip() == "0":
-        print("  ap-11n-scorpion mesh repair disabled (ZD_R600_REPAIR=0)")
+    # Opt-in: the vendor AP images are delivered unmodified unless the repair was
+    # asked for (the installers' --r600-repair), because the repaired image has
+    # been observed to bootloop APs.  Only an explicit ZD_R600_REPAIR=1 enables
+    # it, so an unset or unexpected value means "leave the vendor image alone".
+    if (os.environ.get("ZD_R600_REPAIR") or "").strip() != "1":
+        print("  ap-11n-scorpion mesh repair not enabled (set ZD_R600_REPAIR=1 to repair)")
         return
     firmware_root = stage / "firmwares"
     if not (firmware_root / "r600").is_dir():

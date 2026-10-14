@@ -8,7 +8,7 @@ Technical detail behind `install-zd1200-docker.sh` (Docker) and
 
 ```
 packages/           payloads built into the appliance (see packages/README.md)
-scripts/build/      host-side image preparation; scripts/build/proxmox/ is the PVE host helper
+scripts/build/      host-side image preparation
 scripts/container/  the toolchain that runs inside the container/CT, plus its Proxmox units
 scripts/test/       unit tests and the QEMU boot test
 docker/             the Docker flavour's image and Compose file
@@ -586,6 +586,14 @@ the key lives on the writable partition (`/etc/airespider` →
 too. Controlled by `ZD_ECDSA_SSH` (default `1`); set it to `0` to revert.
 
 ## AP mesh repair (ap-11n-scorpion / R600 family)
+
+**This repair is opt-in and off by default.** It has been observed to bootloop
+APs, so the vendor AP image is delivered unmodified unless it is asked for:
+`--r600-repair` on either installer (on Proxmox the choice is recorded as
+`ZD_R600_REPAIR` in `/etc/zd1200.conf`, so a later disk rebuild and `--upgrade`
+keep it; on Docker set `ZD_R600_REPAIR=1` in `.env`). `--no-r600-repair` still
+exists to turn an inherited repair back off. `build-synthetic-cf.py` applies the
+repair only on an explicit `ZD_R600_REPAIR=1`.
 
 Firmware 10.5.1.0.276 introduced a receive-path bug in the shared
 `ap-11n-scorpion` AP image: a wired Root AP looks healthy, but a wireless Mesh AP

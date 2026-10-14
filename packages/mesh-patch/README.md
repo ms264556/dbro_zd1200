@@ -1,5 +1,9 @@
 # ap-11n-scorpion (R600) mesh repair
 
+> **Opt-in and off by default.** The repair has been observed to bootloop APs, so
+> the vendor AP images are delivered unmodified unless it is explicitly enabled
+> with `--r600-repair` (installers) / `ZD_R600_REPAIR=1` (compose / environment).
+
 **The APs must already be running Solo 104 or 106 firmware before they will join a
 controller delivering a repaired image** — the repair yields an unsigned image and
 older AP firmware rejects it. Upgrade the APs through their own standalone upgrade
@@ -12,8 +16,8 @@ Mesh AP shows as connected but does not pass ordinary Layer-2 traffic. 10.5.1.0.
 
 These files are ported from [`dbro/zd1200`](https://github.com/dbro/zd1200)
 and applied to the staged `/writable` tree by
-`scripts/container/build-synthetic-cf.py`, so the repaired image is what the
-controller delivers to APs.
+`scripts/container/build-synthetic-cf.py` when the repair is enabled, so the
+repaired image is what the controller delivers to APs.
 
 | file | purpose |
 |---|---|

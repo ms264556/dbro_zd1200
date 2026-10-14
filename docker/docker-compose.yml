@@ -77,8 +77,10 @@ services:
       # Add an ECDSA host key beside RSA, so modern SSH clients connect.
       ZD_ECDSA_SSH: ${ZD_ECDSA_SSH:-1}
       # Patch the ap-11n-scorpion (R600) mesh bug out of the AP image the guest
-      # delivers (install-zd1200-docker.sh --no-r600-repair sets 0).
-      ZD_R600_REPAIR: ${ZD_R600_REPAIR:-1}
+      # delivers.  Opt-in: off by default, because the repaired image has been
+      # observed to bootloop APs (install-zd1200-docker.sh --r600-repair, or set
+      # ZD_R600_REPAIR=1 in .env, to enable it).
+      ZD_R600_REPAIR: ${ZD_R600_REPAIR:-0}
       WEB_WAIT_SECONDS: "600"
       VM_SNAPSHOT: "0"
       # On stop, ask the guest to reboot (unmount and flush /writable) over

@@ -35,8 +35,14 @@
 #   --writable-partition S:C override the /writable geometry otherwise read from the
 #                            dump's own partition table (START:COUNT, in 512-byte
 #                            sectors); for a dump whose table cannot be read
-#   --no-r600-repair         do not patch the ap-11n-scorpion (R600) mesh bug out of
-#                            the AP image the guest delivers
+#   --r600-repair            enable the ap-11n-scorpion (R600) mesh repair of the
+#                            AP image the guest delivers.  Opt-in: off by default,
+#                            because the repaired image has been observed to
+#                            bootloop APs.  The APs must already run Solo 104 or
+#                            106 firmware before they accept the repaired image.
+#   --no-r600-repair         keep the vendor AP image (the default); accepted so a
+#                            persisted opt-in (ZD_R600_REPAIR=1 in .env) can be
+#                            turned off for one run
 #   -h | --help
 #
 # The inputs are classified by their contents, not their names.  A firmware
@@ -66,7 +72,11 @@ cd "$(dirname "$0")"
 
 no_up=0
 upgrade=0
-r600_repair="${ZD_R600_REPAIR:-1}"
+# The R600 AP mesh repair is opt-in (off by default).  A flag counts as an
+# explicit override; without one the value is left to Compose (ZD_R600_REPAIR in
+# .env, else its own off default), so a persisted opt-in survives a bare re-run.
+r600_repair="${ZD_R600_REPAIR:-0}"
+r600_repair_set=0
 POSITIONALS=(); OPT_FIRMWARE=""; OPT_BACKUP=""; OPT_WRITABLE=""
 # resolve_inputs() sets these; a bare run does not call it (see below).
 INPUT_KIND=""; INPUT_PATH=""; FIRMWARE_PATH=""
@@ -97,7 +107,8 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "--backup needs a ruckus_db_*.bak path" >&2; exit 2; }
             OPT_BACKUP="$2"; shift 2 ;;
         --backup=*) OPT_BACKUP="${1#*=}"; shift ;;
-        --no-r600-repair) r600_repair=0; shift ;;
+        --r600-repair) r600_repair=1; r600_repair_set=1; shift ;;
+        --no-r600-repair) r600_repair=0; r600_repair_set=1; shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$0"
             exit 0
@@ -166,10 +177,12 @@ if ! docker info >/dev/null 2>&1; then
     fi
 fi
 
-# The ap-11n-scorpion (R600) mesh repair patches the AP firmware the image
-# delivers.  Disable it for a build that must keep the vendor AP images exactly
-# as shipped.
-export ZD_R600_REPAIR="$r600_repair"
+# An explicit --r600-repair / --no-r600-repair overrides what Compose would
+# otherwise resolve (ZD_R600_REPAIR from .env, else off).  Exporting only when a
+# flag was given is what lets `.env` carry a persistent opt-in.
+if [ "$r600_repair_set" = 1 ]; then
+    export ZD_R600_REPAIR="$r600_repair"
+fi
 
 # The compose file lives in docker/; --project-directory . keeps .env, the
 # ./image volume mount and the build context rooted at the repo root.

@@ -305,7 +305,8 @@ What the network has to provide:
 
 | symptom | cause and fix |
 |---|---|
-| APs will not join after the mesh repair | they must already run **Solo 104 or 106** firmware — the repair delivers an unsigned AP image that older firmware rejects. Upgrade the APs through their own standalone upgrade page, or build with `--no-r600-repair` |
+| APs will not join after the mesh repair | they must already run **Solo 104 or 106** firmware — the repair delivers an unsigned AP image that older firmware rejects. Upgrade the APs through their own standalone upgrade page, or install without `--r600-repair` (the default) |
 | an AP still runs fully signed FSI firmware | it must first be moved to a compatible ISI release through its own standalone upgrade page |
-| R600 mesh APs pass no Layer-2 traffic | the AP image has the 10.5.1.0.276+ receive-path bug; rebuild **without** `--no-r600-repair` so the image is repaired (see `packages/mesh-patch/README.md`) |
+| APs bootloop after `--r600-repair` | the repair is off by default for this reason: the repaired image has been observed to bootloop APs. The repaired image is baked into `/writable` when the disk is built, so go back by rebuilding the disk without `--r600-repair` (a factory reset — see "the disk needs rebuilding" in the install log) |
+| R600 mesh APs pass no Layer-2 traffic | the AP image has the 10.5.1.0.276+ receive-path bug; the repair is opt-in, so install with `--r600-repair` to have the image repaired (see `packages/mesh-patch/README.md`). Do not enable it for APs still on older firmware |
 | the web UI offers an upgrade but the guest never applies it | check the console log; a guest firmware upgrade writes the new rootfs to the spare partition and is customised on the next container start. If it stops at `E_FailUpgradeNTP`, the entitlement NTP marker `/tmp/ntp_result` is missing (`S48zd_ntp_result`, patch 20, seeds it at boot) |

@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -63,6 +65,23 @@ def load_functions():
     for node in nodes:
         exec(compile(ast.get_source_segment(source, node), node.name, "exec"), namespace)
     return namespace["debugfs_write"], namespace["place_root_kernel"]
+
+
+def load_patch_scorpion(runtime: Path):
+    """Lift patch_scorpion() out of the builder with its globals stubbed.
+
+    Returns (function, namespace), so a test can point `runtime` at a fixture
+    and swap in a recording subprocess.run.
+    """
+    source = (CONTAINER / "build-synthetic-cf.py").read_text()
+    node = next((n for n in ast.parse(source).body
+                 if isinstance(n, ast.FunctionDef) and n.name == "patch_scorpion"), None)
+    if node is None:
+        raise SystemExit("FAIL: build-synthetic-cf.py no longer defines patch_scorpion")
+    namespace = {"os": os, "sys": sys, "subprocess": subprocess, "Path": Path,
+                 "runtime": runtime}
+    exec(compile(ast.get_source_segment(source, node), node.name, "exec"), namespace)
+    return namespace["patch_scorpion"], namespace
 
 
 def make_image(path: Path, files: dict) -> None:
@@ -127,6 +146,73 @@ def main() -> int:
         except SystemExit:
             failed = True
         check("a write that cannot succeed still fails", failed)
+
+        # The ap-11n-scorpion (R600) mesh repair is opt-in, because the repaired
+        # image bootlooped APs.  patch_scorpion() must reach the vendored helper
+        # only for an explicit ZD_R600_REPAIR=1; anything else (unset, "0", a typo)
+        # has to deliver the vendor AP image untouched.
+        runtime_fix = tmp / "runtime"
+        (runtime_fix / "packages" / "mesh-patch").mkdir(parents=True)
+        (runtime_fix / "packages" / "mesh-patch" / "patch-scorpion-payload.py") \
+            .write_text("# stub helper\n")
+        (runtime_fix / "ruckus-squashfs").mkdir()
+        for tool in ("unsquashfs", "mksquashfs"):
+            (runtime_fix / "ruckus-squashfs" / tool).write_text("#!/bin/sh\n")
+
+        r600_stage = tmp / "stage"
+        (r600_stage / "firmwares" / "r600" / "10.5.1.0.282").mkdir(parents=True)
+
+        class RecordRun:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv, **kwargs):
+                self.calls.append(list(argv))
+
+        def run_gate(value):
+            patch_scorpion, namespace = load_patch_scorpion(runtime_fix)
+            if value is None:
+                os.environ.pop("ZD_R600_REPAIR", None)
+            else:
+                os.environ["ZD_R600_REPAIR"] = value
+            recorder = RecordRun()
+            namespace["subprocess"] = recorder
+            patch_scorpion(r600_stage)
+            return recorder.calls
+
+        calls = run_gate(None)
+        check("an unset ZD_R600_REPAIR leaves the vendor AP image alone",
+              calls == [], f"calls: {calls}")
+        calls = run_gate("0")
+        check("ZD_R600_REPAIR=0 leaves the vendor AP image alone",
+              calls == [], f"calls: {calls}")
+        calls = run_gate("1")
+        check("ZD_R600_REPAIR=1 runs the mesh-patch helper",
+              len(calls) == 1 and calls[0][1].endswith("patch-scorpion-payload.py"),
+              f"calls: {calls}")
+
+        # With the repair enabled, the two non-applications are still quiet and
+        # loud respectively: no r600/ directory means nothing to do even without
+        # the tools; a missing tool must abort rather than skip silently.
+        no_r600_stage = tmp / "no-r600-stage"
+        (no_r600_stage / "firmwares").mkdir(parents=True)
+        patch_scorpion, namespace = load_patch_scorpion(tmp / "no-tools-runtime")
+        os.environ["ZD_R600_REPAIR"] = "1"
+        try:
+            patch_scorpion(no_r600_stage)
+            skipped_quietly = True
+        except BaseException:
+            skipped_quietly = False
+        check("with the repair on, a payload with no r600/ directory is skipped",
+              skipped_quietly)
+        try:
+            patch_scorpion(r600_stage)
+            raised = None
+        except SystemExit as exc:
+            raised = exc
+        check("with the repair on, missing squashfs tooling fails loudly",
+              raised is not None, f"raised: {raised}")
+        os.environ.pop("ZD_R600_REPAIR", None)
 
     if failures:
         print(f"\n{len(failures)} failure(s): {', '.join(failures)}")

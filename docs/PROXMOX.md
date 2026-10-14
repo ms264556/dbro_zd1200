@@ -51,7 +51,8 @@ above, skips the first question:
 
 Everything not asked has a default derived from the host: CT ID (first free),
 hostname `zd1200`, storage (the first that holds container rootfs), Debian 13 template (fetched if
-absent), DHCP, ECDSA host key, Network Monitor and the R600 repair on, and:
+absent), DHCP, ECDSA host key and Network Monitor on, the R600 repair off (it is
+opt-in, `--r600-repair`), and:
 
 | size | default | why |
 |---|---|---|
@@ -271,11 +272,31 @@ patience, and `ZD_CPU_GUARD=0` disables the CPU guard.
 | start after the appliance powered itself off | `pct start <id>` (that also stopped the container) |
 | reboot the CT | `pct reboot <id>` |
 | console | `pct enter <id>` |
+| uninstall | `./install-zd1200-lxc.sh --uninstall` (destroys the CT and its disks) |
 
 The guest is a QEMU process inside the CT, supervised by `zd1200.service`. The
 unit stops the guest through the same orderly path the Docker entrypoint uses
 (ttyS1 control channel, then the guest's stock reboot), so `pct stop` and host
 shutdown do not corrupt `/writable`.
+
+### Uninstalling
+
+`./install-zd1200-lxc.sh --uninstall` is the inverse of an install. It stops and
+destroys the container — `pct destroy <id> --purge`, so backup, replication and HA
+references go with it. `--ctid <id>` picks the container, or without it the
+installer finds the ones it made by their description marker; `--yes` skips the
+confirmation. It takes no input.
+
+It is idempotent: with no container left it still runs, which is also how an
+older version's obsolete host-global summary timer gets removed. That timer kept
+each container's Summary description current; it is no longer installed, because
+Proxmox shows the guest's address from the container's own `zd0` interface (see
+"The guest's address in the Proxmox GUI"). An install or an `--upgrade` removes
+it too:
+
+```sh
+./install-zd1200-lxc.sh --uninstall --yes
+```
 
 ## How it fits together
 
@@ -315,8 +336,6 @@ Proxmox host
   container's own LAN address. `zd1200.service` calls it around QEMU, so only the
   guest has an address while the appliance runs (see "The container's own
   address" above).
-- `scripts/build/proxmox/zd1200-pve-summary-host.sh` — runs on the PVE host as a
-  timer: writes each guest's address into its container's Summary description.
 - `scripts/container/*` — the shared toolchain (also used by the Docker flow).
   `NETWORK_MODE=bridge` is the LXC-specific mode in `launch-vm.sh`.
 

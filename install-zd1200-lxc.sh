@@ -19,6 +19,7 @@
 #   ./install-zd1200-lxc.sh foreign_dump.bin firmware.img
 #                                                      # a ZD1100/ZD3000 dump + firmware
 #   ./install-zd1200-lxc.sh --yes --ctid 120 ...       # unattended
+#   ./install-zd1200-lxc.sh --uninstall                # remove it again
 #
 # The inputs are classified by their contents, not their names.  A firmware
 # upgrade file is a complete appliance on its own; a ZD configuration backup
@@ -47,6 +48,11 @@
 #                            roots from their rollback store, keeping /writable.
 #                            Takes no input.  Uses --ctid to pick the container,
 #                            or finds the one this installer made.
+#   --uninstall              the inverse: stop and destroy the container.  Takes
+#                            no input.  Uses --ctid to pick the container, or
+#                            finds the ones this installer made.  It also removes
+#                            the obsolete host-global summary timer that an older
+#                            version installed.
 #   --writable-from PATH     named alias for a dump positional argument: take
 #                            /writable + serial from the dump while the
 #                            kernel/rootfs come from the firmware
@@ -74,7 +80,13 @@
 #                            kept unless one of these is given.
 #   --network-monitor / --no-network-monitor
 #                            install (or not) the Network Monitor page
-#   --no-r600-repair         do not patch the ap-11n-scorpion (R600) AP image
+#   --r600-repair            enable the ap-11n-scorpion (R600) mesh repair on the
+#                            AP image the guest delivers.  Opt-in: off by default,
+#                            because the repaired image has been observed to
+#                            bootloop APs.  The APs must already run Solo 104 or
+#                            106 firmware before they accept the repaired image.
+#   --no-r600-repair         keep the vendor AP image (the default); accepted so
+#                            an --upgrade can turn an inherited repair off
 #   --console-tty / --no-console-tty
 #                            show the guest's serial console in the Proxmox
 #                            "Console" tab, or leave a login prompt there
@@ -106,6 +118,22 @@ REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 . "$REPO_ROOT/scripts/install-common.sh"
 DEFAULT_CT_STATE=/var/lib/zd1200
 DEFAULT_CT_REPO=/opt/zd1200
+# Every container this installer makes carries this marker in its Proxmox
+# description.  It is how a later run recognises its own containers -- for
+# --upgrade and for --uninstall -- so it is written and matched from one place.
+CT_MARKER='installed by dbro_zd1200/install-zd1200-lxc.sh'
+# The obsolete host-global summary timer: an older version installed it to write
+# each guest's address into its container's Summary description, which Proxmox
+# already shows from the container's own zd0 interface (see
+# zd1200-guest-display).  These paths remain only so an install, an upgrade or an
+# uninstall removes whatever that version left behind.
+LEGACY_SUMMARY_UNIT=zd1200-pve-summary
+LEGACY_SUMMARY_UNIT_DIR=/etc/systemd/system
+LEGACY_SUMMARY_HELPER=/usr/local/sbin/zd1200-pve-summary-host
+# Where the container configs that carry CT_MARKER are looked for.  ZD_LXC_CONF_DIR
+# lets the offline suite drive the recognition against a fixture, the same hook
+# shape as ZD_START_GUARD_SECONDS in the Docker installer.
+LXC_CONF_DIR="${ZD_LXC_CONF_DIR:-/etc/pve/lxc}"
 
 CTID=""; CT_HOSTNAME="zd1200"; STORAGE=""; BRIDGE=""; # The container holds the Debian userland + QEMU (~0.5 GiB), the prepared vendor
 # artifacts (~1.1 GiB) and the synthetic CF, which is ~1.9 GiB and briefly
@@ -117,14 +145,15 @@ ROOTFS_SIZE=20
 CORES=4; MEMORY=4096; ONBOOT=1
 POSITIONALS=(); OPT_FIRMWARE=""; OPT_BACKUP=""; OPT_WRITABLE=""; WRITABLE_PARTITION=""; CONTAINER_MAC_OVERRIDE=""
 ADVANCED=0
-ROOT_SSH_KEY=""; ECDSA=1; NETWORK_MONITOR=1; R600_REPAIR=1; CONSOLE_TTY=1; KEEP_CT_ADDRESS=0
+ROOT_SSH_KEY=""; ECDSA=1; NETWORK_MONITOR=1; R600_REPAIR=0; CONSOLE_TTY=1; KEEP_CT_ADDRESS=0
 SHARE_UPLINK_MAC=1; SHARE_UPLINK_MAC_SET=0
 STATIC_IP=""; GATEWAY=""; TEMPLATE=""; TIMEOUT=1200
 ASSUME_YES=0; INTERACTIVE=1
 UPGRADE=0
+UNINSTALL=0
 # Set when the matching option was given explicitly, so an upgrade can keep the
 # feature set already configured in the container by default.
-ECDSA_SET=0; NETWORK_MONITOR_SET=0; CONSOLE_TTY_SET=0; KEEP_CT_ADDRESS_SET=0
+ECDSA_SET=0; NETWORK_MONITOR_SET=0; R600_REPAIR_SET=0; CONSOLE_TTY_SET=0; KEEP_CT_ADDRESS_SET=0
 
 # whiptail geometry (the PVE helper convention).
 WT=(whiptail --backtitle "ZD1200 LXC installer" --title "ZD1200" --cancel-button Cancel)
@@ -164,6 +193,7 @@ while [ $# -gt 0 ]; do
         --no-start-on-boot)     ONBOOT=0; shift ;;
         --source|--firmware)    OPT_FIRMWARE="$(optval "$1" "${2-}")"; shift 2 ;;
         --upgrade)              UPGRADE=1; shift ;;
+        --uninstall)            UNINSTALL=1; shift ;;
         --container-mac)        CONTAINER_MAC_OVERRIDE="$(optval "$1" "${2-}")"; shift 2 ;;
         --advanced)             ADVANCED=1; shift ;;
         --writable-from)        OPT_WRITABLE="$(optval "$1" "${2-}")"; shift 2 ;;
@@ -174,7 +204,8 @@ while [ $# -gt 0 ]; do
         --no-ecdsa)             ECDSA=0; ECDSA_SET=1; shift ;;
         --network-monitor)      NETWORK_MONITOR=1; NETWORK_MONITOR_SET=1; shift ;;
         --no-network-monitor)   NETWORK_MONITOR=0; NETWORK_MONITOR_SET=1; shift ;;
-        --no-r600-repair)       R600_REPAIR=0; shift ;;
+        --r600-repair)          R600_REPAIR=1; R600_REPAIR_SET=1; shift ;;
+        --no-r600-repair)       R600_REPAIR=0; R600_REPAIR_SET=1; shift ;;
         --console-tty)          CONSOLE_TTY=1; CONSOLE_TTY_SET=1; shift ;;
         --no-console-tty)       CONSOLE_TTY=0; CONSOLE_TTY_SET=1; shift ;;
         --keep-ct-address)      KEEP_CT_ADDRESS=1; KEEP_CT_ADDRESS_SET=1; shift ;;
@@ -312,16 +343,30 @@ next_free_ctid() {
 # 0b. --upgrade: re-provision an existing container from this checkout, without
 # touching the firmware image, /writable, or the keys it already holds.
 # --------------------------------------------------------------------------
-detect_zd1200_ctid() {
-    # The container this installer created carries its description marker.
-    local f id found=""
-    for f in /etc/pve/lxc/*.conf; do
+# find_zd1200_ctids [confdir]: the ids of the containers this installer made,
+# recognised by the description marker.  Never fails -- an empty list is a valid
+# answer, because "the container is already gone" is exactly the case --uninstall
+# has to cope with.  The directory is an argument so the rule can be driven
+# against a fixture (scripts/test/installer-options-test.sh).
+find_zd1200_ctids() {
+    local dir="${1:-$LXC_CONF_DIR}" f id
+    for f in "$dir"/*.conf; do
         [ -f "$f" ] || continue
-        grep -q 'installed by dbro_zd1200/install-zd1200-lxc.sh' "$f" || continue
+        grep -qF "$CT_MARKER" "$f" || continue
         id="$(basename "$f" .conf)"
+        printf '%s\n' "$id"
+    done
+}
+
+# detect_zd1200_ctid: the single container this installer made, for --upgrade.
+# Absence and ambiguity are errors here -- --upgrade must know which one to touch.
+detect_zd1200_ctid() {
+    local id found=""
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
         [ -n "$found" ] && die "more than one ZD1200 container found ($found, $id); pass --ctid"
         found="$id"
-    done
+    done < <(find_zd1200_ctids)
     [ -n "$found" ] || die "no ZD1200 container found (none carries this installer's description); pass --ctid"
     printf '%s' "$found"
 }
@@ -376,7 +421,7 @@ upgrade_existing_container() {
     [ -f "/etc/pve/lxc/$CTID.conf" ] || die "container $CTID does not exist"
     # The upgrade stops services and replaces trees inside the container, so an
     # explicit --ctid must name one this installer made, not any container.
-    grep -q 'installed by dbro_zd1200/install-zd1200-lxc.sh' "/etc/pve/lxc/$CTID.conf" \
+    grep -qF "$CT_MARKER" "/etc/pve/lxc/$CTID.conf" \
         || die "container $CTID does not carry this installer's description marker, so it is not a ZD1200 container made by it; refusing to upgrade it"
     pct status "$CTID" >/dev/null 2>&1 || die "cannot query container $CTID"
 
@@ -389,6 +434,10 @@ upgrade_existing_container() {
     [ "$ECDSA_SET" = 1 ] || ECDSA="${v:-1}"
     v="$(ct_conf_get "$CTID" ZD_NETWORK_MONITOR)"
     [ "$NETWORK_MONITOR_SET" = 1 ] || NETWORK_MONITOR="${v:-1}"
+    # The R600 repair is opt-in, so its fallback is off: an upgrade keeps a
+    # repair the container was installed with only when it recorded one.
+    v="$(ct_conf_get "$CTID" ZD_R600_REPAIR)"
+    [ "$R600_REPAIR_SET" = 1 ] || R600_REPAIR="${v:-0}"
     if [ "$CONSOLE_TTY_SET" = 0 ]; then
         if pct exec "$CTID" -- grep -q '^ZD_CONSOLE_SOCK=' /etc/zd1200.conf 2>/dev/null; then
             CONSOLE_TTY=1
@@ -461,18 +510,21 @@ upgrade_existing_container() {
     [ -n "$key_line" ] && bootstrap_args+=(--root-ssh-key "$key_line")
     [ "$ECDSA" = 0 ] && bootstrap_args+=(--no-ecdsa)
     [ "$NETWORK_MONITOR" = 0 ] && bootstrap_args+=(--no-network-monitor)
-    [ "$R600_REPAIR" = 0 ] && bootstrap_args+=(--no-r600-repair)
+    if [ "$R600_REPAIR" = 1 ]; then
+        bootstrap_args+=(--r600-repair)
+    else
+        bootstrap_args+=(--no-r600-repair)
+    fi
     [ "$CONSOLE_TTY" = 0 ] && bootstrap_args+=(--no-console-tty)
     [ "$KEEP_CT_ADDRESS" = 1 ] && bootstrap_args+=(--keep-ct-address)
     if ! pct exec "$CTID" -- "$DEFAULT_CT_REPO/scripts/container/proxmox/zd1200-ct-bootstrap.sh" "${bootstrap_args[@]}"; then
         die "container upgrade failed — see the output above (the container is left in place: pct enter $CTID)"
     fi
 
-    # The host-side summary helper may have changed with the project.
-    install -m 0755 "$REPO_ROOT/scripts/build/proxmox/zd1200-pve-summary-host.sh" /usr/local/sbin/zd1200-pve-summary-host
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart zd1200-pve-summary.timer >/dev/null 2>&1 || true
-    /usr/local/sbin/zd1200-pve-summary-host "$CTID" >/dev/null 2>&1 || true
+    # An older version kept this container's Summary description current with a
+    # host-global timer; the guest address is shown from the container's own zd0
+    # interface now, so drop whatever that timer left behind.
+    remove_legacy_pve_summary_helper
 
     step "starting the appliance"
     # Drop the previous boot's console log: the readiness check below greps for
@@ -501,6 +553,145 @@ EOF
     fi
     [ "$GUEST_READY" = 1 ] || exit 1
 }
+
+# --------------------------------------------------------------------------
+# 0c. one installer at a time on this host
+# --------------------------------------------------------------------------
+# Two installs started together on one Proxmox host share host state: the free
+# container id, which each scans, then checks, then makes real with `pct create`.
+# Without the lock both runs scanned, both saw the same id free, and the loser
+# died "container N already exists" at the check or in `pct create`.
+#
+# The lock is held across the allocation and the creation only, and released
+# before the install itself, which takes minutes.  When another install holds it,
+# this one says so and then waits: a second accidental install should still
+# succeed with an id of its own rather than fail.  If flock is missing, or the
+# lock file cannot be opened, it warns and continues unlocked -- an install must
+# never abort over a lock.
+LOCK_FILE=/run/zd1200-lxc-install.lock
+LOCK_FD=""
+lock_host() {
+    if [ -z "$LOCK_FD" ]; then
+        if ! command -v flock >/dev/null 2>&1; then
+            warn "flock is not available: two installs started together may pick the same container id"
+            return 0
+        fi
+        # The group scopes the 2>/dev/null to the open; on a bare `exec` it would
+        # redirect this shell's stderr for the rest of the install.
+        if ! { exec {LOCK_FD}>"$LOCK_FILE"; } 2>/dev/null; then
+            LOCK_FD=""
+            warn "cannot open $LOCK_FILE: two installs started together may pick the same container id; continuing unlocked"
+            return 0
+        fi
+    fi
+    if ! flock -n "$LOCK_FD" 2>/dev/null; then
+        info "another install on this host holds $LOCK_FILE; waiting for it to release it"
+        flock "$LOCK_FD" 2>/dev/null \
+            || warn "could not take $LOCK_FILE; continuing unlocked"
+    fi
+    return 0
+}
+unlock_host() {
+    [ -n "$LOCK_FD" ] || return 0
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# 0d. --uninstall: the inverse of an install
+# --------------------------------------------------------------------------
+# remove_legacy_pve_summary_helper: undo the host-global timer an older version
+# installed.  Idempotent and quiet -- it reports only when it found one, so a fresh
+# host and a second run say nothing.  No lock is needed: nothing installs it any
+# more, so there is no writer to race.
+remove_legacy_pve_summary_helper() {
+    [ -e "$LEGACY_SUMMARY_HELPER" ] \
+        || [ -e "$LEGACY_SUMMARY_UNIT_DIR/$LEGACY_SUMMARY_UNIT.timer" ] \
+        || [ -e "$LEGACY_SUMMARY_UNIT_DIR/$LEGACY_SUMMARY_UNIT.service" ] \
+        || return 0
+    systemctl disable --now "$LEGACY_SUMMARY_UNIT.timer" >/dev/null 2>&1 || true
+    rm -f "$LEGACY_SUMMARY_UNIT_DIR/$LEGACY_SUMMARY_UNIT.timer" \
+          "$LEGACY_SUMMARY_UNIT_DIR/$LEGACY_SUMMARY_UNIT.service" \
+          "$LEGACY_SUMMARY_HELPER"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$LEGACY_SUMMARY_UNIT.service" >/dev/null 2>&1 || true
+    info "removed the obsolete $LEGACY_SUMMARY_UNIT.timer host timer"
+}
+
+# uninstall_zd1200_container: stop and destroy the container(s).
+#
+# It also works when the container is already gone, which keeps it idempotent: it
+# then only tidies the obsolete host timer.
+uninstall_zd1200_container() {
+    if [ "${#POSITIONALS[@]}" -gt 0 ] || [ -n "$OPT_FIRMWARE$OPT_BACKUP$OPT_WRITABLE" ]; then
+        die "--uninstall takes no input: it removes an existing appliance.  Drop the firmware, backup and dump arguments."
+    fi
+
+    local -a ids=()
+    if [ -n "$CTID" ]; then
+        [ -f "$LXC_CONF_DIR/$CTID.conf" ] || die "container $CTID does not exist"
+        # An explicit --ctid must name a container this installer made, not any
+        # container on the host: uninstall destroys it and its disks.
+        grep -qF "$CT_MARKER" "$LXC_CONF_DIR/$CTID.conf" \
+            || die "container $CTID does not carry this installer's description marker, so it is not a ZD1200 container made by it; refusing to remove it"
+        ids=("$CTID")
+    else
+        mapfile -t ids < <(find_zd1200_ctids)
+    fi
+
+    local ids_label destroy_note
+    if [ "${#ids[@]}" -eq 0 ]; then
+        ids_label="none found (already removed)"
+        destroy_note="No container to destroy."
+    else
+        ids_label="${ids[*]}"
+        destroy_note="The container and all of its disks are destroyed."
+    fi
+
+    local summary
+    summary="$(cat <<EOF
+Uninstall
+  container ....... $ids_label
+
+$destroy_note
+EOF
+)"
+    if [ "$INTERACTIVE" = 1 ] && [ "$ASSUME_YES" = 0 ] && [ "${#ids[@]}" -gt 0 ]; then
+        "${WT[@]}" --yesno "$summary
+
+Proceed with the uninstall?" 22 84 || die "cancelled"
+    else
+        info "$summary"
+    fi
+
+    local id state
+    for id in "${ids[@]}"; do
+        step "removing container $id"
+        state="$(pct status "$id" 2>/dev/null | awk '{print $2}')" || true
+        if [ "$state" = running ]; then
+            pct stop "$id" >/dev/null 2>&1 \
+                || warn "container $id did not stop cleanly; destroying it anyway"
+        fi
+        # --purge also drops the container from backup, replication and HA jobs.
+        # --force is deliberately not used, so a container that will not stop is
+        # reported rather than destroyed under a running guest.  The vmid must
+        # come first: PVE's CLI rejects `pct destroy --purge <id>` with "not
+        # enough arguments" and destroys nothing.
+        pct destroy "$id" --purge || die "could not destroy container $id"
+    done
+
+    remove_legacy_pve_summary_helper
+    info "uninstall complete"
+}
+
+if [ "$UNINSTALL" = 1 ] && [ "$UPGRADE" = 1 ]; then
+    die "--upgrade and --uninstall are mutually exclusive"
+fi
+
+if [ "$UNINSTALL" = 1 ]; then
+    uninstall_zd1200_container
+    exit 0
+fi
 
 if [ "$UPGRADE" = 1 ]; then
     upgrade_existing_container
@@ -627,7 +818,7 @@ if [ "$INTERACTIVE" = 1 ] && [ "$ADVANCED" = 1 ]; then
     feature_args+=("root-ssh" "Public-key root SSH on TCP 2222 (builds dropbear; slow)" "$([ -n "$ROOT_SSH_KEY" ] && echo ON || echo OFF)")
     feature_args+=("ecdsa" "ECDSA SSH host key alongside RSA" "$([ "$ECDSA" = 1 ] && echo ON || echo OFF)")
     feature_args+=("netmon" "Network Monitor page and collectors" "$([ "$NETWORK_MONITOR" = 1 ] && echo ON || echo OFF)")
-    feature_args+=("r600" "R600 / ap-11n-scorpion mesh repair" "$([ "$R600_REPAIR" = 1 ] && echo ON || echo OFF)")
+    feature_args+=("r600" "R600 / ap-11n-scorpion mesh repair (may bootloop APs)" "$([ "$R600_REPAIR" = 1 ] && echo ON || echo OFF)")
     feature_args+=("onboot" "Start the container on host boot" "$([ "$ONBOOT" = 1 ] && echo ON || echo OFF)")
     selected="$("${WT[@]}" "${feature_args[@]}" 3>&1 1>&2 2>&3)" || die "cancelled"
     ECDSA=0; NETWORK_MONITOR=0; R600_REPAIR=0; ONBOOT=0
@@ -641,51 +832,6 @@ if [ "$INTERACTIVE" = 1 ] && [ "$ADVANCED" = 1 ]; then
         ROOT_SSH_KEY="$keyfile"
     fi
 fi
-
-# --------------------------------------------------------------------------
-# 2d. one installer at a time on this host
-# --------------------------------------------------------------------------
-# Two installs started together on one Proxmox host share host state: the free
-# container id (scanned at the next line, checked below, and made real by
-# `pct create`) and, later, the summary helper with its two systemd units, which
-# every install rewrites.  Without the lock both runs scanned, both saw the same
-# id free, and the loser died "container N already exists" at the check or in
-# `pct create`.
-#
-# The lock is held across the allocation and the creation only -- released
-# before the install itself, which takes minutes -- and taken again for the
-# helper install.  When another install holds it, this one says so and then
-# waits: a second accidental install should still succeed with an id of its own
-# rather than fail.  If flock is missing, or the lock file cannot be opened, it
-# warns and continues unlocked -- an install must never abort over a lock.
-LOCK_FILE=/run/zd1200-lxc-install.lock
-LOCK_FD=""
-lock_host() {
-    if [ -z "$LOCK_FD" ]; then
-        if ! command -v flock >/dev/null 2>&1; then
-            warn "flock is not available: two installs started together may pick the same container id"
-            return 0
-        fi
-        # The group scopes the 2>/dev/null to the open; on a bare `exec` it would
-        # redirect this shell's stderr for the rest of the install.
-        if ! { exec {LOCK_FD}>"$LOCK_FILE"; } 2>/dev/null; then
-            LOCK_FD=""
-            warn "cannot open $LOCK_FILE: two installs started together may pick the same container id; continuing unlocked"
-            return 0
-        fi
-    fi
-    if ! flock -n "$LOCK_FD" 2>/dev/null; then
-        info "another install on this host holds $LOCK_FILE; waiting for it to release it"
-        flock "$LOCK_FD" 2>/dev/null \
-            || warn "could not take $LOCK_FILE; continuing unlocked"
-    fi
-    return 0
-}
-unlock_host() {
-    [ -n "$LOCK_FD" ] || return 0
-    flock -u "$LOCK_FD" 2>/dev/null || true
-    return 0
-}
 
 lock_host
 [ -n "$CTID" ] || CTID="$(next_free_ctid)"
@@ -821,7 +967,7 @@ pct create "$CTID" "$TEMPLATE" \
     --features nesting=1,keyctl=1 \
     --unprivileged 1 --ostype debian \
     --onboot "$ONBOOT" \
-    --description "Ruckus ZD1200 virtual appliance (installed by dbro_zd1200/install-zd1200-lxc.sh)"
+    --description "Ruckus ZD1200 virtual appliance ($CT_MARKER)"
 
 # The id is real now (Proxmox has written /etc/pve/lxc/$CTID.conf), so another
 # install may scan for a free one again -- and the install itself (the slow part
@@ -994,7 +1140,11 @@ elif [ -n "$GUEST_MAC" ]; then
 fi
 [ "$ECDSA" = 0 ] && bootstrap_args+=(--no-ecdsa)
 [ "$NETWORK_MONITOR" = 0 ] && bootstrap_args+=(--no-network-monitor)
-[ "$R600_REPAIR" = 0 ] && bootstrap_args+=(--no-r600-repair)
+if [ "$R600_REPAIR" = 1 ]; then
+    bootstrap_args+=(--r600-repair)
+else
+    bootstrap_args+=(--no-r600-repair)
+fi
 [ "$CONSOLE_TTY" = 0 ] && bootstrap_args+=(--no-console-tty)
 [ "$KEEP_CT_ADDRESS" = 1 ] && bootstrap_args+=(--keep-ct-address)
 
@@ -1013,42 +1163,13 @@ if ! pct exec "$CTID" -- "$DEFAULT_CT_REPO/scripts/container/proxmox/zd1200-ct-b
 fi
 
 # --------------------------------------------------------------------------
-# 7b. publish the guest address to this container's Proxmox summary
+# 7b. drop the obsolete host summary helper
 # --------------------------------------------------------------------------
-# The GUI's Summary tab shows the description, which is host-side data.  A timer
-# on the host keeps it current from the address the guest reported; it only touches
-# CTs that have a state dir (i.e. ones this project installed).
-step "installing the Proxmox summary helper on the host"
-# Host-global too: the helper and both units are the same paths for every
-# install on this host.  Under the lock the three files (and the daemon-reload
-# that picks them up) are written as one set rather than interleaved.
-lock_host
-install -m 0755 "$REPO_ROOT/scripts/build/proxmox/zd1200-pve-summary-host.sh" /usr/local/sbin/zd1200-pve-summary-host
-cat > /etc/systemd/system/zd1200-pve-summary.service <<'UNIT'
-[Unit]
-Description=Publish ZD1200 guest addresses to the Proxmox summary
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/zd1200-pve-summary-host
-UNIT
-
-cat > /etc/systemd/system/zd1200-pve-summary.timer <<'UNIT'
-[Unit]
-Description=Keep ZD1200 guest addresses current in the Proxmox summary
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=2min
-
-[Install]
-WantedBy=timers.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now zd1200-pve-summary.timer >/dev/null 2>&1 || true
-/usr/local/sbin/zd1200-pve-summary-host "$CTID" >/dev/null 2>&1 || true
-unlock_host
+# Older versions installed a host-global timer that rewrote this container's
+# Summary description with the guest's address.  Proxmox shows that address from
+# the container's own zd0 interface (see zd1200-guest-display), so the description
+# needs no maintenance; remove whatever that timer left behind.
+remove_legacy_pve_summary_helper
 
 # --------------------------------------------------------------------------
 # 8. systemd service
