@@ -38,7 +38,10 @@
 #                            when several bridges and no default route leave it open)
 #   --rootfs SIZE            container disk size in GiB (default: 20; the
 #                            guest artifacts need ~5, and a CF-dump build peaks
-#                            near 9 while the writable is extracted)
+#                            near 9 while the writable is extracted).  A dump is
+#                            staged through its first 8 GiB only, so a disk
+#                            bigger than its own layout needs no more room than
+#                            the layout does
 #   --cores N / --memory MB  container sizing (defaults: 4 / 4096)
 #   --start-on-boot / --no-start-on-boot
 #   --source PATH            named alias for the firmware positional argument
@@ -142,6 +145,14 @@ CTID=""; CT_HOSTNAME="zd1200"; STORAGE=""; BRIDGE=""; # The container holds the 
 # thin storage only the used part is allocated.  PVE's own installer suggests 20
 # for a Debian 13 container.
 ROOTFS_SIZE=20
+# A card/disk dump is staged into the container through its first 8 GiB only
+# (see stage_push below).  Every appliance layout lives well inside that: the
+# vendor's own partition tables put the last partition of the largest family
+# member, the ZD5010's, at sector 7826384 (3.73 GiB).  A disk physically larger
+# than its own layout -- a ZD3000's internal hard disk, say -- therefore costs
+# the container no more than the layout does.  A layout reaching past this is
+# not an appliance this installer supports; raise the constant if one appears.
+DUMP_STAGE_BYTES=$((8 * 1024 * 1024 * 1024))
 CORES=4; MEMORY=4096; ONBOOT=1
 POSITIONALS=(); OPT_FIRMWARE=""; OPT_BACKUP=""; OPT_WRITABLE=""; WRITABLE_PARTITION=""; CONTAINER_MAC_OVERRIDE=""
 ADVANCED=0
@@ -1082,11 +1093,50 @@ fi
 
 step "staging the input inside the container"
 pct exec "$CTID" -- mkdir -p /root/zd-inputs
-stage_push() {  # stage_push <host path> <ct variable name>
-    local src="$1" var="$2"
+# Only a dump is capped, and only the dump itself: a firmware or a backup is
+# small and is staged whole.
+stage_cap_for() {  # stage_cap_for <host path>: that input's byte cap, or 0
+    [ -n "$1" ] && [ "$1" = "$INPUT_PATH" ] || { printf '0'; return 0; }
+    case "$INPUT_KIND" in
+        zd1200-dump|foreign-dump) printf '%s' "$DUMP_STAGE_BYTES" ;;
+        *) printf '0' ;;
+    esac
+}
+# stage_push <host path> <ct variable name> [cap bytes]
+#
+# A dump is staged through its first <cap> bytes.  The tools read a dump in two
+# places -- the vendor partition table in sector 0 and the partitions that table
+# names -- and those all lie inside the cap (see DUMP_STAGE_BYTES), so the rest
+# of a disk physically larger than its own layout is not worth copying into a
+# 20 GiB rootfs.  prepare-vendor-image.sh still fails cleanly, naming the
+# partition, if some layout does reach past the cap ("writable dump is too small
+# for partition START+COUNT").
+stage_push() {
+    local src="$1" var="$2" cap="${3:-0}" name dest size
     [ -n "$src" ] || return 0
-    pct push "$CTID" "$src" "/root/zd-inputs/$(basename "$src")"
-    printf -v "$var" '%s' "/root/zd-inputs/$(basename "$src")"
+    name="$(basename "$src")"
+    dest="/root/zd-inputs/$name"
+    size="$(stat -c%s "$src" 2>/dev/null || echo 0)"
+    if [ "$cap" -gt 0 ] && [ "$size" -gt "$cap" ]; then
+        info "staging $name: the first $((cap / 1048576)) MiB of $((size / 1048576)) MiB (a dump is read through its layout only)"
+        # Stream the prefix rather than pct push the file: copying the whole disk
+        # in is exactly what this avoids.  pct exec forwards stdin.
+        head -c "$cap" -- "$src" \
+            | pct exec "$CTID" -- sh -c 'cat > "$1"' sh "$dest" \
+            || die "could not stage the first $((cap / 1048576)) MiB of $src"
+    else
+        pct push "$CTID" "$src" "$dest"
+    fi
+    printf -v "$var" '%s' "$dest"
+}
+# The staged inputs are consumed by bootstrap step 4 (prepare-vendor-image.sh),
+# which writes everything the disk build and every later service start need into
+# $DEFAULT_CT_STATE/image; --upgrade takes no input at all.  Drop them once the
+# bootstrap has succeeded, so a multi-GB dump does not sit in the rootfs for the
+# life of the appliance.  A failed bootstrap keeps them, with the container, for
+# inspection.
+cleanup_staged_inputs() {
+    pct exec "$CTID" -- rm -rf /root/zd-inputs
 }
 # prepare-vendor-image.sh keeps its existing shape: the positional is the
 # firmware (or a self-contained ZD1200 dump), --writable-from pairs a dump's
@@ -1103,8 +1153,8 @@ case "$INPUT_KIND" in
         fi ;;
     foreign-dump)  ct_source="$FIRMWARE_PATH"; ct_writable="$INPUT_PATH" ;;
 esac
-stage_push "$ct_source" ct_source
-stage_push "$ct_writable" ct_writable
+stage_push "$ct_source" ct_source "$(stage_cap_for "$ct_source")"
+stage_push "$ct_writable" ct_writable "$(stage_cap_for "$ct_writable")"
 stage_push "$ct_backup" ct_backup
 
 # The guest's identity seed.  When sharing, tell the bootstrap to take the
@@ -1161,6 +1211,7 @@ fi
 if ! pct exec "$CTID" -- "$DEFAULT_CT_REPO/scripts/container/proxmox/zd1200-ct-bootstrap.sh" "${bootstrap_args[@]}"; then
     die "container provisioning failed — see the output above (the container is left in place for inspection: pct enter $CTID)"
 fi
+cleanup_staged_inputs
 
 # --------------------------------------------------------------------------
 # 7b. drop the obsolete host summary helper

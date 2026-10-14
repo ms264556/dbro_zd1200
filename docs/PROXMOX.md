@@ -58,7 +58,7 @@ opt-in, `--r600-repair`), and:
 |---|---|---|
 | cores | 4 | the guest itself is `-smp 2`; the rest is headroom for QEMU's I/O and the guest's own threads |
 | memory | 4096 MiB | the guest's QEMU is configured for 2048 MiB, plus QEMU and the `debugfs`/`dd` work on the images; 4 GiB is the tested floor |
-| disk | 20 GiB | userland + QEMU ~0.5, prepared artifacts ~1.1, the synthetic CF ~1.9 and briefly duplicated while built (a CF-dump build also extracts a writable); thin storage only allocates what is used |
+| disk | 20 GiB | userland + QEMU ~0.5, prepared artifacts ~1.1, the synthetic CF ~1.9 and briefly duplicated while built (a CF-dump build also extracts a writable); a dump is copied in through its first 8 GiB only, so a disk bigger than its own layout needs no more room than the layout, and the staged input is removed once the disk is built; thin storage only allocates what is used |
 
 `--advanced` asks for those, and every one is a flag (`--help`).
 
